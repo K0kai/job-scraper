@@ -46,6 +46,52 @@ def resume_summaries(db: sqlite3.Connection) -> dict[str, str]:
     return {row["language"]: row["analysis_summary"] or "" for row in rows}
 
 
+def compose_analysis_dossier(analysis: dict, language: str) -> str:
+    """Monta um dossiê longo e estruturado para match e visualização no painel."""
+    language_name = "Português" if language == "pt" else "English"
+    lines: list[str] = []
+    headline = str(analysis.get("headline") or analysis.get("summary") or "").strip()
+    if headline:
+        lines.append(f"Headline: {headline}")
+    profile = str(analysis.get("professional_profile") or "").strip()
+    if profile:
+        lines.append(f"Perfil profissional:\n{profile}")
+    seniority = str(analysis.get("seniority") or "").strip()
+    years = str(analysis.get("years_of_experience") or "").strip()
+    if seniority or years:
+        lines.append(f"Senioridade: {seniority or '—'} | Anos de experiência (declarados/inferíveis só do texto): {years or '—'}")
+
+    def _section(title: str, value: object) -> None:
+        if isinstance(value, list):
+            items = [str(v).strip() for v in value if str(v).strip()]
+            if items:
+                lines.append(title + ":\n- " + "\n- ".join(items))
+        else:
+            text_v = str(value or "").strip()
+            if text_v:
+                lines.append(f"{title}:\n{text_v}")
+
+    _section("Competências técnicas", analysis.get("technical_skills") or analysis.get("skills"))
+    _section("Ferramentas e plataformas", analysis.get("tools"))
+    _section("Soft skills", analysis.get("soft_skills"))
+    _section("Experiência profissional (cronológica)", analysis.get("experience"))
+    _section("Projetos e automações relevantes", analysis.get("projects"))
+    _section("Conquistas / resultados mensuráveis", analysis.get("achievements"))
+    _section("Formação", analysis.get("education"))
+    _section("Certificações", analysis.get("certifications"))
+    _section("Idiomas", analysis.get("languages"))
+    _section("Domínios / indústrias", analysis.get("domains"))
+    _section("Notas de autorização de trabalho", analysis.get("work_authorization_notes"))
+    _section("Localidade / mobilidade", analysis.get("location_notes"))
+    coverage = str(analysis.get("coverage_notes") or "").strip()
+    if coverage:
+        lines.append(f"Cobertura da extração:\n{coverage}")
+    dossier = "\n\n".join(lines).strip()
+    if not dossier:
+        dossier = headline or f"Análise sem conteúdo estruturado ({language_name})."
+    return dossier[:20000]
+
+
 def analyze_resume_text(
     text: str,
     language: str,
@@ -56,68 +102,107 @@ def analyze_resume_text(
     call_json: Callable[..., dict] | None = None,
 ) -> dict:
     language_name = "Portuguese" if language == "pt" else "English"
-    prompt = f"""Analyze this resume written primarily in {language_name}. Return ONLY JSON with keys:
-summary (string, concise professional summary in {language_name}),
-skills (array of strings),
-experience (array of short strings: role, employer, period, highlights — only what is stated),
-education (array of strings),
-seniority (string),
-languages (array of strings),
-work_authorization_notes (string, only if stated),
-location_notes (string, only if stated).
-Never invent employers, dates, skills, or results. If unknown, use empty string or empty array.
+    prompt = f"""You are extracting a COMPLETE structured profile from a resume written primarily in {language_name}.
+Be thorough: cover every role, every notable skill, tool, project, achievement, education item, and language that appears in the text.
+Do NOT invent employers, dates, skills, metrics, or claims that are not supported by the resume.
+If something is missing, use empty string or empty array — never guess.
+
+Return ONLY JSON with these keys:
+- headline (string, 1 sentence positioning statement in {language_name})
+- professional_profile (string, 2-5 paragraphs in {language_name} covering career arc, stacks, domains, and strengths — dense, specific, not generic)
+- summary (string, longer dossier-style summary in {language_name}, 1200-2500 characters if the resume supports it)
+- seniority (string)
+- years_of_experience (string, only if clearly stated or safely countable from dated roles; else "")
+- technical_skills (array of strings — exhaustive list of technologies/languages/frameworks mentioned)
+- tools (array of strings — IDEs, cloud, CI/CD, databases, OS, etc.)
+- soft_skills (array of strings — only if evidenced)
+- experience (array of objects OR detailed strings; prefer objects with keys: role, employer, period, responsibilities (array), highlights (array))
+- projects (array of strings — automations, systems, notable deliverables)
+- achievements (array of strings — quantified results when present)
+- education (array of strings)
+- certifications (array of strings)
+- languages (array of strings)
+- domains (array of strings — e.g. logistics, fintech, security)
+- work_authorization_notes (string)
+- location_notes (string)
+- coverage_notes (string, brief note on how complete the extraction is relative to the source text)
 
 Resume text:
-{text[:20000]}
+{text[:40000]}
 """
     if call_json is not None:
-        return call_json(provider, model, api_key, prompt)
-
-    if not api_key:
-        raise AiUnavailableError("Configure a chave da API de IA antes de analisar o currículo.")
-    provider = provider.casefold().strip()
-    try:
-        if provider == "openai":
-            endpoint = "https://api.openai.com/v1/responses"
-            payload = json.dumps(
-                {"model": model, "input": prompt, "text": {"format": {"type": "json_object"}}, "store": False, "max_output_tokens": 1200}
-            ).encode("utf-8")
-            headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-        elif provider == "gemini":
-            endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{quote_plus(model)}:generateContent?key={quote_plus(api_key)}"
-            payload = json.dumps(
-                {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"maxOutputTokens": 1200, "responseMimeType": "application/json"}}
-            ).encode("utf-8")
-            headers = {"Content-Type": "application/json"}
-        else:
-            raise ValueError("Provedor de IA inválido.")
-        request = Request(endpoint, data=payload, headers=headers, method="POST")
-        with urlopen(request, timeout=90) as response:
-            result = json.loads(response.read().decode("utf-8"))
-    except HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")[:400]
-        if exc.code in {401, 403, 429} or "quota" in body.casefold() or "billing" in body.casefold():
-            raise AiUnavailableError(f"IA indisponível (HTTP {exc.code}).") from exc
-        raise RuntimeError(f"Falha ao analisar currículo (HTTP {exc.code}): {body}") from exc
-    except AiUnavailableError:
-        raise
-    except Exception as exc:
-        message = str(exc).casefold()
-        if "quota" in message or "insufficient" in message or "api key" in message:
-            raise AiUnavailableError(f"IA indisponível: {exc}") from exc
-        raise
-
-    if provider == "openai":
-        raw = "\n".join(part.get("text", "") for item in result.get("output", []) for part in item.get("content", []) if part.get("type") == "output_text")
+        data = call_json(provider, model, api_key, prompt)
     else:
-        raw = "\n".join(part.get("text", "") for item in result.get("candidates", []) for part in item.get("content", {}).get("parts", []))
-    data = json.loads(raw.strip())
+        if not api_key:
+            raise AiUnavailableError("Configure a chave da API de IA antes de analisar o currículo.")
+        provider = provider.casefold().strip()
+        try:
+            if provider == "openai":
+                endpoint = "https://api.openai.com/v1/responses"
+                payload = json.dumps(
+                    {"model": model, "input": prompt, "text": {"format": {"type": "json_object"}}, "store": False, "max_output_tokens": 4500}
+                ).encode("utf-8")
+                headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+            elif provider == "gemini":
+                endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{quote_plus(model)}:generateContent?key={quote_plus(api_key)}"
+                payload = json.dumps(
+                    {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"maxOutputTokens": 4500, "responseMimeType": "application/json"}}
+                ).encode("utf-8")
+                headers = {"Content-Type": "application/json"}
+            else:
+                raise ValueError("Provedor de IA inválido.")
+            request = Request(endpoint, data=payload, headers=headers, method="POST")
+            with urlopen(request, timeout=120) as response:
+                result = json.loads(response.read().decode("utf-8"))
+        except HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")[:400]
+            if exc.code in {401, 403, 429} or "quota" in body.casefold() or "billing" in body.casefold():
+                raise AiUnavailableError(f"IA indisponível (HTTP {exc.code}).") from exc
+            raise RuntimeError(f"Falha ao analisar currículo (HTTP {exc.code}): {body}") from exc
+        except AiUnavailableError:
+            raise
+        except Exception as exc:
+            message = str(exc).casefold()
+            if "quota" in message or "insufficient" in message or "api key" in message:
+                raise AiUnavailableError(f"IA indisponível: {exc}") from exc
+            raise
+
+        if provider == "openai":
+            raw = "\n".join(part.get("text", "") for item in result.get("output", []) for part in item.get("content", []) if part.get("type") == "output_text")
+        else:
+            raw = "\n".join(part.get("text", "") for item in result.get("candidates", []) for part in item.get("content", {}).get("parts", []))
+        data = json.loads(raw.strip())
+
     if not isinstance(data, dict):
         raise RuntimeError("A análise do currículo não retornou JSON objeto.")
-    summary = str(data.get("summary") or "").strip()
-    if not summary:
-        raise RuntimeError("A análise do currículo não retornou um resumo.")
+    # Normalize experience objects to readable strings inside a copy used for dossier.
+    experience = data.get("experience") or []
+    if isinstance(experience, list):
+        normalized = []
+        for item in experience:
+            if isinstance(item, dict):
+                role = str(item.get("role") or "").strip()
+                employer = str(item.get("employer") or "").strip()
+                period = str(item.get("period") or "").strip()
+                resp = item.get("responsibilities") or []
+                highs = item.get("highlights") or []
+                bits = [b for b in (role, employer, period) if b]
+                head = " — ".join(bits) if bits else "Experiência"
+                details = []
+                if isinstance(resp, list):
+                    details.extend(str(x).strip() for x in resp if str(x).strip())
+                if isinstance(highs, list):
+                    details.extend(str(x).strip() for x in highs if str(x).strip())
+                normalized.append(head + ((": " + "; ".join(details)) if details else ""))
+            else:
+                normalized.append(str(item).strip())
+        data["experience"] = [x for x in normalized if x]
+    dossier = compose_analysis_dossier(data, language)
+    data["summary"] = dossier
+    if not str(data.get("headline") or "").strip():
+        data["headline"] = dossier.split("\n", 1)[0][:240]
     return data
+
 
 
 def _upsert_resume(

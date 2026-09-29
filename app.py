@@ -108,6 +108,7 @@ DEFAULT_SETTINGS = {
     "adzuna_countries": "br,us,gb,ca",
     "apify_monthly_credit_limit_usd": "5",
     "apify_job_count": "25",
+    "apify_actors_json": "[{\"id\": \"curious_coder~linkedin-jobs-scraper\", \"label\": \"LinkedIn Jobs\", \"enabled\": true, \"input_mode\": \"linkedin_search\", \"count\": 25}]",
     "smtp_host": "",
     "smtp_port": "587",
     "smtp_user": "",
@@ -117,7 +118,7 @@ DEFAULT_SETTINGS = {
     "queue_max_attempts": "40",
     "queue_ttl_hours": "24",
 }
-STATUSES = {"new": "Nova", "review": "Revisar", "saved": "Salva", "prepared": "Carta preparada", "applied": "Aplicada", "ignored": "Ignorada", "blocked": "Envio indisponível"}
+STATUSES = {"new": "Nova", "review": "Na fila", "worth": "Vale a pena olhar", "saved": "Salva", "prepared": "Carta preparada", "applied": "Aplicada", "ignored": "Ignorada", "blocked": "Envio indisponível"}
 BRASILIA = ZoneInfo("America/Sao_Paulo")
 
 
@@ -498,7 +499,34 @@ Description: {re.sub(r'<[^>]+>', ' ', job['description'])[:10000]}"""
     }
 
 
+
+def is_linkedin_job(job: dict) -> bool:
+    blob = " ".join(
+        str(job.get(key) or "")
+        for key in ("url", "source", "description", "company")
+    ).casefold()
+    return "linkedin.com" in blob or "linkedin" in str(job.get("source") or "").casefold()
+
+
+def mark_worth_looking(job_id: int, *, score: int, reason: str, detail: str) -> None:
+    note = (
+        f"Vale a pena olhar (score {score}/100). {detail} "
+        f"Motivo da IA: {reason}"
+    )[:900]
+    with connect() as db:
+        db.execute(
+            "UPDATE jobs SET status='worth', notes=? WHERE id=?",
+            (note, job_id),
+        )
+        db.execute(
+            "UPDATE ai_decisions SET apply_channel=?, apply_result=? WHERE id=(SELECT MAX(id) FROM ai_decisions WHERE job_id=?)",
+            ("manual", detail[:500], job_id),
+        )
+    log_event("info", "worth", f"Vaga #{job_id} enviada para 'Vale a pena olhar' — {detail}")
+
+
 def process_auto_job(job_id: int) -> str:
+
     """Triagem com análise salva do currículo; aplica por e-mail ou Playwright quando possível."""
     cfg = settings()
     with connect() as db:
@@ -562,6 +590,17 @@ def process_auto_job(job_id: int) -> str:
     provider = cfg.get("ai_provider", "gemini").casefold()
     model = cfg.get("ai_model", "gemini-2.5-flash").strip()
     api_key = get_ai_key(provider)
+    score = int(decision["match_score"])
+
+    # LinkedIn (and similar) with good match: manual review instead of fragile automation.
+    if is_linkedin_job(job):
+        mark_worth_looking(
+            job_id,
+            score=score,
+            reason=decision["reason"],
+            detail="LinkedIn detectado — candidatura automática indisponível; carta preparada para você enviar manualmente.",
+        )
+        return f"vaga {job_id}: vale a pena olhar (LinkedIn, score {score})"
 
     with connect() as db:
         ok, detail = apply_via_email(
@@ -595,13 +634,13 @@ def process_auto_job(job_id: int) -> str:
             channel = "browser"
         if not ok:
             record_blocked(db, job_id, detail, now_iso(), int(resume["id"]), cover_id)
-            db.execute("UPDATE jobs SET status='blocked', notes=? WHERE id=?", (detail[:900], job_id))
-            db.execute(
-                "UPDATE ai_decisions SET apply_channel=?, apply_result=? WHERE id=(SELECT MAX(id) FROM ai_decisions WHERE job_id=?)",
-                (channel, detail[:500], job_id),
+            mark_worth_looking(
+                job_id,
+                score=score,
+                reason=decision["reason"],
+                detail=f"Match bom, mas envio automático falhou ({channel}): {detail}",
             )
-            log_event("warning", "auto-apply", f"Vaga #{job_id} bloqueada via {channel}: {detail}")
-            return f"vaga {job_id}: bloqueada — {detail}"
+            return f"vaga {job_id}: vale a pena olhar — {detail}"
         db.execute("UPDATE jobs SET status='applied', applied_at=?, notes=? WHERE id=?", (now_iso(), detail[:900], job_id))
         db.execute(
             "UPDATE ai_decisions SET apply_channel=?, apply_result=? WHERE id=(SELECT MAX(id) FROM ai_decisions WHERE job_id=?)",
@@ -748,8 +787,16 @@ def fetch_adzuna() -> list[dict]:
     return results
 
 
-APIFY_ACTOR_ID = "curious_coder~linkedin-jobs-scraper"
 APIFY_API = "https://api.apify.com/v2"
+DEFAULT_APIFY_ACTORS: list[dict] = [
+    {
+        "id": "curious_coder~linkedin-jobs-scraper",
+        "label": "LinkedIn Jobs",
+        "enabled": True,
+        "input_mode": "linkedin_search",
+        "count": 25,
+    }
+]
 
 
 def apify_headers(token: str) -> dict[str, str]:
@@ -768,8 +815,196 @@ def apify_monthly_usage_usd(token: str) -> tuple[float, str]:
     return used, label
 
 
+def normalize_apify_actor_id(actor_id: str) -> str:
+    raw = (actor_id or "").strip()
+    if "/" in raw and "~" not in raw:
+        owner, name = raw.split("/", 1)
+        return f"{owner.strip()}~{name.strip()}"
+    return raw
+
+
+def load_apify_actors(cfg: dict[str, str] | None = None) -> list[dict]:
+    cfg = cfg or settings()
+    raw = (cfg.get("apify_actors_json") or "").strip()
+    if not raw:
+        return [dict(item) for item in DEFAULT_APIFY_ACTORS]
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"JSON de actors Apify inválido: {exc}") from exc
+    if not isinstance(data, list) or not data:
+        raise ValueError("apify_actors_json deve ser uma lista JSON com pelo menos um actor.")
+    actors: list[dict] = []
+    for idx, item in enumerate(data):
+        if not isinstance(item, dict):
+            raise ValueError(f"Actor Apify #{idx + 1} deve ser um objeto JSON.")
+        actor_id = normalize_apify_actor_id(str(item.get("id") or ""))
+        if not actor_id:
+            raise ValueError(f"Actor Apify #{idx + 1} sem id.")
+        label = str(item.get("label") or actor_id).strip()
+        enabled = bool(item.get("enabled", True))
+        mode = str(item.get("input_mode") or "linkedin_search").strip().casefold()
+        if mode not in {"linkedin_search", "custom"}:
+            mode = "custom" if item.get("input_template") or item.get("input") else "linkedin_search"
+        try:
+            count = max(1, min(100, int(item.get("count") or cfg.get("apify_job_count", "25") or 25)))
+        except (TypeError, ValueError):
+            count = 25
+        template = item.get("input_template") if "input_template" in item else item.get("input")
+        actors.append(
+            {
+                "id": actor_id,
+                "label": label,
+                "enabled": enabled,
+                "input_mode": mode,
+                "count": count,
+                "input_template": template if isinstance(template, (dict, list)) else None,
+            }
+        )
+    return actors
+
+
+def _substitute_apify_value(value: object, ctx: dict[str, str]) -> object:
+    if isinstance(value, str):
+        out = value
+        for key, replacement in ctx.items():
+            out = out.replace("{{" + key + "}}", replacement)
+        return out
+    if isinstance(value, list):
+        return [_substitute_apify_value(item, ctx) for item in value]
+    if isinstance(value, dict):
+        return {str(k): _substitute_apify_value(v, ctx) for k, v in value.items()}
+    return value
+
+
+def build_apify_run_input(actor: dict, cfg: dict[str, str]) -> dict:
+    keywords = terms(cfg.get("keywords", ""))[:3] or ["software engineer"]
+    locations = terms(cfg.get("locations", ""))[:3] or ["remote"]
+    count = int(actor.get("count") or 25)
+    mode = str(actor.get("input_mode") or "linkedin_search")
+    if mode == "linkedin_search":
+        urls: list[str] = []
+        for keyword in keywords:
+            for location in locations:
+                urls.append(
+                    f"https://www.linkedin.com/jobs/search/?keywords={quote_plus(keyword)}"
+                    f"&location={quote_plus(location)}&position=1&pageNum=0"
+                )
+                if len(urls) >= 3:
+                    break
+            if len(urls) >= 3:
+                break
+        return {"urls": urls, "count": count, "scrapeCompany": False}
+
+    template = actor.get("input_template")
+    if not isinstance(template, (dict, list)):
+        raise ValueError(
+            f"Actor {actor.get('label')} em modo custom precisa de input_template (objeto JSON)."
+        )
+    ctx = {
+        "count": str(count),
+        "keywords": ", ".join(keywords),
+        "locations": ", ".join(locations),
+        "keyword": keywords[0],
+        "location": locations[0],
+        "keyword0": keywords[0],
+        "keyword1": keywords[1] if len(keywords) > 1 else keywords[0],
+        "location0": locations[0],
+        "location1": locations[1] if len(locations) > 1 else locations[0],
+    }
+    built = _substitute_apify_value(template, ctx)
+    if isinstance(built, list):
+        return {"items": built}
+    if not isinstance(built, dict):
+        raise ValueError(f"input_template do actor {actor.get('label')} deve resultar em objeto JSON.")
+    return built
+
+
+def normalize_apify_items(items: list, *, label: str) -> list[dict]:
+    results: list[dict] = []
+    source_name = f"Apify:{label}" if label else "Apify"
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        url = str(
+            item.get("link")
+            or item.get("url")
+            or item.get("applyUrl")
+            or item.get("jobUrl")
+            or item.get("externalApplyLink")
+            or ""
+        ).strip()
+        title = str(item.get("title") or item.get("position") or item.get("jobTitle") or "").strip()
+        if not url or not title:
+            continue
+        description = str(
+            item.get("descriptionText")
+            or item.get("descriptionHtml")
+            or item.get("description")
+            or item.get("jobDescription")
+            or ""
+        )
+        company = item.get("companyName") or item.get("company") or {}
+        if isinstance(company, dict):
+            company = company.get("name") or company.get("display_name") or ""
+        location = item.get("location") or item.get("jobLocation") or ""
+        if isinstance(location, dict):
+            location = location.get("display_name") or location.get("name") or ""
+        results.append(
+            {
+                "source": source_name,
+                "source_id": str(item.get("id") or item.get("jobId") or url),
+                "title": title,
+                "company": str(company or ""),
+                "location": str(location or ""),
+                "description": description,
+                "url": url,
+                "posted_at": item.get("postedAt") or item.get("publishedAt") or item.get("date"),
+            }
+        )
+    return results
+
+
+def run_apify_actor(token: str, actor: dict, cfg: dict[str, str]) -> list[dict]:
+    actor_id = normalize_apify_actor_id(str(actor["id"]))
+    label = str(actor.get("label") or actor_id)
+    run_input = build_apify_run_input(actor, cfg)
+    log_event("info", "apify", f"Iniciando actor {label} ({actor_id}).")
+    started = fetch_json(
+        f"{APIFY_API}/actors/{quote_plus(actor_id)}/runs",
+        data=json.dumps(run_input).encode("utf-8"),
+        headers=apify_headers(token),
+        timeout=45,
+    )
+    run = started.get("data", started) if isinstance(started, dict) else {}
+    run_id = str(run.get("id") or "")
+    dataset_id = str(run.get("defaultDatasetId") or "")
+    if not run_id:
+        raise RuntimeError(f"Apify ({label}) não retornou o identificador da execução.")
+    deadline = time.time() + 180
+    status = str(run.get("status") or "READY")
+    while status in {"READY", "RUNNING"} and time.time() < deadline:
+        if collector.stop_event.is_set():
+            raise RuntimeError(f"Coleta interrompida durante Apify ({label}).")
+        time.sleep(5)
+        progress = fetch_json(f"{APIFY_API}/actor-runs/{quote_plus(run_id)}", headers=apify_headers(token), timeout=30)
+        run = progress.get("data", progress) if isinstance(progress, dict) else {}
+        status = str(run.get("status") or status)
+        dataset_id = str(run.get("defaultDatasetId") or dataset_id)
+    if status != "SUCCEEDED":
+        raise RuntimeError(f"Apify ({label}) encerrada com status {status}.")
+    if not dataset_id:
+        raise RuntimeError(f"Apify ({label}) não produziu dataset.")
+    items = fetch_json(f"{APIFY_API}/datasets/{quote_plus(dataset_id)}/items?clean=1", headers=apify_headers(token), timeout=45)
+    if not isinstance(items, list):
+        items = []
+    normalized = normalize_apify_items(items, label=label)
+    log_event("success", "apify", f"Actor {label}: {len(normalized)} vaga(s) úteis.")
+    return normalized
+
+
 def fetch_apify() -> list[dict]:
-    """Roda o actor de job scraping da Apify sem substituir as outras fontes."""
+    """Roda todos os actors Apify habilitados e mescla os resultados."""
     token = secret_get("apify_token")
     if not token:
         raise ValueError("Configure o token da Apify no painel.")
@@ -785,74 +1020,40 @@ def fetch_apify() -> list[dict]:
     set_setting("apify_last_usage_cycle", cycle_label)
     if used >= limit:
         raise ValueError(f"Limite mensal de créditos Apify atingido ({used:.2f} USD de {limit:.2f} USD no ciclo {cycle_label}).")
-    try:
-        count = max(1, min(100, int(cfg.get("apify_job_count", "25"))))
-    except ValueError:
-        count = 25
-    keywords = terms(cfg.get("keywords", ""))[:2] or ["software engineer"]
-    locations = terms(cfg.get("locations", ""))[:2] or ["remote"]
-    urls: list[str] = []
-    for keyword in keywords:
-        for location in locations:
-            urls.append(f"https://www.linkedin.com/jobs/search/?keywords={quote_plus(keyword)}&location={quote_plus(location)}&position=1&pageNum=0")
-            if len(urls) >= 2:
-                break
-        if len(urls) >= 2:
-            break
-    run_input = {"urls": urls, "count": count, "scrapeCompany": False}
-    started = fetch_json(
-        f"{APIFY_API}/actors/{APIFY_ACTOR_ID}/runs",
-        data=json.dumps(run_input).encode("utf-8"),
-        headers=apify_headers(token),
-        timeout=45,
-    )
-    run = started.get("data", started) if isinstance(started, dict) else {}
-    run_id = str(run.get("id") or "")
-    dataset_id = str(run.get("defaultDatasetId") or "")
-    if not run_id:
-        raise RuntimeError("A Apify não retornou o identificador da execução.")
-    deadline = time.time() + 180
-    status = str(run.get("status") or "READY")
-    while status in {"READY", "RUNNING"} and time.time() < deadline:
+
+    actors = [actor for actor in load_apify_actors(cfg) if actor.get("enabled", True)]
+    if not actors:
+        raise ValueError("Nenhum actor Apify habilitado em apify_actors_json.")
+
+    results: list[dict] = []
+    errors: list[str] = []
+    for actor in actors:
         if collector.stop_event.is_set():
-            raise RuntimeError("Coleta interrompida durante a execução Apify.")
-        time.sleep(5)
-        progress = fetch_json(f"{APIFY_API}/actor-runs/{quote_plus(run_id)}", headers=apify_headers(token), timeout=30)
-        run = progress.get("data", progress) if isinstance(progress, dict) else {}
-        status = str(run.get("status") or status)
-        dataset_id = str(run.get("defaultDatasetId") or dataset_id)
-    if status != "SUCCEEDED":
-        raise RuntimeError(f"Execução Apify encerrada com status {status}.")
-    if not dataset_id:
-        raise RuntimeError("A execução Apify não produziu um dataset.")
-    items = fetch_json(f"{APIFY_API}/datasets/{quote_plus(dataset_id)}/items?clean=1", headers=apify_headers(token), timeout=45)
-    if not isinstance(items, list):
-        items = []
-    results = []
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        url = str(item.get("link") or item.get("url") or item.get("applyUrl") or "").strip()
-        title = str(item.get("title") or "").strip()
-        if not url or not title:
-            continue
-        description = str(item.get("descriptionText") or item.get("descriptionHtml") or item.get("description") or "")
-        results.append({
-            "source": "Apify",
-            "source_id": str(item.get("id") or url),
-            "title": title,
-            "company": str(item.get("companyName") or item.get("company") or ""),
-            "location": str(item.get("location") or ""),
-            "description": description,
-            "url": url,
-            "posted_at": item.get("postedAt") or item.get("publishedAt"),
-        })
+            break
+        # Re-check credit budget between actors.
+        try:
+            used_now, _ = apify_monthly_usage_usd(token)
+            if used_now >= limit:
+                errors.append(f"{actor.get('label')}: limite de créditos atingido antes da execução")
+                break
+        except Exception:
+            pass
+        try:
+            results.extend(run_apify_actor(token, actor, cfg))
+        except Exception as exc:
+            LOG.exception("Falha no actor Apify %s", actor.get("id"))
+            errors.append(f"{actor.get('label')}: {exc}")
+            log_event("error", "apify", f"Falha no actor {actor.get('label')}: {exc}")
     try:
         used_after, cycle_after = apify_monthly_usage_usd(token)
         set_setting("apify_last_usage_usd", f"{used_after:.4f}")
         set_setting("apify_last_usage_cycle", cycle_after)
     except Exception:
         pass
+    if errors and not results:
+        raise RuntimeError("Todos os actors Apify falharam: " + "; ".join(errors))
+    if errors:
+        log_event("warning", "apify", "Alguns actors falharam: " + "; ".join(errors))
     return results
 
 
@@ -1011,7 +1212,16 @@ def load_dashboard() -> tuple[dict, list, list]:
 
 
 def stats_html(counts: dict) -> str:
-    return "".join(f'<div class="stat"><span>{esc(label)}</span><strong>{counts.get(key, 0)}</strong></div>' for key, label in [("new", "Novas"), ("review", "Revisar"), ("prepared", "Preparadas"), ("applied", "Aplicadas"), ("ignored", "Ignoradas")])
+    return "".join(
+        f'<div class="stat"><span>{esc(label)}</span><strong>{counts.get(key, 0)}</strong></div>'
+        for key, label in [
+            ("new", "Novas"),
+            ("worth", "Vale olhar"),
+            ("prepared", "Preparadas"),
+            ("applied", "Aplicadas"),
+            ("ignored", "Ignoradas"),
+        ]
+    )
 
 
 def job_rows_html(jobs, collecting: bool) -> str:
@@ -1101,6 +1311,52 @@ def queue_html(limit: int = 100) -> str:
     return summary + table + clear_btn
 
 
+def worth_html(limit: int = 80) -> str:
+    with connect() as db:
+        rows = db.execute(
+            """SELECT jobs.*, cover_letters.body AS cover_letter,
+                      (
+                        SELECT match_score FROM ai_decisions
+                        WHERE ai_decisions.job_id = jobs.id
+                        ORDER BY id DESC LIMIT 1
+                      ) AS match_score
+               FROM jobs
+               LEFT JOIN cover_letters ON cover_letters.job_id = jobs.id
+               WHERE jobs.status = 'worth'
+               ORDER BY COALESCE(match_score, 0) DESC, jobs.id DESC
+               LIMIT ?""",
+            (limit,),
+        ).fetchall()
+    if not rows:
+        return (
+            '<p class="hint">Nenhuma vaga aqui ainda. Quando houver bom match mas LinkedIn, '
+            "falha de formulário/e-mail, a vaga aparece nesta lista para você candidatar manualmente.</p>"
+        )
+    cards = []
+    for job in rows:
+        score = job["match_score"]
+        score_label = f"{int(score)}/100" if score is not None else "—"
+        desc = re.sub(r"<[^>]+>", " ", job["description"] or "")[:1200]
+        letter = job["cover_letter"] or ""
+        cards.append(
+            f'<article class="worth-card">'
+            f'<div class="worth-head"><a class="job-title" href="{esc(job["url"])}" target="_blank" rel="noreferrer">{esc(job["title"])}</a>'
+            f'<span class="analysis-badge analysis-ok">Match {esc(score_label)}</span></div>'
+            f'<p class="hint"><strong>{esc(job["company"])}</strong> · {esc(job["location"])} · {esc(job["source"])} · {esc(format_brasilia(job["posted_at"] or job["first_seen_at"]))}</p>'
+            f'<p class="hint">{esc(job["notes"] or "")}</p>'
+            f'<p><a href="{esc(job["url"])}" target="_blank" rel="noreferrer">Abrir vaga para candidatura manual</a></p>'
+            f'<details><summary>Descrição</summary><div class="description">{esc(desc)}</div></details>'
+            f'<details><summary>{"Carta pronta para copiar" if letter else "Sem carta"}</summary><div class="description">{esc(letter or "—")}</div></details>'
+            f'<form method="post" action="/job-status" class="actions">'
+            f'<input type="hidden" name="id" value="{int(job["id"])}">'
+            f'<button class="subtle" name="status" value="applied" type="submit">Marcar como aplicada</button>'
+            f'<button class="subtle" name="status" value="ignored" type="submit">Ignorar</button>'
+            f'<button class="subtle" name="status" value="saved" type="submit">Salvar</button>'
+            f"</form></article>"
+        )
+    return '<div class="worth-list">' + "".join(cards) + "</div>"
+
+
 def state_label_for(state: str) -> str:
     return {"running": "Em execução", "stopping": "Parando", "stopped": "Parada"}.get(state, state)
 
@@ -1118,6 +1374,7 @@ def live_payload() -> dict:
         "history_html": history_html(runs),
         "logs_html": logs_html(),
         "queue_html": queue_html(),
+        "worth_html": worth_html(),
     }
 
 
@@ -1154,16 +1411,41 @@ def resume_panels_html() -> str:
                 or ("Análise concluída." if raw_status in {"ok", "reused"} else "Sem mensagem.")
             )
             error = esc((row["analysis_error"] if "analysis_error" in row.keys() else "") or "")
-            summary = esc((row["analysis_summary"] or "")[:900])
+            summary = esc((row["analysis_summary"] or "")[:6000])
+            structured = ""
+            try:
+                data = json.loads(row["analysis_json"] or "{}")
+            except json.JSONDecodeError:
+                data = {}
+            if isinstance(data, dict) and data:
+                headline = esc(str(data.get("headline") or "")[:300])
+                skills = data.get("technical_skills") or data.get("skills") or []
+                tools = data.get("tools") or []
+                experience = data.get("experience") or []
+                if headline:
+                    structured += f'<p><strong>Headline:</strong> {headline}</p>'
+                if isinstance(skills, list) and skills:
+                    structured += "<p><strong>Skills:</strong> " + esc(", ".join(str(s) for s in skills[:40])) + "</p>"
+                if isinstance(tools, list) and tools:
+                    structured += "<p><strong>Ferramentas:</strong> " + esc(", ".join(str(s) for s in tools[:30])) + "</p>"
+                if isinstance(experience, list) and experience:
+                    structured += "<p><strong>Experiências capturadas:</strong> " + esc(str(len(experience))) + "</p><ul>" + "".join(
+                        f"<li>{esc(str(item)[:280])}</li>" for item in experience[:12]
+                    ) + "</ul>"
             error_block = (
                 f'<p class="analysis-error-text"><strong>Detalhe do erro:</strong> {error}</p>'
                 if error and raw_status == "error"
                 else ""
             )
             summary_block = (
-                f'<details open><summary>Resumo da análise da IA</summary><div class="description">{summary}</div></details>'
+                f'{structured}<details open><summary>Dossiê completo da análise</summary><div class="description" style="max-width:100%;max-height:420px;white-space:pre-wrap">{summary}</div></details>'
                 if summary
-                else '<p class="hint">Ainda não há resumo salvo (análise incompleta ou falhou).</p>'
+                else '<p class="hint">Ainda não há dossiê salvo (análise incompleta ou falhou).</p>'
+            )
+            reanalyze = (
+                f'<form method="post" action="/reanalyze-resume" style="margin-top:8px">'
+                f'<input type="hidden" name="language" value="{lang}">'
+                f'<button class="subtle" type="submit">Reanalisar com IA (fila)</button></form>'
             )
             status = (
                 f'<div class="analysis-badge {badge_class}">{badge_label}</div>'
@@ -1171,7 +1453,7 @@ def resume_panels_html() -> str:
                 f'<strong>Última análise:</strong> {when}<br>'
                 f'<strong>Modelo:</strong> {provider} / {model}</p>'
                 f'<p class="hint">{message}</p>'
-                f"{error_block}{summary_block}"
+                f"{error_block}{summary_block}{reanalyze}"
             )
         blocks.append(
             f'<div class="resume-card"><h3 style="margin:0 0 8px;font-size:15px">Currículo {label}</h3>'
@@ -1229,6 +1511,7 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
     rules_panel = form_rules_html()
     logs_view = logs_html()
     queue_view = queue_html()
+    worth_view = worth_html()
     notice_class = {
         "success": "notice notice-ok",
         "info": "notice notice-info",
@@ -1237,11 +1520,12 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
     }.get(notice_kind, "notice")
     notice_html = f'<div class="{notice_class}">{esc(notice)}</div>' if notice else ""
     return f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Radar de Vagas</title><style>
-      :root{{--ink:#172b36;--muted:#62747d;--line:#dce5e8;--paper:#f4f7f7;--teal:#0b786d;--mint:#d8f0e9;--white:#fff}}*{{box-sizing:border-box}}body{{margin:0;background:var(--paper);color:var(--ink);font:15px/1.5 Inter,Segoe UI,Arial,sans-serif}}header{{background:#102d35;color:white;padding:28px max(24px,calc((100vw - 1280px)/2));display:flex;justify-content:space-between;align-items:center}}h1{{font-size:25px;margin:0}}header p{{margin:5px 0 0;color:#c1d4d6}}main{{max-width:1280px;margin:26px auto;padding:0 24px}}.top{{display:grid;grid-template-columns:1.3fr .7fr;gap:18px}}.panel,.stat,.table-wrap{{background:white;border:1px solid var(--line);border-radius:13px}}.panel{{padding:20px}}h2{{font-size:18px;margin:0 0 14px}}.form-grid{{display:grid;grid-template-columns:1fr 1fr;gap:12px}}label{{display:block;color:var(--muted);font-size:13px;font-weight:600}}input,textarea,select{{font:inherit;color:var(--ink);width:100%;margin-top:5px;padding:9px 10px;border:1px solid #cdd9dc;border-radius:8px;background:white}}.hint{{color:var(--muted);font-size:12px;margin:10px 0}}button{{border:0;border-radius:8px;padding:10px 15px;background:var(--teal);color:white;font-weight:650;cursor:pointer}}button.stop{{background:#a74639}}button.subtle{{padding:7px 10px;background:#eaf2f1;color:var(--ink);margin-top:6px}}.actions{{display:flex;gap:9px;margin-top:12px;align-items:center}}.runtime{{color:var(--muted);font-size:13px}}.stats{{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin:18px 0}}.stat{{padding:13px 15px}}.stat span{{display:block;font-size:12px;color:var(--muted)}}.stat strong{{font-size:23px}}.table-wrap{{overflow:auto}}table{{border-collapse:collapse;width:100%;min-width:950px}}th,td{{padding:13px 12px;text-align:left;border-bottom:1px solid var(--line);vertical-align:top}}th{{font-size:12px;color:var(--muted);background:#f8fafa}}td small{{display:block;color:var(--muted);margin-top:3px}}.job-title{{font-weight:700;color:#145d59;text-decoration:none}}.job-title:hover{{text-decoration:underline}}.source{{background:var(--mint);padding:3px 7px;border-radius:99px;font-size:12px}}select{{min-width:150px;margin:0;padding:7px}}summary{{cursor:pointer;color:var(--teal);font-size:13px}}.description{{max-width:350px;max-height:220px;overflow:auto;padding:8px 0;font-size:13px}}details textarea{{min-width:230px}}.history{{color:var(--muted);font-size:13px;padding-left:20px}}.notice{{padding:10px 13px;border-radius:8px;margin-bottom:15px}}.notice-ok{{background:#e7f4ed;border:1px solid #b7dfc8}}.notice-info{{background:#e8f1f8;border:1px solid #b7d0e6}}.notice-error{{background:#fceaea;border:1px solid #e3b0b0;color:#6b2a2a}}.notice-warn{{background:#fff6e5;border:1px solid #e6d0a0}}.analysis-badge{{display:inline-block;padding:4px 10px;border-radius:999px;font-size:12px;font-weight:700;margin:10px 0 6px}}.analysis-ok{{background:#d8f0e9;color:#0b5c52}}.analysis-info{{background:#dceaf6;color:#1d4f74}}.analysis-error{{background:#f6d6d6;color:#7a2424}}.analysis-none{{background:#eceff1;color:#526066}}.analysis-error-text{{color:#7a2424;font-size:13px;margin:8px 0}}.resume-card{{border:1px solid var(--line);border-radius:10px;padding:14px;background:#fbfcfc}}.tabs{{display:flex;gap:8px;margin:0 0 16px}}.tab{{background:#e7eeef;color:var(--ink);padding:9px 16px;border-radius:999px;font-weight:650;cursor:pointer}}.tab.active{{background:var(--teal);color:white}}.tab-panel{{display:none}}.tab-panel.active{{display:block}}.log-console{{font:12.5px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:#0f1c22;color:#d7e6ea;border-radius:10px;padding:12px;max-height:620px;overflow:auto}}.log-line{{display:grid;grid-template-columns:132px 72px 110px 1fr;gap:10px;padding:5px 0;border-bottom:1px solid #1e323b}}.log-time{{color:#8eacb6}}.log-level{{font-weight:700;text-transform:uppercase}}.log-source{{color:#7ec8c0}}.log-msg{{color:#e8f3f5;white-space:pre-wrap;word-break:break-word}}.log-info .log-level{{color:#9ec9ff}}.log-success .log-level{{color:#7ddea8}}.log-warning .log-level{{color:#f0c674}}.log-error .log-level{{color:#f0a0a0}}.log-debug .log-level{{color:#9aa7ad}}.log-empty{{color:#9bb0b8;padding:18px 8px}}.queue-status{{display:inline-block;padding:3px 8px;border-radius:999px;font-size:12px;font-weight:700}}.queue-pending,.queue-retry_wait{{background:#dceaf6;color:#1d4f74}}.queue-running{{background:#d8f0e9;color:#0b5c52}}.queue-succeeded{{background:#e7f4ed;color:#1f6b45}}.queue-failed{{background:#f6d6d6;color:#7a2424}}.queue-cancelled{{background:#eceff1;color:#526066}}@media(max-width:900px){{.log-line{{grid-template-columns:1fr;gap:2px}}}}@media(max-width:800px){{.top{{grid-template-columns:1fr}}.stats{{grid-template-columns:repeat(2,1fr)}}header{{padding:20px 24px}}.form-grid{{grid-template-columns:1fr}}}}
-      </style></head><body><header><div><h1>Radar de Vagas</h1><p>Busca, seleção e candidaturas automáticas</p></div><span id="collector-state">{esc(state_label)}</span></header><main>{notice_html}<nav class="tabs" aria-label="Seções do painel"><button type="button" class="tab active" data-tab="painel">Painel</button><button type="button" class="tab" data-tab="filas">Filas</button><button type="button" class="tab" data-tab="logs">Logs</button></nav><div id="tab-painel" class="tab-panel active"><div class="top"><section class="panel"><h2>Preferências de busca</h2><form method="post" action="/settings"><div class="form-grid"><label>Cargos e termos, separados por vírgula<textarea name="keywords" rows="3">{esc(cfg.get('keywords',''))}</textarea></label><label>Países/regiões aceitos<textarea name="locations" rows="3">{esc(cfg.get('locations',''))}</textarea></label><label>Fontes: remotive, remoteok, adzuna, apify<input name="sources" value="{esc(cfg.get('sources',''))}"></label><label>Intervalo de busca (minutos)<input name="interval_minutes" type="number" min="5" value="{esc(cfg.get('interval_minutes','15'))}"></label><label>Países Adzuna (ex.: br,us,gb,ca)<input name="adzuna_countries" value="{esc(cfg.get('adzuna_countries','br,us,gb,ca'))}"></label><label>Limite mensal Apify (USD)<input name="apify_monthly_credit_limit_usd" type="number" min="0" step="0.01" value="{esc(cfg.get('apify_monthly_credit_limit_usd','5'))}"></label><label>Máximo de vagas por ciclo Apify<input name="apify_job_count" type="number" min="1" max="100" value="{esc(cfg.get('apify_job_count','25'))}"></label></div><button>Salvar preferências</button></form><div class="actions"><form method="post" action="/start"><button>Iniciar bot</button></form><form method="post" action="/stop"><button class="stop">Parar bot</button></form><span class="runtime" id="runtime-message">{esc(status['message'])}</span></div></section><section class="panel"><h2>Execuções recentes</h2><ul class="history" id="run-history">{history}</ul></section></div><section class="panel" style="margin-top:18px"><h2>Currículos (PDF)</h2>{resume_panel}<p class="hint">O seletor de arquivos do sistema abre ao escolher o PDF. A IA analisa só quando o arquivo muda (hash). O status abaixo mostra se a análise ocorreu, foi reutilizada ou falhou.</p></section>
-<section class="panel" style="margin-top:18px"><h2>Perfil, SMTP e automação</h2><form method="post" action="/ai-settings"><div class="form-grid"><label>Provedor de IA<select name="ai_provider"><option value="gemini" {'selected' if cfg.get('ai_provider') == 'gemini' else ''}>Gemini</option><option value="openai" {'selected' if cfg.get('ai_provider') == 'openai' else ''}>OpenAI</option></select></label><label>Modelo<input name="ai_model" value="{esc(cfg.get('ai_model','gemini-2.5-flash'))}"></label><label>Seu nome<input name="candidate_name" value="{esc(cfg.get('candidate_name',''))}"></label><label>E-mail<input name="candidate_email" value="{esc(cfg.get('candidate_email',''))}"></label><label>Telefone<input name="candidate_phone" value="{esc(cfg.get('candidate_phone',''))}"></label><label>LinkedIn<input name="candidate_linkedin" value="{esc(cfg.get('candidate_linkedin',''))}"></label><label>Cidade<input name="candidate_city" value="{esc(cfg.get('candidate_city',''))}"></label><label>Chave de IA (vazio mantém a salva)<input type="password" name="api_key" autocomplete="new-password"></label><label>Fatos profissionais em português<textarea name="candidate_facts_pt" rows="3">{esc(cfg.get('candidate_facts_pt',''))}</textarea></label><label>Professional facts in English<textarea name="candidate_facts_en" rows="3">{esc(cfg.get('candidate_facts_en',''))}</textarea></label><label>Score mínimo (%)<input name="minimum_match_score" type="number" min="0" max="100" value="{esc(cfg.get('minimum_match_score','80'))}"></label><label>Máximo de candidaturas por ciclo<input name="maximum_applications_per_run" type="number" min="1" max="50" value="{esc(cfg.get('maximum_applications_per_run','5'))}"></label><label>Workers da fila (paralelo)<input name="queue_max_workers" type="number" min="1" max="8" value="{esc(cfg.get('queue_max_workers','3'))}"></label><label>Máx. tentativas por job<input name="queue_max_attempts" type="number" min="1" max="200" value="{esc(cfg.get('queue_max_attempts','40'))}"></label><label>TTL da fila (horas)<input name="queue_ttl_hours" type="number" min="1" max="168" value="{esc(cfg.get('queue_ttl_hours','24'))}"></label><label>Adzuna App ID<input name="adzuna_app_id" value=""></label><label>Adzuna API key<input type="password" name="adzuna_app_key" value=""></label><label>Token Apify<input type="password" name="apify_token" value="" autocomplete="new-password"></label></div><label style="margin:12px 0"><input type="checkbox" name="auto_apply" value="1" {'checked' if cfg.get('auto_apply') == '1' else ''} style="width:auto"> Ativar triagem e candidatura automáticas (e-mail SMTP, depois formulário público)</label><p class="hint">Chaves ficam no cofre do sistema. Match usa a análise salva do currículo. Sem e-mail/formulário ou com pergunta aberta sem tokens de IA, a vaga é marcada como bloqueada/pulada.</p><button>Salvar perfil e IA</button></form></section>
+      :root{{--ink:#172b36;--muted:#62747d;--line:#dce5e8;--paper:#f4f7f7;--teal:#0b786d;--mint:#d8f0e9;--white:#fff}}*{{box-sizing:border-box}}body{{margin:0;background:var(--paper);color:var(--ink);font:15px/1.5 Inter,Segoe UI,Arial,sans-serif}}header{{background:#102d35;color:white;padding:28px max(24px,calc((100vw - 1280px)/2));display:flex;justify-content:space-between;align-items:center}}h1{{font-size:25px;margin:0}}header p{{margin:5px 0 0;color:#c1d4d6}}main{{max-width:1280px;margin:26px auto;padding:0 24px}}.top{{display:grid;grid-template-columns:1.3fr .7fr;gap:18px}}.panel,.stat,.table-wrap{{background:white;border:1px solid var(--line);border-radius:13px}}.panel{{padding:20px}}h2{{font-size:18px;margin:0 0 14px}}.form-grid{{display:grid;grid-template-columns:1fr 1fr;gap:12px}}label{{display:block;color:var(--muted);font-size:13px;font-weight:600}}input,textarea,select{{font:inherit;color:var(--ink);width:100%;margin-top:5px;padding:9px 10px;border:1px solid #cdd9dc;border-radius:8px;background:white}}.hint{{color:var(--muted);font-size:12px;margin:10px 0}}button{{border:0;border-radius:8px;padding:10px 15px;background:var(--teal);color:white;font-weight:650;cursor:pointer}}button.stop{{background:#a74639}}button.subtle{{padding:7px 10px;background:#eaf2f1;color:var(--ink);margin-top:6px}}.actions{{display:flex;gap:9px;margin-top:12px;align-items:center}}.runtime{{color:var(--muted);font-size:13px}}.stats{{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin:18px 0}}.stat{{padding:13px 15px}}.stat span{{display:block;font-size:12px;color:var(--muted)}}.stat strong{{font-size:23px}}.table-wrap{{overflow:auto}}table{{border-collapse:collapse;width:100%;min-width:950px}}th,td{{padding:13px 12px;text-align:left;border-bottom:1px solid var(--line);vertical-align:top}}th{{font-size:12px;color:var(--muted);background:#f8fafa}}td small{{display:block;color:var(--muted);margin-top:3px}}.job-title{{font-weight:700;color:#145d59;text-decoration:none}}.job-title:hover{{text-decoration:underline}}.source{{background:var(--mint);padding:3px 7px;border-radius:99px;font-size:12px}}select{{min-width:150px;margin:0;padding:7px}}summary{{cursor:pointer;color:var(--teal);font-size:13px}}.description{{max-width:350px;max-height:220px;overflow:auto;padding:8px 0;font-size:13px}}details textarea{{min-width:230px}}.history{{color:var(--muted);font-size:13px;padding-left:20px}}.notice{{padding:10px 13px;border-radius:8px;margin-bottom:15px}}.notice-ok{{background:#e7f4ed;border:1px solid #b7dfc8}}.notice-info{{background:#e8f1f8;border:1px solid #b7d0e6}}.notice-error{{background:#fceaea;border:1px solid #e3b0b0;color:#6b2a2a}}.notice-warn{{background:#fff6e5;border:1px solid #e6d0a0}}.analysis-badge{{display:inline-block;padding:4px 10px;border-radius:999px;font-size:12px;font-weight:700;margin:10px 0 6px}}.analysis-ok{{background:#d8f0e9;color:#0b5c52}}.analysis-info{{background:#dceaf6;color:#1d4f74}}.analysis-error{{background:#f6d6d6;color:#7a2424}}.analysis-none{{background:#eceff1;color:#526066}}.analysis-error-text{{color:#7a2424;font-size:13px;margin:8px 0}}.resume-card{{border:1px solid var(--line);border-radius:10px;padding:14px;background:#fbfcfc}}.tabs{{display:flex;gap:8px;margin:0 0 16px}}.tab{{background:#e7eeef;color:var(--ink);padding:9px 16px;border-radius:999px;font-weight:650;cursor:pointer}}.tab.active{{background:var(--teal);color:white}}.tab-panel{{display:none}}.tab-panel.active{{display:block}}.log-console{{font:12.5px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:#0f1c22;color:#d7e6ea;border-radius:10px;padding:12px;max-height:620px;overflow:auto}}.log-line{{display:grid;grid-template-columns:132px 72px 110px 1fr;gap:10px;padding:5px 0;border-bottom:1px solid #1e323b}}.log-time{{color:#8eacb6}}.log-level{{font-weight:700;text-transform:uppercase}}.log-source{{color:#7ec8c0}}.log-msg{{color:#e8f3f5;white-space:pre-wrap;word-break:break-word}}.log-info .log-level{{color:#9ec9ff}}.log-success .log-level{{color:#7ddea8}}.log-warning .log-level{{color:#f0c674}}.log-error .log-level{{color:#f0a0a0}}.log-debug .log-level{{color:#9aa7ad}}.log-empty{{color:#9bb0b8;padding:18px 8px}}.queue-status{{display:inline-block;padding:3px 8px;border-radius:999px;font-size:12px;font-weight:700}}.queue-pending,.queue-retry_wait{{background:#dceaf6;color:#1d4f74}}.queue-running{{background:#d8f0e9;color:#0b5c52}}.queue-succeeded{{background:#e7f4ed;color:#1f6b45}}.queue-failed{{background:#f6d6d6;color:#7a2424}}.queue-cancelled{{background:#eceff1;color:#526066}}.worth-list{{display:grid;gap:14px}}.worth-card{{border:1px solid var(--line);border-radius:12px;padding:14px;background:#fbfcfc}}.worth-head{{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap}}@media(max-width:900px){{.log-line{{grid-template-columns:1fr;gap:2px}}}}@media(max-width:800px){{.top{{grid-template-columns:1fr}}.stats{{grid-template-columns:repeat(2,1fr)}}header{{padding:20px 24px}}.form-grid{{grid-template-columns:1fr}}}}
+      </style></head><body><header><div><h1>Radar de Vagas</h1><p>Busca, seleção e candidaturas automáticas</p></div><span id="collector-state">{esc(state_label)}</span></header><main>{notice_html}<nav class="tabs" aria-label="Seções do painel"><button type="button" class="tab active" data-tab="painel">Painel</button><button type="button" class="tab" data-tab="vale">Vale a pena olhar</button><button type="button" class="tab" data-tab="filas">Filas</button><button type="button" class="tab" data-tab="logs">Logs</button></nav><div id="tab-painel" class="tab-panel active"><div class="top"><section class="panel"><h2>Preferências de busca</h2><form method="post" action="/settings"><div class="form-grid"><label>Cargos e termos, separados por vírgula<textarea name="keywords" rows="3">{esc(cfg.get('keywords',''))}</textarea></label><label>Países/regiões aceitos<textarea name="locations" rows="3">{esc(cfg.get('locations',''))}</textarea></label><label>Fontes: remotive, remoteok, adzuna, apify<input name="sources" value="{esc(cfg.get('sources',''))}"></label><label>Intervalo de busca (minutos)<input name="interval_minutes" type="number" min="5" value="{esc(cfg.get('interval_minutes','15'))}"></label><label>Países Adzuna (ex.: br,us,gb,ca)<input name="adzuna_countries" value="{esc(cfg.get('adzuna_countries','br,us,gb,ca'))}"></label><label>Limite mensal Apify (USD)<input name="apify_monthly_credit_limit_usd" type="number" min="0" step="0.01" value="{esc(cfg.get('apify_monthly_credit_limit_usd','5'))}"></label><label>Máximo de vagas por ciclo Apify<input name="apify_job_count" type="number" min="1" max="100" value="{esc(cfg.get('apify_job_count','25'))}"></label><label style="grid-column:1/-1">Actors Apify (JSON — um ou mais scrapers)<textarea name="apify_actors_json" rows="8" style="font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px">{esc(cfg.get('apify_actors_json',''))}</textarea></label></div><p class="hint">Cada actor: <code>id</code>, <code>label</code>, <code>enabled</code>, <code>input_mode</code> (<code>linkedin_search</code> ou <code>custom</code>), <code>count</code> opcional. Em <code>custom</code>, use <code>input_template</code> com placeholders <code>{{keyword}}</code>, <code>{{location}}</code>, <code>{{count}}</code>, <code>{{keywords}}</code>.</p><button>Salvar preferências</button></form><div class="actions"><form method="post" action="/start"><button>Iniciar bot</button></form><form method="post" action="/stop"><button class="stop">Parar bot</button></form><span class="runtime" id="runtime-message">{esc(status['message'])}</span></div></section><section class="panel"><h2>Execuções recentes</h2><ul class="history" id="run-history">{history}</ul></section></div><section class="panel" style="margin-top:18px"><h2>Currículos (PDF)</h2>{resume_panel}<p class="hint">O seletor de arquivos do sistema abre ao escolher o PDF. A análise agora gera um dossiê completo (skills, experiências, projetos). Use <em>Reanalisar</em> para regenerar com o prompt enriquecido.</p></section>
+<section class="panel" style="margin-top:18px"><h2>Perfil, SMTP e automação</h2><form method="post" action="/ai-settings"><div class="form-grid"><label>Provedor de IA<select name="ai_provider"><option value="gemini" {'selected' if cfg.get('ai_provider') == 'gemini' else ''}>Gemini</option><option value="openai" {'selected' if cfg.get('ai_provider') == 'openai' else ''}>OpenAI</option></select></label><label>Modelo<input name="ai_model" value="{esc(cfg.get('ai_model','gemini-2.5-flash'))}"></label><label>Seu nome<input name="candidate_name" value="{esc(cfg.get('candidate_name',''))}"></label><label>E-mail<input name="candidate_email" value="{esc(cfg.get('candidate_email',''))}"></label><label>Telefone<input name="candidate_phone" value="{esc(cfg.get('candidate_phone',''))}"></label><label>LinkedIn<input name="candidate_linkedin" value="{esc(cfg.get('candidate_linkedin',''))}"></label><label>Cidade<input name="candidate_city" value="{esc(cfg.get('candidate_city',''))}"></label><label>Chave de IA (vazio mantém a salva)<input type="password" name="api_key" autocomplete="new-password"></label><label>Fatos profissionais em português<textarea name="candidate_facts_pt" rows="3">{esc(cfg.get('candidate_facts_pt',''))}</textarea></label><label>Professional facts in English<textarea name="candidate_facts_en" rows="3">{esc(cfg.get('candidate_facts_en',''))}</textarea></label><label>Score mínimo (%)<input name="minimum_match_score" type="number" min="0" max="100" value="{esc(cfg.get('minimum_match_score','80'))}"></label><label>Máximo de candidaturas por ciclo<input name="maximum_applications_per_run" type="number" min="1" max="50" value="{esc(cfg.get('maximum_applications_per_run','5'))}"></label><label>Workers da fila (paralelo)<input name="queue_max_workers" type="number" min="1" max="8" value="{esc(cfg.get('queue_max_workers','3'))}"></label><label>Máx. tentativas por job<input name="queue_max_attempts" type="number" min="1" max="200" value="{esc(cfg.get('queue_max_attempts','40'))}"></label><label>TTL da fila (horas)<input name="queue_ttl_hours" type="number" min="1" max="168" value="{esc(cfg.get('queue_ttl_hours','24'))}"></label><label>Adzuna App ID<input name="adzuna_app_id" value=""></label><label>Adzuna API key<input type="password" name="adzuna_app_key" value=""></label><label>Token Apify<input type="password" name="apify_token" value="" autocomplete="new-password"></label></div><label style="margin:12px 0"><input type="checkbox" name="auto_apply" value="1" {'checked' if cfg.get('auto_apply') == '1' else ''} style="width:auto"> Ativar triagem e candidatura automáticas (e-mail SMTP, depois formulário público)</label><p class="hint">Chaves ficam no cofre do sistema. Match usa o dossiê completo do currículo. Bom match em LinkedIn ou sem canal de envio vai para a aba <strong>Vale a pena olhar</strong>.</p><button>Salvar perfil e IA</button></form></section>
 <section class="panel" style="margin-top:18px"><h2>SMTP</h2><form method="post" action="/smtp-settings"><div class="form-grid"><label>Host<input name="smtp_host" value="{esc(cfg.get('smtp_host',''))}"></label><label>Porta<input name="smtp_port" type="number" value="{esc(cfg.get('smtp_port','587'))}"></label><label>Usuário<input name="smtp_user" value="{esc(cfg.get('smtp_user',''))}"></label><label>Remetente (From)<input name="smtp_from" value="{esc(cfg.get('smtp_from',''))}"></label><label>Senha (vazio mantém)<input type="password" name="smtp_password" autocomplete="new-password"></label><label>TLS<select name="smtp_use_tls"><option value="1" {'selected' if cfg.get('smtp_use_tls','1')=='1' else ''}>Sim (STARTTLS)</option><option value="0" {'selected' if cfg.get('smtp_use_tls')=='0' else ''}>Não</option></select></label></div><div class="actions"><button>Salvar SMTP</button></div></form><form method="post" action="/smtp-test" style="margin-top:8px"><button class="subtle" type="submit">Enviar e-mail de teste</button></form></section>
 <section class="panel" style="margin-top:18px"><h2>Regras de formulário (Playwright)</h2><form method="post" action="/profile-settings">{rules_panel}<p class="hint">Para selects (ex.: salário), coloque em "Valor fixo" o texto da opção preferida. Perguntas abertas sem regra usam a IA; se não houver tokens, a vaga é pulada.</p><button>Salvar regras</button></form></section><div class="stats" id="job-stats">{cards}</div><section class="table-wrap"><table><thead><tr><th>Vaga</th><th>Localidade</th><th>Fonte</th><th>Idioma</th><th>Etapa</th><th>Carta e descrição</th><th>Data</th></tr></thead><tbody id="jobs-body">{rows}</tbody></table></section></div>
+<div id="tab-vale" class="tab-panel"><section class="panel"><h2 style="margin-top:0">Vale a pena olhar</h2><p class="hint">Vagas com bom match que são LinkedIn ou em que e-mail/formulário automático não funcionou. A carta fica pronta para você copiar e candidatar manualmente.</p><div id="worth-body">{worth_view}</div></section></div>
 <div id="tab-filas" class="tab-panel"><section class="panel"><h2 style="margin-top:0">Filas de IA (async + retry)</h2><p class="hint">Análise de currículo e candidaturas rodam em paralelo (até 3 workers). Em fila/rate-limit da API, o job entra em retry automático até sucesso, expirar (24h) ou cancelar.</p><div id="queue-body">{queue_view}</div></section></div>
 <div id="tab-logs" class="tab-panel"><section class="panel"><div class="actions" style="justify-content:space-between;margin-top:0"><h2 style="margin:0">Logs do processo</h2><form method="post" action="/clear-logs"><button class="subtle" type="submit">Limpar logs</button></form></div><p class="hint">Atualiza automaticamente. Mostra coleta, análise de currículo, triagem da IA, SMTP e Playwright.</p><div id="logs-body" class="log-console">{logs_view}</div></section></div></main>
 <script>
@@ -1277,12 +1561,14 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
         var historyEl = document.getElementById("run-history");
         var logsEl = document.getElementById("logs-body");
         var queueEl = document.getElementById("queue-body");
+        var worthEl = document.getElementById("worth-body");
         if (stateEl && stateEl.textContent !== data.state_label) stateEl.textContent = data.state_label;
         if (messageEl && messageEl.textContent !== data.message) messageEl.textContent = data.message;
         if (statsEl && statsEl.innerHTML !== data.stats_html) statsEl.innerHTML = data.stats_html;
         if (jobsEl && jobsEl.innerHTML !== data.jobs_html) jobsEl.innerHTML = data.jobs_html;
         if (historyEl && historyEl.innerHTML !== data.history_html) historyEl.innerHTML = data.history_html;
         if (queueEl && data.queue_html && queueEl.innerHTML !== data.queue_html) queueEl.innerHTML = data.queue_html;
+        if (worthEl && data.worth_html && worthEl.innerHTML !== data.worth_html) worthEl.innerHTML = data.worth_html;
         if (logsEl && data.logs_html && logsEl.innerHTML !== data.logs_html) {{
           var stickBottom = logsEl.scrollTop + logsEl.clientHeight >= logsEl.scrollHeight - 40;
           logsEl.innerHTML = data.logs_html;
@@ -1407,7 +1693,47 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         form = parse_form(self)
+        if path == "/reanalyze-resume":
+            language = (form.get("language") or "").strip().casefold()
+            if language not in {"pt", "en"}:
+                self.redirect("Idioma inválido para reanálise.", notice_kind="error")
+                return
+            with connect() as db:
+                row = get_resume(db, language)
+                if not row:
+                    self.redirect(f"Não há currículo {language.upper()} salvo.", notice_kind="error")
+                    return
+                db.execute(
+                    """UPDATE resumes SET analysis_status='pending', analysis_error='',
+                           analysis_message=?, updated_at=? WHERE language=?""",
+                    (
+                        f"Currículo {language.upper()}: reanálise solicitada — na fila.",
+                        now_iso(),
+                        language,
+                    ),
+                )
+                actives = db.execute(
+                    """SELECT id FROM queue_jobs
+                       WHERE kind=? AND status IN ('pending','running','retry_wait')
+                         AND payload LIKE ?""",
+                    (KIND_RESUME, f'%"{language}"%'),
+                ).fetchall()
+            for active in actives:
+                queue.cancel(int(active["id"]))
+            qid = queue.enqueue(KIND_RESUME, {"language": language}, dedupe_key=f"resume:{language}")
+            msg = f"Reanálise do currículo {language.upper()} enfileirada (job #{qid})."
+            log_event("info", "resume", msg)
+            self.redirect(msg, notice_kind="info")
+            return
+
         if path == "/settings":
+            if "apify_actors_json" in form and form.get("apify_actors_json", "").strip():
+                try:
+                    # Validate before persist.
+                    load_apify_actors({**settings(), "apify_actors_json": form["apify_actors_json"]})
+                except ValueError as exc:
+                    self.redirect(f"Actors Apify inválidos: {exc}", notice_kind="error")
+                    return
             save_settings(form)
             log_event("info", "settings", "Preferências de busca salvas.")
             self.redirect("Filtros salvos.")
