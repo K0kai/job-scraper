@@ -271,6 +271,7 @@ def persist_resume_upload(
     raw_bytes: bytes,
     resumes_dir: str,
     now_iso: str,
+    force_reanalyze: bool = False,
 ) -> tuple[str, str, bool]:
     """Salva o PDF e extrai texto. Não chama a IA.
 
@@ -291,9 +292,18 @@ def persist_resume_upload(
         handle.write(raw_bytes)
     digest = file_sha256(temp_path)
     existing = get_resume(db, language)
-    if existing and existing["file_sha256"] == digest and (existing["analysis_summary"] or "").strip():
+    same_analyzed = (
+        existing
+        and existing["file_sha256"] == digest
+        and (existing["analysis_summary"] or "").strip()
+        and not force_reanalyze
+    )
+    if same_analyzed:
         os.replace(temp_path, stored_path)
-        message = f"Currículo {language.upper()}: PDF idêntico ao já analisado. Análise da IA reutilizada (sem nova chamada)."
+        message = (
+            f"Currículo {language.upper()}: PDF idêntico ao já analisado. "
+            "Análise reutilizada. Use «Reanalisar currículo» ou marque «Forçar nova análise»."
+        )
         db.execute(
             """UPDATE resumes SET original_filename=?, stored_path=?, analysis_status='reused',
                    analysis_error='', analysis_message=?, updated_at=? WHERE language=?""",
@@ -303,10 +313,15 @@ def persist_resume_upload(
 
     extracted = extract_pdf_text(temp_path)
     os.replace(temp_path, stored_path)
-    message = (
-        f"Currículo {language.upper()}: PDF salvo. Análise da IA enfileirada "
-        "(será retentada automaticamente se a API estiver ocupada)."
-    )
+    if force_reanalyze and existing and existing["file_sha256"] == digest:
+        message = (
+            f"Currículo {language.upper()}: mesmo PDF, mas reanálise forçada foi enfileirada."
+        )
+    else:
+        message = (
+            f"Currículo {language.upper()}: PDF salvo. Análise da IA enfileirada "
+            "(será retentada automaticamente se a API estiver ocupada)."
+        )
     _upsert_resume(
         db,
         language=language,
