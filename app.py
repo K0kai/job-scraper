@@ -106,6 +106,7 @@ DEFAULT_SETTINGS = {
     "resume_pt_path": "",
     "resume_en_path": "",
     "auto_apply": "0",
+    "browser_engine": "pydoll",
     "minimum_match_score": "65",
     "maximum_applications_per_run": "5",
     "adzuna_countries": "br,us,gb,ca",
