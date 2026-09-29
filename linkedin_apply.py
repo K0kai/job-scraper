@@ -716,9 +716,15 @@ def apply_via_linkedin(
         )
 
     try:
-        from playwright.sync_api import sync_playwright
+        from browser_engine import engine_install_hint, resolve_sync_playwright
+
+        module = resolve_sync_playwright(cfg)
+        sync_playwright = module.sync_playwright
     except ImportError:
-        return False, "Playwright não instalado. Rode: pip install playwright && playwright install chrome"
+        return False, (
+            "Motor de navegador indisponível. "
+            f"Instale com: {engine_install_hint(cfg)}"
+        )
 
     limit_reason = rate_limit_block_reason(connect_fn, cfg)
     if limit_reason:

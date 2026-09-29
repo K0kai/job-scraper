@@ -42,5 +42,12 @@ class ApplyViaBrowserEngineTests(unittest.TestCase):
         self.assertTrue(callable(apply_channels.apply_via_browser))
 
 
+class LinkedInApplyEngineTests(unittest.TestCase):
+    def test_linkedin_apply_module_importable(self):
+        import linkedin_apply
+
+        self.assertTrue(callable(linkedin_apply.apply_via_linkedin))
+
+
 if __name__ == "__main__":
     unittest.main()
