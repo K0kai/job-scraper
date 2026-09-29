@@ -59,5 +59,18 @@ class BrowserEnginePanelTests(unittest.TestCase):
         self.assertIn("playwright", html)
 
 
+class PydollSmokeTests(unittest.TestCase):
+    def test_sync_playwright_importable(self):
+        from pydoll.playwright.sync_api import sync_playwright
+
+        self.assertTrue(callable(sync_playwright))
+
+    def test_browser_engine_resolves_pydoll_module(self):
+        import browser_engine
+
+        mod = browser_engine.resolve_sync_playwright({"browser_engine": "pydoll"})
+        self.assertTrue(callable(mod.sync_playwright))
+
+
 if __name__ == "__main__":
     unittest.main()
