@@ -109,6 +109,8 @@ DEFAULT_SETTINGS = {
     "apify_monthly_credit_limit_usd": "5",
     "apify_job_count": "25",
     "apify_actors_json": "[{\"id\": \"curious_coder~linkedin-jobs-scraper\", \"label\": \"LinkedIn Jobs\", \"enabled\": true, \"input_mode\": \"linkedin_search\", \"count\": 25}]",
+    "apify_linkedin_filter_json": "",
+    "apify_linkedin_filter_hash": "",
     "smtp_host": "",
     "smtp_port": "587",
     "smtp_user": "",
@@ -910,23 +912,264 @@ def _substitute_apify_value(value: object, ctx: dict[str, str]) -> object:
     return value
 
 
+# LinkedIn Jobs search: f_E = experience, f_WT = workplace type.
+LINKEDIN_EXPERIENCE_CODES = {1, 2, 3, 4, 5, 6}
+LINKEDIN_WORKPLACE_CODES = {1, 2, 3}  # 1 on-site, 2 remote, 3 hybrid
+
+
+def _resume_filter_fingerprint() -> str:
+    with connect() as db:
+        summaries = resume_summaries(db)
+        rows = db.execute(
+            "SELECT language, analyzed_at, file_sha256 FROM resumes ORDER BY language"
+        ).fetchall()
+    blob = json.dumps(
+        {
+            "summaries": summaries,
+            "meta": [
+                {
+                    "language": r["language"],
+                    "analyzed_at": r["analyzed_at"],
+                    "sha": r["file_sha256"],
+                }
+                for r in rows
+            ],
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:24]
+
+
+def _fallback_linkedin_filter(cfg: dict[str, str]) -> dict:
+    keywords = terms(cfg.get("keywords", ""))[:4] or ["software engineer"]
+    locations = terms(cfg.get("locations", ""))[:3] or ["remote"]
+    return {
+        "keywords": keywords,
+        "locations": locations,
+        "experience_levels": [3, 4],
+        "workplace_types": [2, 3],
+        "reason": "Fallback sem IA: keywords/locations das preferências + Mid-Senior/Associate + remote/hybrid.",
+        "source": "fallback",
+    }
+
+
+def _normalize_linkedin_filter(raw: dict, cfg: dict[str, str]) -> dict:
+    fallback = _fallback_linkedin_filter(cfg)
+    keywords = raw.get("keywords") if isinstance(raw.get("keywords"), list) else []
+    keywords = [str(k).strip() for k in keywords if str(k).strip()][:5]
+    if not keywords:
+        keywords = list(fallback["keywords"])
+    locations = raw.get("locations") if isinstance(raw.get("locations"), list) else []
+    locations = [str(x).strip() for x in locations if str(x).strip()][:4]
+    if not locations:
+        locations = list(fallback["locations"])
+    experience = []
+    for item in raw.get("experience_levels") or []:
+        try:
+            code = int(item)
+        except (TypeError, ValueError):
+            continue
+        if code in LINKEDIN_EXPERIENCE_CODES and code not in experience:
+            experience.append(code)
+    if not experience:
+        experience = list(fallback["experience_levels"])
+    workplace = []
+    for item in raw.get("workplace_types") or []:
+        try:
+            code = int(item)
+        except (TypeError, ValueError):
+            continue
+        if code in LINKEDIN_WORKPLACE_CODES and code not in workplace:
+            workplace.append(code)
+    if not workplace:
+        workplace = list(fallback["workplace_types"])
+    reason = str(raw.get("reason") or "").strip()[:400]
+    return {
+        "keywords": keywords,
+        "locations": locations,
+        "experience_levels": experience,
+        "workplace_types": workplace,
+        "reason": reason or fallback["reason"],
+        "source": str(raw.get("source") or "ai"),
+    }
+
+
+def ai_generate_linkedin_search_filter(cfg: dict[str, str]) -> dict:
+    """Pede à IA keywords + níveis LinkedIn (f_E/f_WT) com base no currículo analisado."""
+    with connect() as db:
+        summaries = resume_summaries(db)
+    resume_pt = (summaries.get("pt") or "").strip()
+    resume_en = (summaries.get("en") or "").strip()
+    if not resume_pt and not resume_en:
+        raise ValueError("Analise um currículo antes de gerar o filtro LinkedIn/Apify.")
+
+    facts_pt = (cfg.get("candidate_facts_pt") or "").strip()
+    facts_en = (cfg.get("candidate_facts_en") or "").strip()
+    pref_keywords = cfg.get("keywords", "")
+    pref_locations = cfg.get("locations", "")
+    provider = cfg.get("ai_provider", "gemini").casefold()
+    model = cfg.get("ai_model", "gemini-2.5-flash").strip()
+    api_key = get_ai_key(provider)
+    if not api_key:
+        raise AiUnavailableError("Configure a chave da API de IA para gerar o filtro LinkedIn.")
+
+    prompt = f"""You design LinkedIn Jobs search filters for Apify (curious_coder linkedin-jobs-scraper).
+The scraper takes LinkedIn search URLs. Choose filters that match THIS candidate's real level and stack.
+
+LinkedIn experience codes (f_E): 1 Internship, 2 Entry, 3 Associate, 4 Mid-Senior, 5 Director, 6 Executive.
+LinkedIn workplace codes (f_WT): 1 On-site, 2 Remote, 3 Hybrid.
+
+Rules:
+- Prefer 2–4 experience codes centered on the candidate's seniority (usually include one level below and the main level; avoid jumping to Director/Executive unless the resume clearly supports it).
+- Prefer workplace types the candidate can actually do (default remote+hybrid if unclear).
+- keywords: 2–5 concrete job-search phrases in the language of the target market (mix role + stack when useful), NOT a dump of every skill.
+- locations: 1–4 strings (countries/regions/cities or "Remote" / "Brazil" / "United States" etc.). Prefer the panel preferences when sensible.
+- Do NOT invent employers or skills; only use the resume summaries and facts.
+- Return ONLY JSON with keys:
+  keywords (string array),
+  locations (string array),
+  experience_levels (integer array of f_E codes),
+  workplace_types (integer array of f_WT codes),
+  reason (short string in Portuguese explaining the choice).
+
+Panel keyword preferences: {pref_keywords or '[none]'}
+Panel location preferences: {pref_locations or '[none]'}
+Candidate facts PT: {facts_pt or '[none]'}
+Candidate facts EN: {facts_en or '[none]'}
+Resume summary PT: {resume_pt[:6000] or '[none]'}
+Resume summary EN: {resume_en[:6000] or '[none]'}
+"""
+    try:
+        if provider == "openai":
+            endpoint = "https://api.openai.com/v1/responses"
+            payload = json.dumps(
+                {
+                    "model": model,
+                    "input": prompt,
+                    "text": {"format": {"type": "json_object"}},
+                    "store": False,
+                    "max_output_tokens": 500,
+                }
+            ).encode("utf-8")
+            headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        elif provider == "gemini":
+            endpoint = (
+                f"https://generativelanguage.googleapis.com/v1beta/models/"
+                f"{quote_plus(model)}:generateContent?key={quote_plus(api_key)}"
+            )
+            payload = json.dumps(
+                {
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "generationConfig": {"maxOutputTokens": 500, "responseMimeType": "application/json"},
+                }
+            ).encode("utf-8")
+            headers = {"Content-Type": "application/json"}
+        else:
+            raise ValueError("Provedor de IA inválido.")
+        request = Request(endpoint, data=payload, headers=headers, method="POST")
+        with urlopen(request, timeout=60) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")[:300]
+        if exc.code in {401, 403, 429} or "quota" in body.casefold():
+            raise AiUnavailableError(f"IA indisponível ao gerar filtro LinkedIn (HTTP {exc.code}).") from exc
+        raise
+    except URLError as exc:
+        raise AiUnavailableError(f"IA indisponível ao gerar filtro LinkedIn: {exc}") from exc
+
+    if provider == "openai":
+        raw_text = "\n".join(
+            part.get("text", "")
+            for item in result.get("output", [])
+            for part in item.get("content", [])
+            if part.get("type") == "output_text"
+        )
+    else:
+        raw_text = "\n".join(
+            part.get("text", "")
+            for item in result.get("candidates", [])
+            for part in item.get("content", {}).get("parts", [])
+        )
+    decision = json.loads(raw_text.strip())
+    if not isinstance(decision, dict):
+        raise ValueError("Resposta da IA para filtro LinkedIn inválida.")
+    normalized = _normalize_linkedin_filter(decision, cfg)
+    normalized["source"] = "ai"
+    return normalized
+
+
+def get_linkedin_search_filter(cfg: dict[str, str], *, force_refresh: bool = False) -> dict:
+    """Retorna filtro LinkedIn em cache ou gera com IA quando o currículo mudou."""
+    fingerprint = _resume_filter_fingerprint()
+    cached_hash = (cfg.get("apify_linkedin_filter_hash") or "").strip()
+    cached_raw = (cfg.get("apify_linkedin_filter_json") or "").strip()
+    if not force_refresh and cached_hash == fingerprint and cached_raw:
+        try:
+            data = json.loads(cached_raw)
+            if isinstance(data, dict):
+                out = _normalize_linkedin_filter(data, cfg)
+                out["source"] = str(data.get("source") or "cache")
+                return out
+        except json.JSONDecodeError:
+            pass
+
+    try:
+        generated = ai_generate_linkedin_search_filter(cfg)
+    except (AiUnavailableError, ValueError, json.JSONDecodeError) as exc:
+        log_event("warning", "apify", f"Filtro LinkedIn via IA indisponível ({exc}); usando fallback.")
+        generated = _fallback_linkedin_filter(cfg)
+
+    payload = dict(generated)
+    set_setting("apify_linkedin_filter_json", json.dumps(payload, ensure_ascii=False))
+    set_setting("apify_linkedin_filter_hash", fingerprint)
+    log_event(
+        "info",
+        "apify",
+        "Filtro LinkedIn "
+        f"({payload.get('source')}): keywords={payload['keywords']}, "
+        f"locations={payload['locations']}, f_E={payload['experience_levels']}, "
+        f"f_WT={payload['workplace_types']}. {payload.get('reason', '')}",
+    )
+    return payload
+
+
+def build_linkedin_search_urls(filter_data: dict, *, max_urls: int = 4) -> list[str]:
+    keywords = [str(k) for k in (filter_data.get("keywords") or []) if str(k).strip()][:4]
+    locations = [str(x) for x in (filter_data.get("locations") or []) if str(x).strip()][:3]
+    if not keywords:
+        keywords = ["software engineer"]
+    if not locations:
+        locations = ["remote"]
+    experience = [int(x) for x in (filter_data.get("experience_levels") or []) if int(x) in LINKEDIN_EXPERIENCE_CODES]
+    workplace = [int(x) for x in (filter_data.get("workplace_types") or []) if int(x) in LINKEDIN_WORKPLACE_CODES]
+    f_e = "%2C".join(str(x) for x in experience) if experience else ""
+    f_wt = "%2C".join(str(x) for x in workplace) if workplace else ""
+    urls: list[str] = []
+    for keyword in keywords:
+        for location in locations:
+            url = (
+                f"https://www.linkedin.com/jobs/search/?keywords={quote_plus(keyword)}"
+                f"&location={quote_plus(location)}&position=1&pageNum=0"
+            )
+            if f_e:
+                url += f"&f_E={f_e}"
+            if f_wt:
+                url += f"&f_WT={f_wt}"
+            urls.append(url)
+            if len(urls) >= max_urls:
+                return urls
+    return urls
+
+
 def build_apify_run_input(actor: dict, cfg: dict[str, str]) -> dict:
     keywords = terms(cfg.get("keywords", ""))[:3] or ["software engineer"]
     locations = terms(cfg.get("locations", ""))[:3] or ["remote"]
     count = int(actor.get("count") or 25)
     mode = str(actor.get("input_mode") or "linkedin_search")
     if mode == "linkedin_search":
-        urls: list[str] = []
-        for keyword in keywords:
-            for location in locations:
-                urls.append(
-                    f"https://www.linkedin.com/jobs/search/?keywords={quote_plus(keyword)}"
-                    f"&location={quote_plus(location)}&position=1&pageNum=0"
-                )
-                if len(urls) >= 3:
-                    break
-            if len(urls) >= 3:
-                break
+        filter_data = get_linkedin_search_filter(cfg)
+        urls = build_linkedin_search_urls(filter_data, max_urls=4)
         return {"urls": urls, "count": count, "scrapeCompany": False}
 
     template = actor.get("input_template")
@@ -934,6 +1177,13 @@ def build_apify_run_input(actor: dict, cfg: dict[str, str]) -> dict:
         raise ValueError(
             f"Actor {actor.get('label')} em modo custom precisa de input_template (objeto JSON)."
         )
+    # Prefer AI LinkedIn filter keywords when available for template placeholders.
+    try:
+        linkedin_filter = get_linkedin_search_filter(cfg)
+        keywords = list(linkedin_filter.get("keywords") or keywords)[:3] or keywords
+        locations = list(linkedin_filter.get("locations") or locations)[:3] or locations
+    except Exception:
+        pass
     ctx = {
         "count": str(count),
         "keywords": ", ".join(keywords),
@@ -1638,7 +1888,7 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
     )
     return f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Radar de Vagas</title><style>
       :root{{--ink:#172b36;--muted:#62747d;--line:#dce5e8;--paper:#f4f7f7;--teal:#0b786d;--mint:#d8f0e9;--white:#fff}}*{{box-sizing:border-box}}body{{margin:0;background:var(--paper);color:var(--ink);font:15px/1.5 Inter,Segoe UI,Arial,sans-serif}}header{{background:#102d35;color:white;padding:28px max(24px,calc((100vw - 1280px)/2));display:flex;justify-content:space-between;align-items:center}}h1{{font-size:25px;margin:0}}header p{{margin:5px 0 0;color:#c1d4d6}}main{{max-width:1280px;margin:26px auto;padding:0 24px}}.top{{display:grid;grid-template-columns:1.3fr .7fr;gap:18px}}.panel,.stat,.table-wrap{{background:white;border:1px solid var(--line);border-radius:13px}}.panel{{padding:20px}}h2{{font-size:18px;margin:0 0 14px}}.form-grid{{display:grid;grid-template-columns:1fr 1fr;gap:12px}}label{{display:block;color:var(--muted);font-size:13px;font-weight:600}}input,textarea,select{{font:inherit;color:var(--ink);width:100%;margin-top:5px;padding:9px 10px;border:1px solid #cdd9dc;border-radius:8px;background:white}}.hint{{color:var(--muted);font-size:12px;margin:10px 0}}button{{border:0;border-radius:8px;padding:10px 15px;background:var(--teal);color:white;font-weight:650;cursor:pointer}}button.stop{{background:#a74639}}button.subtle{{padding:7px 10px;background:#eaf2f1;color:var(--ink);margin-top:6px}}.actions{{display:flex;gap:9px;margin-top:12px;align-items:center}}.runtime{{color:var(--muted);font-size:13px}}.stats{{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin:18px 0}}.stat{{padding:13px 15px}}.stat span{{display:block;font-size:12px;color:var(--muted)}}.stat strong{{font-size:23px}}.table-wrap{{overflow:auto}}table{{border-collapse:collapse;width:100%;min-width:950px}}th,td{{padding:13px 12px;text-align:left;border-bottom:1px solid var(--line);vertical-align:top}}th{{font-size:12px;color:var(--muted);background:#f8fafa}}td small{{display:block;color:var(--muted);margin-top:3px}}.job-title{{font-weight:700;color:#145d59;text-decoration:none}}.job-title:hover{{text-decoration:underline}}.source{{background:var(--mint);padding:3px 7px;border-radius:99px;font-size:12px}}select{{min-width:150px;margin:0;padding:7px}}summary{{cursor:pointer;color:var(--teal);font-size:13px}}.description{{max-width:350px;max-height:220px;overflow:auto;padding:8px 0;font-size:13px}}details textarea{{min-width:230px}}.history{{color:var(--muted);font-size:13px;padding-left:20px}}.notice{{padding:10px 13px;border-radius:8px;margin-bottom:15px}}.notice-ok{{background:#e7f4ed;border:1px solid #b7dfc8}}.notice-info{{background:#e8f1f8;border:1px solid #b7d0e6}}.notice-error{{background:#fceaea;border:1px solid #e3b0b0;color:#6b2a2a}}.notice-warn{{background:#fff6e5;border:1px solid #e6d0a0}}.analysis-badge{{display:inline-block;padding:4px 10px;border-radius:999px;font-size:12px;font-weight:700;margin:10px 0 6px}}.analysis-ok{{background:#d8f0e9;color:#0b5c52}}.analysis-info{{background:#dceaf6;color:#1d4f74}}.analysis-error{{background:#f6d6d6;color:#7a2424}}.analysis-none{{background:#eceff1;color:#526066}}.analysis-error-text{{color:#7a2424;font-size:13px;margin:8px 0}}.resume-card{{border:1px solid var(--line);border-radius:10px;padding:14px;background:#fbfcfc}}.tabs{{display:flex;gap:8px;margin:0 0 16px}}.tab{{background:#e7eeef;color:var(--ink);padding:9px 16px;border-radius:999px;font-weight:650;cursor:pointer}}.tab.active{{background:var(--teal);color:white}}.tab-panel{{display:none}}.tab-panel.active{{display:block}}.log-console{{font:12.5px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:#0f1c22;color:#d7e6ea;border-radius:10px;padding:12px;max-height:620px;overflow:auto}}.log-line{{display:grid;grid-template-columns:132px 72px 110px 1fr;gap:10px;padding:5px 0;border-bottom:1px solid #1e323b}}.log-time{{color:#8eacb6}}.log-level{{font-weight:700;text-transform:uppercase}}.log-source{{color:#7ec8c0}}.log-msg{{color:#e8f3f5;white-space:pre-wrap;word-break:break-word}}.log-info .log-level{{color:#9ec9ff}}.log-success .log-level{{color:#7ddea8}}.log-warning .log-level{{color:#f0c674}}.log-error .log-level{{color:#f0a0a0}}.log-debug .log-level{{color:#9aa7ad}}.log-empty{{color:#9bb0b8;padding:18px 8px}}.queue-status{{display:inline-block;padding:3px 8px;border-radius:999px;font-size:12px;font-weight:700}}.queue-pending,.queue-retry_wait{{background:#dceaf6;color:#1d4f74}}.queue-running{{background:#d8f0e9;color:#0b5c52}}.queue-succeeded{{background:#e7f4ed;color:#1f6b45}}.queue-failed{{background:#f6d6d6;color:#7a2424}}.queue-cancelled{{background:#eceff1;color:#526066}}.worth-list{{display:grid;gap:14px}}.worth-card{{border:1px solid var(--line);border-radius:12px;padding:14px;background:#fbfcfc}}.worth-head{{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap}}@media(max-width:900px){{.log-line{{grid-template-columns:1fr;gap:2px}}}}@media(max-width:800px){{.top{{grid-template-columns:1fr}}.stats{{grid-template-columns:repeat(2,1fr)}}header{{padding:20px 24px}}.form-grid{{grid-template-columns:1fr}}}}
-      </style></head><body><header><div><h1>Radar de Vagas</h1><p>Busca, seleção e candidaturas automáticas</p></div><span id="collector-state">{esc(state_label)}</span></header><main>{notice_html}<nav class="tabs" aria-label="Seções do painel"><button type="button" class="tab active" data-tab="painel">Painel</button><button type="button" class="tab" data-tab="vale">Vale a pena olhar</button><button type="button" class="tab" data-tab="filas">Filas</button><button type="button" class="tab" data-tab="logs">Logs</button></nav><div id="tab-painel" class="tab-panel active"><div class="top"><section class="panel"><h2>Preferências de busca</h2><form method="post" action="/settings"><div class="form-grid"><label>Cargos e termos, separados por vírgula<textarea name="keywords" rows="3">{esc(cfg.get('keywords',''))}</textarea></label><label>Países/regiões aceitos<textarea name="locations" rows="3">{esc(cfg.get('locations',''))}</textarea></label><label>Fontes: remotive, remoteok, adzuna, apify<input name="sources" value="{esc(cfg.get('sources',''))}"></label><label>Intervalo de busca (minutos)<input name="interval_minutes" type="number" min="5" value="{esc(cfg.get('interval_minutes','15'))}"></label><label>Países Adzuna (ex.: br,us,gb,ca)<input name="adzuna_countries" value="{esc(cfg.get('adzuna_countries','br,us,gb,ca'))}"></label><label>Limite mensal Apify (USD)<input name="apify_monthly_credit_limit_usd" type="number" min="0" step="0.01" value="{esc(cfg.get('apify_monthly_credit_limit_usd','5'))}"></label><label>Máximo de vagas por ciclo Apify<input name="apify_job_count" type="number" min="1" max="100" value="{esc(cfg.get('apify_job_count','25'))}"></label><label style="grid-column:1/-1">Actors Apify (JSON — um ou mais scrapers)<textarea name="apify_actors_json" rows="8" style="font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px">{esc(cfg.get('apify_actors_json',''))}</textarea></label></div><p class="hint">Cada actor: <code>id</code>, <code>label</code>, <code>enabled</code>, <code>input_mode</code> (<code>linkedin_search</code> ou <code>custom</code>), <code>count</code> opcional. Em <code>custom</code>, use <code>input_template</code> com placeholders <code>{{keyword}}</code>, <code>{{location}}</code>, <code>{{count}}</code>, <code>{{keywords}}</code>.</p><button>Salvar preferências</button></form><div class="actions"><form method="post" action="/start" class="js-process-form"><button>Iniciar bot</button></form><form method="post" action="/stop" class="js-process-form"><button class="stop">Parar bot</button></form><span class="runtime" id="runtime-message">{esc(status['message'])}</span></div></section><section class="panel"><h2>Execuções recentes</h2><ul class="history" id="run-history">{history}</ul></section></div><section class="panel" style="margin-top:18px"><h2>Currículos (PDF)</h2>{resume_panel}<p class="hint">O seletor de arquivos do sistema abre ao escolher o PDF. A análise agora gera um dossiê completo (skills, experiências, projetos). Use <em>Reanalisar</em> para regenerar com o prompt enriquecido.</p></section>
+      </style></head><body><header><div><h1>Radar de Vagas</h1><p>Busca, seleção e candidaturas automáticas</p></div><span id="collector-state">{esc(state_label)}</span></header><main>{notice_html}<nav class="tabs" aria-label="Seções do painel"><button type="button" class="tab active" data-tab="painel">Painel</button><button type="button" class="tab" data-tab="vale">Vale a pena olhar</button><button type="button" class="tab" data-tab="filas">Filas</button><button type="button" class="tab" data-tab="logs">Logs</button></nav><div id="tab-painel" class="tab-panel active"><div class="top"><section class="panel"><h2>Preferências de busca</h2><form method="post" action="/settings"><div class="form-grid"><label>Cargos e termos, separados por vírgula<textarea name="keywords" rows="3">{esc(cfg.get('keywords',''))}</textarea></label><label>Países/regiões aceitos<textarea name="locations" rows="3">{esc(cfg.get('locations',''))}</textarea></label><label>Fontes: remotive, remoteok, adzuna, apify<input name="sources" value="{esc(cfg.get('sources',''))}"></label><label>Intervalo de busca (minutos)<input name="interval_minutes" type="number" min="5" value="{esc(cfg.get('interval_minutes','15'))}"></label><label>Países Adzuna (ex.: br,us,gb,ca)<input name="adzuna_countries" value="{esc(cfg.get('adzuna_countries','br,us,gb,ca'))}"></label><label>Limite mensal Apify (USD)<input name="apify_monthly_credit_limit_usd" type="number" min="0" step="0.01" value="{esc(cfg.get('apify_monthly_credit_limit_usd','5'))}"></label><label>Máximo de vagas por ciclo Apify<input name="apify_job_count" type="number" min="1" max="100" value="{esc(cfg.get('apify_job_count','25'))}"></label><label style="grid-column:1/-1">Actors Apify (JSON — um ou mais scrapers)<textarea name="apify_actors_json" rows="8" style="font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px">{esc(cfg.get('apify_actors_json',''))}</textarea></label></div><p class="hint">Cada actor: <code>id</code>, <code>label</code>, <code>enabled</code>, <code>input_mode</code> (<code>linkedin_search</code> ou <code>custom</code>), <code>count</code> opcional. Em <code>linkedin_search</code>, a IA monta sozinha keywords + f_E (nível) + f_WT (remote/híbrido) a partir do currículo (cache até reanalisar). Em <code>custom</code>, use <code>input_template</code> com placeholders <code>{{keyword}}</code>, <code>{{location}}</code>, <code>{{count}}</code>, <code>{{keywords}}</code>.</p><button>Salvar preferências</button></form><div class="actions"><form method="post" action="/start" class="js-process-form"><button>Iniciar bot</button></form><form method="post" action="/stop" class="js-process-form"><button class="stop">Parar bot</button></form><span class="runtime" id="runtime-message">{esc(status['message'])}</span></div></section><section class="panel"><h2>Execuções recentes</h2><ul class="history" id="run-history">{history}</ul></section></div><section class="panel" style="margin-top:18px"><h2>Currículos (PDF)</h2>{resume_panel}<p class="hint">O seletor de arquivos do sistema abre ao escolher o PDF. A análise agora gera um dossiê completo (skills, experiências, projetos). Use <em>Reanalisar</em> para regenerar com o prompt enriquecido.</p></section>
 <section class="panel" style="margin-top:18px"><h2>Perfil, SMTP e automação</h2><form method="post" action="/ai-settings"><div class="form-grid"><label>Provedor de IA<select name="ai_provider"><option value="gemini" {'selected' if cfg.get('ai_provider') == 'gemini' else ''}>Gemini</option><option value="openai" {'selected' if cfg.get('ai_provider') == 'openai' else ''}>OpenAI</option></select></label><label>Modelo<input name="ai_model" value="{esc(cfg.get('ai_model','gemini-2.5-flash'))}"></label><label>Seu nome<input name="candidate_name" value="{esc(cfg.get('candidate_name',''))}"></label><label>E-mail<input name="candidate_email" value="{esc(cfg.get('candidate_email',''))}"></label><label>Telefone<input name="candidate_phone" value="{esc(cfg.get('candidate_phone',''))}"></label><label>LinkedIn<input name="candidate_linkedin" value="{esc(cfg.get('candidate_linkedin',''))}"></label><label>Cidade<input name="candidate_city" value="{esc(cfg.get('candidate_city',''))}"></label><label>Chave de IA (vazio mantém a salva)<input type="password" name="api_key" autocomplete="new-password"></label><label>Fatos profissionais em português<textarea name="candidate_facts_pt" rows="3">{esc(cfg.get('candidate_facts_pt',''))}</textarea></label><label>Professional facts in English<textarea name="candidate_facts_en" rows="3">{esc(cfg.get('candidate_facts_en',''))}</textarea></label><label>Score mínimo (%)<input name="minimum_match_score" type="number" min="0" max="100" value="{esc(cfg.get('minimum_match_score','80'))}"></label><label>Máximo de candidaturas por ciclo<input name="maximum_applications_per_run" type="number" min="1" max="50" value="{esc(cfg.get('maximum_applications_per_run','5'))}"></label><label>Workers da fila (paralelo)<input name="queue_max_workers" type="number" min="1" max="8" value="{esc(cfg.get('queue_max_workers','3'))}"></label><label>Máx. tentativas por job<input name="queue_max_attempts" type="number" min="1" max="200" value="{esc(cfg.get('queue_max_attempts','40'))}"></label><label>TTL da fila (horas)<input name="queue_ttl_hours" type="number" min="1" max="168" value="{esc(cfg.get('queue_ttl_hours','24'))}"></label><label>Adzuna App ID<input name="adzuna_app_id" value=""></label><label>Adzuna API key<input type="password" name="adzuna_app_key" value=""></label><label>Token Apify<input type="password" name="apify_token" value="" autocomplete="new-password"></label></div><label style="margin:12px 0"><input type="checkbox" name="auto_apply" value="1" {'checked' if cfg.get('auto_apply') == '1' else ''} style="width:auto"> Ativar triagem e candidatura automáticas (e-mail SMTP, depois formulário público)</label><p class="hint">Chaves ficam no cofre do sistema. Match usa o dossiê completo do currículo. Bom match em LinkedIn ou sem canal de envio vai para a aba <strong>Vale a pena olhar</strong>.</p><button>Salvar perfil e IA</button></form></section>
 <section class="panel" style="margin-top:18px"><h2>SMTP</h2><form method="post" action="/smtp-settings"><div class="form-grid"><label>Host<input name="smtp_host" value="{esc(cfg.get('smtp_host',''))}"></label><label>Porta<input name="smtp_port" type="number" value="{esc(cfg.get('smtp_port','587'))}"></label><label>Usuário<input name="smtp_user" value="{esc(cfg.get('smtp_user',''))}"></label><label>Remetente (From)<input name="smtp_from" value="{esc(cfg.get('smtp_from',''))}"></label><label>Senha (vazio mantém)<input type="password" name="smtp_password" autocomplete="new-password"></label><label>TLS<select name="smtp_use_tls"><option value="1" {'selected' if cfg.get('smtp_use_tls','1')=='1' else ''}>Sim (STARTTLS)</option><option value="0" {'selected' if cfg.get('smtp_use_tls')=='0' else ''}>Não</option></select></label></div><div class="actions"><button>Salvar SMTP</button></div></form><form method="post" action="/smtp-test" style="margin-top:8px"><button class="subtle" type="submit">Enviar e-mail de teste</button></form></section>
 <section class="panel" style="margin-top:18px"><h2>Regras de formulário (Playwright)</h2><form method="post" action="/profile-settings">{rules_panel}<p class="hint">Para selects (ex.: salário), coloque em "Valor fixo" o texto da opção preferida. Perguntas abertas sem regra usam a IA; se não houver tokens, a vaga é pulada.</p><button>Salvar regras</button></form></section><div class="stats" id="job-stats">{cards}</div><section class="table-wrap"><table><thead><tr><th>Vaga</th><th>Localidade</th><th>Fonte</th><th>Idioma</th><th>Etapa</th><th>Carta e descrição</th><th>Data</th></tr></thead><tbody id="jobs-body">{rows}</tbody></table></section></div>
