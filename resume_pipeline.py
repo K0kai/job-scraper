@@ -178,7 +178,7 @@ def _upsert_resume(
     )
 
 
-def store_resume_upload(
+def persist_resume_upload(
     db: sqlite3.Connection,
     *,
     language: str,
@@ -186,14 +186,10 @@ def store_resume_upload(
     raw_bytes: bytes,
     resumes_dir: str,
     now_iso: str,
-    provider: str,
-    model: str,
-    api_key: str,
-    get_ai_key: Callable[[str], str] | None = None,
 ) -> tuple[str, str, bool]:
-    """Salva PDF e analisa se o hash mudou.
+    """Salva o PDF e extrai texto. Não chama a IA.
 
-    Retorna (mensagem, notice_kind, reanalyzed) onde notice_kind é success|info|error.
+    Retorna (mensagem, notice_kind, needs_analysis).
     """
     if language not in {"pt", "en"}:
         raise ValueError("Idioma do currículo deve ser pt ou en.")
@@ -220,66 +216,85 @@ def store_resume_upload(
         )
         return message, "info", False
 
-    extracted = ""
-    try:
-        extracted = extract_pdf_text(temp_path)
-        key = api_key or (get_ai_key(provider) if get_ai_key else "")
-        analysis = analyze_resume_text(extracted, language, provider=provider, model=model, api_key=key)
-        summary = str(analysis.get("summary") or "").strip()
-        os.replace(temp_path, stored_path)
-        message = (
-            f"Currículo {language.upper()}: PDF salvo e análise da IA concluída com sucesso "
-            f"({provider}/{model})."
-        )
-        _upsert_resume(
-            db,
-            language=language,
-            original_filename=original_filename,
-            stored_path=stored_path,
-            digest=digest,
-            extracted_text=extracted,
-            analysis_json=json.dumps(analysis, ensure_ascii=False),
-            analysis_summary=summary,
-            analyzed_at=now_iso,
-            provider=provider,
-            model=model,
-            analysis_status="ok",
-            analysis_error="",
-            analysis_message=message,
-            now_iso=now_iso,
-        )
-        return message, "success", True
-    except Exception as exc:
-        # Keep the uploaded file when possible so the user sees the failed attempt.
-        try:
-            os.replace(temp_path, stored_path)
-        except OSError:
-            if os.path.exists(temp_path):
-                try:
-                    os.remove(temp_path)
-                except OSError:
-                    pass
-            stored_path = (existing["stored_path"] if existing else stored_path)
-        err = f"{exc.__class__.__name__}: {exc}"
-        message = f"Currículo {language.upper()}: falha na análise da IA. {err}"
-        prev_summary = (existing["analysis_summary"] if existing else "") or ""
-        prev_json = (existing["analysis_json"] if existing else "") or ""
-        prev_analyzed = existing["analyzed_at"] if existing else None
-        _upsert_resume(
-            db,
-            language=language,
-            original_filename=original_filename,
-            stored_path=stored_path if os.path.exists(stored_path) else (existing["stored_path"] if existing else ""),
-            digest=digest,
-            extracted_text=extracted or ((existing["extracted_text"] if existing else "") or ""),
-            analysis_json=prev_json,
-            analysis_summary=prev_summary,
-            analyzed_at=prev_analyzed,
-            provider=provider,
-            model=model,
-            analysis_status="error",
-            analysis_error=err,
-            analysis_message=message,
-            now_iso=now_iso,
-        )
-        return message, "error", False
+    extracted = extract_pdf_text(temp_path)
+    os.replace(temp_path, stored_path)
+    message = (
+        f"Currículo {language.upper()}: PDF salvo. Análise da IA enfileirada "
+        "(será retentada automaticamente se a API estiver ocupada)."
+    )
+    _upsert_resume(
+        db,
+        language=language,
+        original_filename=original_filename,
+        stored_path=stored_path,
+        digest=digest,
+        extracted_text=extracted,
+        analysis_json=(existing["analysis_json"] if existing else "") or "",
+        analysis_summary=(existing["analysis_summary"] if existing else "") or "",
+        analyzed_at=existing["analyzed_at"] if existing else None,
+        provider="",
+        model="",
+        analysis_status="pending",
+        analysis_error="",
+        analysis_message=message,
+        now_iso=now_iso,
+    )
+    return message, "info", True
+
+
+def run_resume_analysis(
+    db: sqlite3.Connection,
+    *,
+    language: str,
+    provider: str,
+    model: str,
+    api_key: str,
+    now_iso: str,
+) -> str:
+    """Executa a análise de IA do currículo já persistido. Pode levantar AiUnavailableError."""
+    row = get_resume(db, language)
+    if not row:
+        raise ValueError(f"Nenhum currículo {language} salvo para analisar.")
+    text = (row["extracted_text"] or "").strip()
+    if not text:
+        if row["stored_path"] and os.path.exists(row["stored_path"]):
+            text = extract_pdf_text(row["stored_path"])
+        else:
+            raise ValueError("Currículo sem texto extraído.")
+    analysis = analyze_resume_text(text, language, provider=provider, model=model, api_key=api_key)
+    summary = str(analysis.get("summary") or "").strip()
+    message = f"Currículo {language.upper()}: análise da IA concluída ({provider}/{model})."
+    _upsert_resume(
+        db,
+        language=language,
+        original_filename=row["original_filename"],
+        stored_path=row["stored_path"],
+        digest=row["file_sha256"],
+        extracted_text=text,
+        analysis_json=json.dumps(analysis, ensure_ascii=False),
+        analysis_summary=summary,
+        analyzed_at=now_iso,
+        provider=provider,
+        model=model,
+        analysis_status="ok",
+        analysis_error="",
+        analysis_message=message,
+        now_iso=now_iso,
+    )
+    return message
+
+
+def mark_resume_analysis_error(db: sqlite3.Connection, language: str, error: str, now_iso: str) -> None:
+    row = get_resume(db, language)
+    if not row:
+        return
+    db.execute(
+        """UPDATE resumes SET analysis_status='error', analysis_error=?, analysis_message=?, updated_at=?
+           WHERE language=?""",
+        (error[:1000], f"Currículo {language.upper()}: falha na análise — {error}"[:500], now_iso, language),
+    )
+
+
+# Compat: antigo nome usado em imports/testes.
+def store_resume_upload(*args, **kwargs):  # type: ignore[no-untyped-def]
+    raise RuntimeError("Use persist_resume_upload + fila de análise (run_resume_analysis).")
