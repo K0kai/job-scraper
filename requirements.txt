@@ -1,0 +1,2 @@
+keyring>=25,<26
+lingua-language-detector>=2.1,<3
