@@ -258,9 +258,15 @@ def apply_via_browser(
     now_iso: str,
 ) -> tuple[bool, str]:
     try:
-        from playwright.sync_api import sync_playwright
+        from browser_engine import engine_install_hint, resolve_sync_playwright
+
+        module = resolve_sync_playwright(cfg)
+        sync_playwright = module.sync_playwright
     except ImportError:
-        return False, "Playwright não instalado. Rode: pip install playwright && playwright install chromium"
+        return False, (
+            "Motor de navegador indisponível. "
+            f"Instale com: {engine_install_hint(cfg)}"
+        )
 
     with connect_fn() as db:
         rules = [dict(row) for row in list_rules(db)]

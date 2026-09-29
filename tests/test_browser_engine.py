@@ -35,5 +35,12 @@ class ResolveEngineTests(unittest.TestCase):
         self.assertIn("playwright install", hint)
 
 
+class ApplyViaBrowserEngineTests(unittest.TestCase):
+    def test_apply_via_browser_module_importable(self):
+        import apply_channels
+
+        self.assertTrue(callable(apply_channels.apply_via_browser))
+
+
 if __name__ == "__main__":
     unittest.main()
