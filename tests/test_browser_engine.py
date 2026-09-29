@@ -49,5 +49,15 @@ class LinkedInApplyEngineTests(unittest.TestCase):
         self.assertTrue(callable(linkedin_apply.apply_via_linkedin))
 
 
+class BrowserEnginePanelTests(unittest.TestCase):
+    def test_settings_panel_offers_engine_selector(self):
+        from app import render_page
+
+        html = render_page()
+        self.assertIn('name="browser_engine"', html)
+        self.assertIn("pydoll", html)
+        self.assertIn("playwright", html)
+
+
 if __name__ == "__main__":
     unittest.main()
