@@ -1374,29 +1374,52 @@ def live_payload() -> dict:
     status = collector.snapshot()
     counts, jobs, runs = load_dashboard()
     collecting = status["state"] in {"running", "stopping"}
+    stats = stats_html(counts)
+    jobs_body = job_rows_html(jobs, collecting)
+    history = history_html(runs)
+    logs = logs_html()
+    queue = queue_html()
+    worth = worth_html()
     return {
         "state": status["state"],
         "state_label": state_label_for(status["state"]),
         "message": status["message"],
-        "stats_html": stats_html(counts),
-        "jobs_html": job_rows_html(jobs, collecting),
-        "history_html": history_html(runs),
-        "logs_html": logs_html(),
-        "queue_html": queue_html(),
-        "worth_html": worth_html(),
-        "resume_status_html": resume_status_payload(),
+        "stats_html": stats,
+        "stats_hash": _live_hash(stats),
+        "jobs_html": jobs_body,
+        "jobs_hash": _live_hash(jobs_body),
+        "history_html": history,
+        "history_hash": _live_hash(history),
+        "logs_html": logs,
+        "logs_hash": _live_hash(logs),
+        "queue_html": queue,
+        "queue_hash": _live_hash(queue),
+        "worth_html": worth,
+        "worth_hash": _live_hash(worth),
+        "resume_status": resume_status_payload(),
     }
 
 
-def resume_status_html_for(lang: str) -> str:
-    """HTML só da zona de status (badge/dossiê/reanalisar). Sem input de arquivo."""
+def _live_hash(text: str) -> str:
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:16]
+
+
+def resume_status_parts(lang: str) -> dict[str, str]:
+    """Partes do status do currículo: meta (leve) e dossiê (só muda com a análise)."""
     with connect() as db:
         row = get_resume(db, lang)
     if not row:
-        return (
+        meta = (
             '<div class="analysis-badge analysis-none">Sem PDF</div>'
             '<p class="hint">Nenhum currículo enviado. Escolha um PDF e clique em enviar para a IA analisar.</p>'
         )
+        dossier = ""
+        return {
+            "meta_html": meta,
+            "dossier_html": dossier,
+            "meta_hash": _live_hash(meta),
+            "dossier_hash": _live_hash(dossier),
+        }
     raw_status = (row["analysis_status"] if "analysis_status" in row.keys() else "") or (
         "ok" if (row["analysis_summary"] or "").strip() else "none"
     )
@@ -1417,6 +1440,25 @@ def resume_status_html_for(lang: str) -> str:
         or ("Análise concluída." if raw_status in {"ok", "reused"} else "Sem mensagem.")
     )
     error = esc((row["analysis_error"] if "analysis_error" in row.keys() else "") or "")
+    reanalyze = (
+        f'<form method="post" action="/reanalyze-resume" class="js-process-form" style="margin-top:10px">'
+        f'<input type="hidden" name="language" value="{lang}">'
+        f'<button type="submit" style="width:100%">Reanalisar currículo com IA</button></form>'
+        f'<p class="hint">Gera uma nova análise mesmo com o mesmo PDF (útil após melhorar o prompt).</p>'
+    )
+    error_block = (
+        f'<p class="analysis-error-text"><strong>Detalhe do erro:</strong> {error}</p>'
+        if error and raw_status == "error"
+        else ""
+    )
+    meta = (
+        f'<div class="analysis-badge {badge_class}">{badge_label}</div>'
+        f'<p class="hint"><strong>Arquivo:</strong> {filename}<br>'
+        f'<strong>Última análise:</strong> {when}<br>'
+        f'<strong>Modelo:</strong> {provider} / {model}</p>'
+        f'<p class="hint">{message}</p>'
+        f"{reanalyze}{error_block}"
+    )
     summary = esc((row["analysis_summary"] or "")[:6000])
     structured = ""
     try:
@@ -1438,34 +1480,45 @@ def resume_status_html_for(lang: str) -> str:
             structured += "<p><strong>Experiências capturadas:</strong> " + esc(str(len(experience))) + "</p><ul>" + "".join(
                 f"<li>{esc(str(item)[:280])}</li>" for item in experience[:12]
             ) + "</ul>"
-    error_block = (
-        f'<p class="analysis-error-text"><strong>Detalhe do erro:</strong> {error}</p>'
-        if error and raw_status == "error"
-        else ""
+    if summary:
+        dossier = (
+            f"{structured}"
+            f'<details class="resume-dossier" open>'
+            f"<summary>Dossiê completo da análise</summary>"
+            f'<div class="description resume-dossier-scroll" style="max-width:100%;max-height:420px;white-space:pre-wrap">{summary}</div>'
+            f"</details>"
+        )
+    else:
+        dossier = '<p class="hint">Ainda não há dossiê salvo (análise incompleta ou falhou).</p>'
+    # Hash do dossiê ignora mensagens transitórias da fila — só conteúdo da análise.
+    dossier_key = "|".join(
+        (
+            raw_status,
+            row["analyzed_at"] or "",
+            row["analysis_json"] or "",
+            row["analysis_summary"] or "",
+            row["analysis_error"] or "",
+        )
     )
-    summary_block = (
-        f'{structured}<details open><summary>Dossiê completo da análise</summary><div class="description" style="max-width:100%;max-height:420px;white-space:pre-wrap">{summary}</div></details>'
-        if summary
-        else '<p class="hint">Ainda não há dossiê salvo (análise incompleta ou falhou).</p>'
-    )
-    reanalyze = (
-        f'<form method="post" action="/reanalyze-resume" class="js-process-form" style="margin-top:10px">'
-        f'<input type="hidden" name="language" value="{lang}">'
-        f'<button type="submit" style="width:100%">Reanalisar currículo com IA</button></form>'
-        f'<p class="hint">Gera uma nova análise mesmo com o mesmo PDF (útil após melhorar o prompt).</p>'
-    )
+    return {
+        "meta_html": meta,
+        "dossier_html": dossier,
+        "meta_hash": _live_hash(meta),
+        "dossier_hash": _live_hash(dossier_key),
+    }
+
+
+def resume_status_html_for(lang: str) -> str:
+    """HTML combinado da zona de status (meta + dossiê). Sem input de arquivo."""
+    parts = resume_status_parts(lang)
     return (
-        f'<div class="analysis-badge {badge_class}">{badge_label}</div>'
-        f'<p class="hint"><strong>Arquivo:</strong> {filename}<br>'
-        f'<strong>Última análise:</strong> {when}<br>'
-        f'<strong>Modelo:</strong> {provider} / {model}</p>'
-        f'<p class="hint">{message}</p>'
-        f"{reanalyze}{error_block}{summary_block}"
+        f'<div id="resume-meta-{lang}" data-hash="{parts["meta_hash"]}">{parts["meta_html"]}</div>'
+        f'<div id="resume-dossier-{lang}" data-hash="{parts["dossier_hash"]}">{parts["dossier_html"]}</div>'
     )
 
 
-def resume_status_payload() -> dict[str, str]:
-    return {"pt": resume_status_html_for("pt"), "en": resume_status_html_for("en")}
+def resume_status_payload() -> dict[str, dict[str, str]]:
+    return {"pt": resume_status_parts("pt"), "en": resume_status_parts("en")}
 
 
 def resume_panels_html() -> str:
@@ -1579,6 +1632,43 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
       if (target) target.click();
     }}
   }} catch (e) {{}}
+  var appliedHashes = {{}};
+  function panelBusy(el) {{
+    if (!el) return false;
+    try {{
+      if (el.matches(":hover")) return true;
+      if (el.querySelector(":hover")) return true;
+    }} catch (e) {{}}
+    if (el.contains(document.activeElement)) return true;
+    return false;
+  }}
+  function applyRegion(el, html, hash, opts) {{
+    opts = opts || {{}};
+    if (!el || html == null || hash == null) return;
+    if (appliedHashes[opts.key] === hash || el.getAttribute("data-hash") === hash) {{
+      appliedHashes[opts.key] = hash;
+      return;
+    }}
+    if (opts.skipIfBusy && panelBusy(el)) return;
+    var scrollEl = opts.scrollSelector ? el.querySelector(opts.scrollSelector) : null;
+    var scrollTop = scrollEl ? scrollEl.scrollTop : 0;
+    var details = opts.preserveDetails ? el.querySelector("details") : null;
+    var wasOpen = details ? details.open : null;
+    var wrap = opts.wrapScroll ? el.closest(opts.wrapScroll) : null;
+    var wrapTop = wrap ? wrap.scrollTop : 0;
+    el.innerHTML = html;
+    el.setAttribute("data-hash", hash);
+    appliedHashes[opts.key] = hash;
+    if (scrollEl) {{
+      var again = el.querySelector(opts.scrollSelector);
+      if (again) again.scrollTop = scrollTop;
+    }}
+    if (details != null) {{
+      var d2 = el.querySelector("details");
+      if (d2 && wasOpen !== null) d2.open = wasOpen;
+    }}
+    if (wrap) wrap.scrollTop = wrapTop;
+  }}
   function refresh() {{
     if (inFlight || document.hidden) return;
     inFlight = true;
@@ -1593,27 +1683,36 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
         var logsEl = document.getElementById("logs-body");
         var queueEl = document.getElementById("queue-body");
         var worthEl = document.getElementById("worth-body");
-        var resumePt = document.getElementById("resume-status-pt");
-        var resumeEn = document.getElementById("resume-status-en");
         if (stateEl && stateEl.textContent !== data.state_label) stateEl.textContent = data.state_label;
         if (messageEl && messageEl.textContent !== data.message) messageEl.textContent = data.message;
-        if (statsEl && statsEl.innerHTML !== data.stats_html) statsEl.innerHTML = data.stats_html;
-        if (jobsEl && jobsEl.innerHTML !== data.jobs_html) jobsEl.innerHTML = data.jobs_html;
-        if (historyEl && historyEl.innerHTML !== data.history_html) historyEl.innerHTML = data.history_html;
-        if (queueEl && data.queue_html && queueEl.innerHTML !== data.queue_html) queueEl.innerHTML = data.queue_html;
-        if (worthEl && data.worth_html && worthEl.innerHTML !== data.worth_html) worthEl.innerHTML = data.worth_html;
-        if (data.resume_status_html) {{
-          if (resumePt && data.resume_status_html.pt && resumePt.innerHTML !== data.resume_status_html.pt) {{
-            resumePt.innerHTML = data.resume_status_html.pt;
-          }}
-          if (resumeEn && data.resume_status_html.en && resumeEn.innerHTML !== data.resume_status_html.en) {{
-            resumeEn.innerHTML = data.resume_status_html.en;
-          }}
+        applyRegion(statsEl, data.stats_html, data.stats_hash, {{ key: "stats" }});
+        applyRegion(jobsEl, data.jobs_html, data.jobs_hash, {{ key: "jobs", skipIfBusy: true, wrapScroll: ".table-wrap" }});
+        applyRegion(historyEl, data.history_html, data.history_hash, {{ key: "history" }});
+        applyRegion(queueEl, data.queue_html, data.queue_hash, {{ key: "queue", skipIfBusy: true }});
+        applyRegion(worthEl, data.worth_html, data.worth_hash, {{ key: "worth", skipIfBusy: true }});
+        if (data.resume_status) {{
+          ["pt", "en"].forEach(function (lang) {{
+            var part = data.resume_status[lang];
+            if (!part) return;
+            applyRegion(document.getElementById("resume-meta-" + lang), part.meta_html, part.meta_hash, {{
+              key: "resume-meta-" + lang
+            }});
+            applyRegion(document.getElementById("resume-dossier-" + lang), part.dossier_html, part.dossier_hash, {{
+              key: "resume-dossier-" + lang,
+              skipIfBusy: true,
+              scrollSelector: ".resume-dossier-scroll",
+              preserveDetails: true
+            }});
+          }});
         }}
-        if (logsEl && data.logs_html && logsEl.innerHTML !== data.logs_html) {{
-          var stickBottom = logsEl.scrollTop + logsEl.clientHeight >= logsEl.scrollHeight - 40;
-          logsEl.innerHTML = data.logs_html;
-          if (stickBottom) logsEl.scrollTop = 0;
+        if (logsEl && data.logs_html && data.logs_hash && appliedHashes.logs !== data.logs_hash) {{
+          if (!panelBusy(logsEl)) {{
+            var stickBottom = logsEl.scrollTop + logsEl.clientHeight >= logsEl.scrollHeight - 40;
+            var savedTop = logsEl.scrollTop;
+            logsEl.innerHTML = data.logs_html;
+            appliedHashes.logs = data.logs_hash;
+            logsEl.scrollTop = stickBottom ? 0 : savedTop;
+          }}
         }}
       }})
       .catch(function () {{}})
