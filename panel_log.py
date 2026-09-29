@@ -14,9 +14,9 @@ _lock = threading.Lock()
 
 
 def _connect() -> sqlite3.Connection:
-    db = sqlite3.connect(DB_PATH, timeout=15)
-    db.row_factory = sqlite3.Row
-    return db
+    from dbutil import open_connection
+
+    return open_connection(DB_PATH, timeout=60.0)
 
 
 def ensure_log_table(db: sqlite3.Connection | None = None) -> None:

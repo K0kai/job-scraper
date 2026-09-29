@@ -161,8 +161,31 @@ Company: {job.get('company')}
     return answer[:1200]
 
 
+ConnectFn = Callable[[], sqlite3.Connection]
+
+
+def _insert_application(
+    connect_fn: ConnectFn,
+    *,
+    job_id: int,
+    channel: str,
+    recipient: str,
+    resume_id: int | None,
+    cover_letter_id: int | None,
+    status: str,
+    detail: str,
+    now_iso: str,
+) -> None:
+    with connect_fn() as db:
+        db.execute(
+            """INSERT INTO applications(job_id,channel,recipient,resume_id,cover_letter_id,status,detail,attempted_at)
+               VALUES(?,?,?,?,?,?,?,?)""",
+            (job_id, channel, recipient, resume_id, cover_letter_id, status, detail[:500], now_iso),
+        )
+
+
 def apply_via_email(
-    db: sqlite3.Connection,
+    connect_fn: ConnectFn,
     job: dict,
     cfg: dict[str, str],
     *,
@@ -180,6 +203,7 @@ def apply_via_email(
     if not (cfg.get("smtp_host") or "").strip():
         return False, "SMTP não configurado."
     subject = f"Candidatura: {job.get('title', '')} — {cfg.get('candidate_name') or 'candidato'}"
+    recipient_csv = ",".join(recipients[:3])
     try:
         send_smtp_email(
             cfg=cfg,
@@ -191,22 +215,34 @@ def apply_via_email(
             attachment_name=resume_path.rsplit("/", 1)[-1],
         )
     except Exception as exc:
-        db.execute(
-            """INSERT INTO applications(job_id,channel,recipient,resume_id,cover_letter_id,status,detail,attempted_at)
-               VALUES(?,?,?,?,?,?,?,?)""",
-            (job["id"], "email", ",".join(recipients[:3]), resume_id, cover_letter_id, "failed", str(exc)[:500], now_iso),
+        _insert_application(
+            connect_fn,
+            job_id=job["id"],
+            channel="email",
+            recipient=recipient_csv,
+            resume_id=resume_id,
+            cover_letter_id=cover_letter_id,
+            status="failed",
+            detail=str(exc)[:500],
+            now_iso=now_iso,
         )
         return False, f"Falha SMTP: {exc}"
-    db.execute(
-        """INSERT INTO applications(job_id,channel,recipient,resume_id,cover_letter_id,status,detail,attempted_at)
-           VALUES(?,?,?,?,?,?,?,?)""",
-        (job["id"], "email", ",".join(recipients[:3]), resume_id, cover_letter_id, "sent", "E-mail enviado", now_iso),
+    _insert_application(
+        connect_fn,
+        job_id=job["id"],
+        channel="email",
+        recipient=recipient_csv,
+        resume_id=resume_id,
+        cover_letter_id=cover_letter_id,
+        status="sent",
+        detail="E-mail enviado",
+        now_iso=now_iso,
     )
-    return True, f"E-mail enviado para {', '.join(recipients[:3])}"
+    return True, f"E-mail enviado para {recipient_csv}"
 
 
 def apply_via_browser(
-    db: sqlite3.Connection,
+    connect_fn: ConnectFn,
     job: dict,
     cfg: dict[str, str],
     *,
@@ -226,9 +262,25 @@ def apply_via_browser(
     except ImportError:
         return False, "Playwright não instalado. Rode: pip install playwright && playwright install chromium"
 
-    rules = list_rules(db)
+    with connect_fn() as db:
+        rules = [dict(row) for row in list_rules(db)]
     facts = cfg.get("candidate_facts_pt" if job.get("language") == "pt" else "candidate_facts_en", "")
     open_count = 0
+    pending_answers: list[tuple[str, str]] = []
+
+    def block(detail: str, *, status: str = "blocked") -> tuple[bool, str]:
+        _insert_application(
+            connect_fn,
+            job_id=job["id"],
+            channel="browser",
+            recipient="",
+            resume_id=resume_id,
+            cover_letter_id=cover_letter_id,
+            status=status,
+            detail=detail,
+            now_iso=now_iso,
+        )
+        return False, detail
 
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=True)
@@ -238,13 +290,7 @@ def apply_via_browser(
             content = page.content().casefold()
             if any(token in content for token in ("sign in", "log in", "fazer login", "captcha", "cf-challenge")):
                 browser.close()
-                detail = "Página exige login ou CAPTCHA; envio automático pulado."
-                db.execute(
-                    """INSERT INTO applications(job_id,channel,recipient,resume_id,cover_letter_id,status,detail,attempted_at)
-                       VALUES(?,?,?,?,?,?,?,?)""",
-                    (job["id"], "browser", "", resume_id, cover_letter_id, "blocked", detail, now_iso),
-                )
-                return False, detail
+                return block("Página exige login ou CAPTCHA; envio automático pulado.")
 
             # Collect labeled controls
             controls = page.evaluate(
@@ -269,13 +315,7 @@ def apply_via_browser(
             )
             if not controls:
                 browser.close()
-                detail = "Nenhum formulário público detectado."
-                db.execute(
-                    """INSERT INTO applications(job_id,channel,recipient,resume_id,cover_letter_id,status,detail,attempted_at)
-                       VALUES(?,?,?,?,?,?,?,?)""",
-                    (job["id"], "browser", "", resume_id, cover_letter_id, "blocked", detail, now_iso),
-                )
-                return False, detail
+                return block("Nenhum formulário público detectado.")
 
             for control in controls:
                 label = control.get("label") or control.get("name") or ""
@@ -294,13 +334,7 @@ def apply_via_browser(
                     open_count += 1
                     if open_count > 5:
                         browser.close()
-                        detail = "Muitas perguntas abertas; vaga pulada."
-                        db.execute(
-                            """INSERT INTO applications(job_id,channel,recipient,resume_id,cover_letter_id,status,detail,attempted_at)
-                               VALUES(?,?,?,?,?,?,?,?)""",
-                            (job["id"], "browser", "", resume_id, cover_letter_id, "blocked", detail, now_iso),
-                        )
-                        return False, detail
+                        return block("Muitas perguntas abertas; vaga pulada.")
                     try:
                         answer = generate_open_answer(
                             question=label,
@@ -314,26 +348,11 @@ def apply_via_browser(
                         )
                     except AiUnavailableError as exc:
                         browser.close()
-                        detail = f"Pergunta aberta detectada; IA indisponível — vaga pulada. {exc}"
-                        db.execute(
-                            """INSERT INTO applications(job_id,channel,recipient,resume_id,cover_letter_id,status,detail,attempted_at)
-                               VALUES(?,?,?,?,?,?,?,?)""",
-                            (job["id"], "browser", "", resume_id, cover_letter_id, "blocked", detail[:500], now_iso),
-                        )
-                        return False, detail
+                        return block(f"Pergunta aberta detectada; IA indisponível — vaga pulada. {exc}")
                     except Exception as exc:
                         browser.close()
-                        detail = f"Não foi possível responder pergunta aberta; vaga pulada. {exc}"
-                        db.execute(
-                            """INSERT INTO applications(job_id,channel,recipient,resume_id,cover_letter_id,status,detail,attempted_at)
-                               VALUES(?,?,?,?,?,?,?,?)""",
-                            (job["id"], "browser", "", resume_id, cover_letter_id, "blocked", detail[:500], now_iso),
-                        )
-                        return False, detail
-                    db.execute(
-                        """INSERT INTO form_answers(job_id,question,answer,provider,model,created_at) VALUES(?,?,?,?,?,?)""",
-                        (job["id"], label[:500], answer, provider, model, now_iso),
-                    )
+                        return block(f"Não foi possível responder pergunta aberta; vaga pulada. {exc}")
+                    pending_answers.append((label[:500], answer))
                     if locator:
                         locator.fill(answer)
                     continue
@@ -346,13 +365,7 @@ def apply_via_browser(
                 if value is None or value == "":
                     if str(rule["mode"]) in {"select", "file"} or (tag == "textarea"):
                         browser.close()
-                        detail = f"Campo obrigatório sem valor configurado: {rule['key']}"
-                        db.execute(
-                            """INSERT INTO applications(job_id,channel,recipient,resume_id,cover_letter_id,status,detail,attempted_at)
-                               VALUES(?,?,?,?,?,?,?,?)""",
-                            (job["id"], "browser", "", resume_id, cover_letter_id, "blocked", detail, now_iso),
-                        )
-                        return False, detail
+                        return block(f"Campo obrigatório sem valor configurado: {rule['key']}")
                     continue
 
                 if not locator:
@@ -365,13 +378,7 @@ def apply_via_browser(
                     chosen = pick_select_option(list(options), value)
                     if not chosen:
                         browser.close()
-                        detail = f"Nenhuma opção de select compatível para {rule['key']} (valor: {value})"
-                        db.execute(
-                            """INSERT INTO applications(job_id,channel,recipient,resume_id,cover_letter_id,status,detail,attempted_at)
-                               VALUES(?,?,?,?,?,?,?,?)""",
-                            (job["id"], "browser", "", resume_id, cover_letter_id, "blocked", detail, now_iso),
-                        )
-                        return False, detail
+                        return block(f"Nenhuma opção de select compatível para {rule['key']} (valor: {value})")
                     locator.select_option(label=chosen)
                 else:
                     locator.fill(value)
@@ -394,25 +401,46 @@ def apply_via_browser(
                 browser.close()
             except Exception:
                 pass
-            detail = f"Falha no Playwright: {exc}"
-            db.execute(
-                """INSERT INTO applications(job_id,channel,recipient,resume_id,cover_letter_id,status,detail,attempted_at)
-                   VALUES(?,?,?,?,?,?,?,?)""",
-                (job["id"], "browser", "", resume_id, cover_letter_id, "failed", detail[:500], now_iso),
-            )
-            return False, detail
+            return block(f"Falha no Playwright: {exc}", status="failed")
 
-    db.execute(
-        """INSERT INTO applications(job_id,channel,recipient,resume_id,cover_letter_id,status,detail,attempted_at)
-           VALUES(?,?,?,?,?,?,?,?)""",
-        (job["id"], "browser", "", resume_id, cover_letter_id, "sent", "Formulário enviado via Playwright", now_iso),
+    if pending_answers:
+        with connect_fn() as db:
+            for question, answer in pending_answers:
+                db.execute(
+                    """INSERT INTO form_answers(job_id,question,answer,provider,model,created_at) VALUES(?,?,?,?,?,?)""",
+                    (job["id"], question, answer, provider, model, now_iso),
+                )
+
+    _insert_application(
+        connect_fn,
+        job_id=job["id"],
+        channel="browser",
+        recipient="",
+        resume_id=resume_id,
+        cover_letter_id=cover_letter_id,
+        status="sent",
+        detail="Formulário enviado via Playwright",
+        now_iso=now_iso,
     )
     return True, "Formulário enviado via Playwright"
 
 
-def record_blocked(db: sqlite3.Connection, job_id: int, detail: str, now_iso: str, resume_id: int | None = None, cover_letter_id: int | None = None) -> None:
-    db.execute(
-        """INSERT INTO applications(job_id,channel,recipient,resume_id,cover_letter_id,status,detail,attempted_at)
-           VALUES(?,?,?,?,?,?,?,?)""",
-        (job_id, "none", "", resume_id, cover_letter_id, "blocked", detail[:500], now_iso),
+def record_blocked(
+    connect_fn: ConnectFn,
+    job_id: int,
+    detail: str,
+    now_iso: str,
+    resume_id: int | None = None,
+    cover_letter_id: int | None = None,
+) -> None:
+    _insert_application(
+        connect_fn,
+        job_id=job_id,
+        channel="none",
+        recipient="",
+        resume_id=resume_id,
+        cover_letter_id=cover_letter_id,
+        status="blocked",
+        detail=detail,
+        now_iso=now_iso,
     )

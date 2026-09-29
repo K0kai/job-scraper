@@ -156,9 +156,9 @@ def format_brasilia(value: object) -> str:
 
 
 def connect() -> sqlite3.Connection:
-    db = sqlite3.connect(DB_PATH, timeout=15)
-    db.row_factory = sqlite3.Row
-    return db
+    from dbutil import open_connection
+
+    return open_connection(DB_PATH, timeout=60.0)
 
 
 def initialize() -> None:
@@ -682,45 +682,45 @@ def process_auto_job(job_id: int) -> str:
         )
         return f"vaga {job_id}: vale a pena olhar (LinkedIn, score {score})"
 
-    with connect() as db:
-        ok, detail = apply_via_email(
-            db,
+    ok, detail = apply_via_email(
+        connect,
+        job,
+        cfg,
+        cover_letter=cover_body,
+        resume_path=resume["stored_path"],
+        resume_id=int(resume["id"]),
+        cover_letter_id=cover_id,
+        smtp_password=secret_get("smtp_password"),
+        now_iso=stamp,
+    )
+    channel = "email"
+    if not ok:
+        ok, detail = apply_via_browser(
+            connect,
             job,
             cfg,
             cover_letter=cover_body,
             resume_path=resume["stored_path"],
             resume_id=int(resume["id"]),
             cover_letter_id=cover_id,
-            smtp_password=secret_get("smtp_password"),
-            now_iso=stamp,
+            resume_summary=resume["analysis_summary"] or "",
+            resume_json=resume["analysis_json"] or "",
+            provider=provider,
+            model=model,
+            api_key=api_key,
+            now_iso=now_iso(),
         )
-        channel = "email"
-        if not ok:
-            ok, detail = apply_via_browser(
-                db,
-                job,
-                cfg,
-                cover_letter=cover_body,
-                resume_path=resume["stored_path"],
-                resume_id=int(resume["id"]),
-                cover_letter_id=cover_id,
-                resume_summary=resume["analysis_summary"] or "",
-                resume_json=resume["analysis_json"] or "",
-                provider=provider,
-                model=model,
-                api_key=api_key,
-                now_iso=now_iso(),
-            )
-            channel = "browser"
-        if not ok:
-            record_blocked(db, job_id, detail, now_iso(), int(resume["id"]), cover_id)
-            mark_worth_looking(
-                job_id,
-                score=score,
-                reason=decision["reason"],
-                detail=f"Match bom, mas envio automático falhou ({channel}): {detail}",
-            )
-            return f"vaga {job_id}: vale a pena olhar — {detail}"
+        channel = "browser"
+    if not ok:
+        record_blocked(connect, job_id, detail, now_iso(), int(resume["id"]), cover_id)
+        mark_worth_looking(
+            job_id,
+            score=score,
+            reason=decision["reason"],
+            detail=f"Match bom, mas envio automático falhou ({channel}): {detail}",
+        )
+        return f"vaga {job_id}: vale a pena olhar — {detail}"
+    with connect() as db:
         db.execute("UPDATE jobs SET status='applied', applied_at=?, notes=? WHERE id=?", (now_iso(), detail[:900], job_id))
         db.execute(
             "UPDATE ai_decisions SET apply_channel=?, apply_result=? WHERE id=(SELECT MAX(id) FROM ai_decisions WHERE job_id=?)",

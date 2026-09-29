@@ -81,9 +81,9 @@ class JobQueue:
     def _connect(self) -> sqlite3.Connection:
         if self._connect_fn:
             return self._connect_fn()
-        db = sqlite3.connect(self.db_path, timeout=30)
-        db.row_factory = sqlite3.Row
-        return db
+        from dbutil import open_connection
+
+        return open_connection(self.db_path, timeout=60.0)
 
     def _ensure_schema(self) -> None:
         with self._connect() as db:
