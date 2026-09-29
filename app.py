@@ -434,7 +434,40 @@ def ai_assess_job(job: dict, cfg: dict[str, str]) -> dict:
     if language == "en" and not resume_summary_en and not resume_summary_pt:
         raise ValueError("Faça upload e análise de pelo menos um currículo antes da triagem automática.")
 
-    prompt = f"""Evaluate whether this candidate should apply to this job. Use only the candidate facts below and resume summary in the appropriate language; do not infer missing qualifications. Consider explicit location/work authorization, seniority, required skills, and role fit. Identify whether the job description asks for a cover letter. Return only JSON with keys: match_score (integer 0-100), should_apply (boolean), cover_letter_required (boolean), reason (short string in {('Portuguese' if language == 'pt' else 'English')}), recommended_resume_language (either "en" or "pt").
+    prompt = f"""You are a supportive career coach helping a strong candidate decide whether to APPLY.
+
+Goal: be OPTIMISTIC but honest. Prefer giving the candidate a chance when there is a credible fit.
+Do NOT invent experience, employers, degrees, or tools that are absent from the candidate facts / resume summaries.
+You MAY count transferable skills, adjacent tools in the same family (e.g. React↔Vue, Postgres↔MySQL, AWS↔GCP),
+fast-learning capacity implied by a broad senior/generalist profile, and partial overlap with long requirement lists.
+
+Scoring guidance (use the FULL 0–100 range generously when there is real overlap):
+- 85–100: strong overlap on core responsibilities and most must-have skills; clear apply.
+- 70–84: solid partial fit — core role matches, some secondary skills missing or only adjacent; still apply.
+- 55–69: stretch but plausible (title/seniority close, several transferable skills); apply if remote/location OK.
+- 40–54: weak overlap; apply only if the role is unusually flexible or the candidate clearly targets this niche.
+- 0–39: clear mismatch (wrong career track, seniority gap of multiple levels, or hard blockers).
+
+Hard blockers for should_apply=false (and low score):
+- Role is a fundamentally different profession (e.g. nurse, accountant, truck driver) with no path from the resume.
+- Explicit non-negotiable work authorization / onsite-only location that conflicts with the candidate facts.
+- Seniority gap of roughly 2+ levels with no supporting evidence (e.g. junior resume vs principal/staff bar).
+
+Do NOT treat these as hard blockers by themselves:
+- Missing 1–3 tools from a long laundry list of requirements.
+- "Nice to have" / preferred / plus skills the candidate lacks.
+- Cover letter requested (set cover_letter_required=true; still may apply).
+- Perfect keyword match missing when the resume shows equivalent experience in plain language.
+
+Set should_apply=true whenever match_score >= 55 unless a hard blocker applies.
+Identify whether the job description asks for a cover letter.
+Return ONLY JSON with keys:
+match_score (integer 0-100),
+should_apply (boolean),
+cover_letter_required (boolean),
+reason (short string in {('Portuguese' if language == 'pt' else 'English')}),
+recommended_resume_language (either "en" or "pt").
+
 Candidate facts: {facts or '[none provided]'}
 Resume summary (PT): {resume_summary_pt or '[none provided]'}
 Resume summary (EN): {resume_summary_en or '[none provided]'}
