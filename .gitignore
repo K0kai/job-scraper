@@ -3,3 +3,6 @@ jobs.db-shm
 jobs.db-wal
 __pycache__/
 .venv/
+resumes/*.pdf
+resumes/*.tmp
+*.pyc

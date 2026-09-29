@@ -1,0 +1,195 @@
+# Upload, extração e análise única de currículos PDF.
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import sqlite3
+from typing import Callable
+from urllib.error import HTTPError
+from urllib.parse import quote_plus
+from urllib.request import Request, urlopen
+
+
+class AiUnavailableError(RuntimeError):
+    """Chave ausente, quota esgotada ou falha de autenticação/billing da IA."""
+
+
+def extract_pdf_text(path: str) -> str:
+    from pypdf import PdfReader
+
+    reader = PdfReader(path)
+    chunks: list[str] = []
+    for page in reader.pages:
+        chunks.append(page.extract_text() or "")
+    text = re.sub(r"\s+", " ", "\n".join(chunks)).strip()
+    if len(text) < 40:
+        raise ValueError("Não foi possível extrair texto útil deste PDF. Use um PDF com texto selecionável.")
+    return text[:50000]
+
+
+def file_sha256(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(65536), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def get_resume(db: sqlite3.Connection, language: str) -> sqlite3.Row | None:
+    return db.execute("SELECT * FROM resumes WHERE language=?", (language,)).fetchone()
+
+
+def resume_summaries(db: sqlite3.Connection) -> dict[str, str]:
+    rows = db.execute("SELECT language, analysis_summary FROM resumes").fetchall()
+    return {row["language"]: row["analysis_summary"] or "" for row in rows}
+
+
+def analyze_resume_text(
+    text: str,
+    language: str,
+    *,
+    provider: str,
+    model: str,
+    api_key: str,
+    call_json: Callable[..., dict] | None = None,
+) -> dict:
+    language_name = "Portuguese" if language == "pt" else "English"
+    prompt = f"""Analyze this resume written primarily in {language_name}. Return ONLY JSON with keys:
+summary (string, concise professional summary in {language_name}),
+skills (array of strings),
+experience (array of short strings: role, employer, period, highlights — only what is stated),
+education (array of strings),
+seniority (string),
+languages (array of strings),
+work_authorization_notes (string, only if stated),
+location_notes (string, only if stated).
+Never invent employers, dates, skills, or results. If unknown, use empty string or empty array.
+
+Resume text:
+{text[:20000]}
+"""
+    if call_json is not None:
+        return call_json(provider, model, api_key, prompt)
+
+    if not api_key:
+        raise AiUnavailableError("Configure a chave da API de IA antes de analisar o currículo.")
+    provider = provider.casefold().strip()
+    try:
+        if provider == "openai":
+            endpoint = "https://api.openai.com/v1/responses"
+            payload = json.dumps(
+                {"model": model, "input": prompt, "text": {"format": {"type": "json_object"}}, "store": False, "max_output_tokens": 1200}
+            ).encode("utf-8")
+            headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        elif provider == "gemini":
+            endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{quote_plus(model)}:generateContent?key={quote_plus(api_key)}"
+            payload = json.dumps(
+                {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"maxOutputTokens": 1200, "responseMimeType": "application/json"}}
+            ).encode("utf-8")
+            headers = {"Content-Type": "application/json"}
+        else:
+            raise ValueError("Provedor de IA inválido.")
+        request = Request(endpoint, data=payload, headers=headers, method="POST")
+        with urlopen(request, timeout=90) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")[:400]
+        if exc.code in {401, 403, 429} or "quota" in body.casefold() or "billing" in body.casefold():
+            raise AiUnavailableError(f"IA indisponível (HTTP {exc.code}).") from exc
+        raise RuntimeError(f"Falha ao analisar currículo (HTTP {exc.code}): {body}") from exc
+    except AiUnavailableError:
+        raise
+    except Exception as exc:
+        message = str(exc).casefold()
+        if "quota" in message or "insufficient" in message or "api key" in message:
+            raise AiUnavailableError(f"IA indisponível: {exc}") from exc
+        raise
+
+    if provider == "openai":
+        raw = "\n".join(part.get("text", "") for item in result.get("output", []) for part in item.get("content", []) if part.get("type") == "output_text")
+    else:
+        raw = "\n".join(part.get("text", "") for item in result.get("candidates", []) for part in item.get("content", {}).get("parts", []))
+    data = json.loads(raw.strip())
+    if not isinstance(data, dict):
+        raise RuntimeError("A análise do currículo não retornou JSON objeto.")
+    summary = str(data.get("summary") or "").strip()
+    if not summary:
+        raise RuntimeError("A análise do currículo não retornou um resumo.")
+    return data
+
+
+def store_resume_upload(
+    db: sqlite3.Connection,
+    *,
+    language: str,
+    original_filename: str,
+    raw_bytes: bytes,
+    resumes_dir: str,
+    now_iso: str,
+    provider: str,
+    model: str,
+    api_key: str,
+    get_ai_key: Callable[[str], str] | None = None,
+) -> tuple[str, bool]:
+    """Salva PDF e analisa se o hash mudou. Retorna (mensagem, reanalyzed)."""
+    if language not in {"pt", "en"}:
+        raise ValueError("Idioma do currículo deve ser pt ou en.")
+    if not raw_bytes.startswith(b"%PDF"):
+        raise ValueError("Envie um arquivo PDF válido.")
+    if len(raw_bytes) > 12 * 1024 * 1024:
+        raise ValueError("PDF maior que 12 MB.")
+
+    os.makedirs(resumes_dir, exist_ok=True)
+    stored_name = f"resume_{language}.pdf"
+    stored_path = os.path.join(resumes_dir, stored_name)
+    temp_path = stored_path + ".tmp"
+    with open(temp_path, "wb") as handle:
+        handle.write(raw_bytes)
+    digest = file_sha256(temp_path)
+    existing = get_resume(db, language)
+    if existing and existing["file_sha256"] == digest and (existing["analysis_summary"] or "").strip():
+        os.replace(temp_path, stored_path)
+        db.execute(
+            """UPDATE resumes SET original_filename=?, stored_path=?, updated_at=? WHERE language=?""",
+            (original_filename, stored_path, now_iso, language),
+        )
+        return f"Currículo {language.upper()} já analisado (mesmo arquivo). Análise reutilizada.", False
+
+    text = extract_pdf_text(temp_path)
+    key = api_key or (get_ai_key(provider) if get_ai_key else "")
+    analysis = analyze_resume_text(text, language, provider=provider, model=model, api_key=key)
+    summary = str(analysis.get("summary") or "").strip()
+    os.replace(temp_path, stored_path)
+    db.execute(
+        """INSERT INTO resumes(language,original_filename,stored_path,file_sha256,extracted_text,analysis_json,analysis_summary,analyzed_at,provider,model,created_at,updated_at)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+           ON CONFLICT(language) DO UPDATE SET
+             original_filename=excluded.original_filename,
+             stored_path=excluded.stored_path,
+             file_sha256=excluded.file_sha256,
+             extracted_text=excluded.extracted_text,
+             analysis_json=excluded.analysis_json,
+             analysis_summary=excluded.analysis_summary,
+             analyzed_at=excluded.analyzed_at,
+             provider=excluded.provider,
+             model=excluded.model,
+             updated_at=excluded.updated_at
+        """,
+        (
+            language,
+            original_filename,
+            stored_path,
+            digest,
+            text,
+            json.dumps(analysis, ensure_ascii=False),
+            summary,
+            now_iso,
+            provider,
+            model,
+            now_iso,
+            now_iso,
+        ),
+    )
+    return f"Currículo {language.upper()} salvo e analisado.", True

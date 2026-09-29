@@ -18,9 +18,14 @@ from urllib.parse import parse_qs, quote_plus, urlparse
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
+from apply_channels import apply_via_browser, apply_via_email, record_blocked, send_smtp_email
+from form_rules import ensure_default_rules, list_rules, save_rules_from_form
+from resume_pipeline import AiUnavailableError, get_resume, resume_summaries, store_resume_upload
 
-ROOT = __file__.rsplit("\\", 1)[0]
-DB_PATH = ROOT + "\\jobs.db"
+
+ROOT = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(ROOT, "jobs.db")
+RESUMES_DIR = os.path.join(ROOT, "resumes")
 HOST = "127.0.0.1"
 PORT = 8765
 POLL_SECONDS = 15 * 60
@@ -79,6 +84,9 @@ DEFAULT_SETTINGS = {
     "ai_model": "gemini-2.5-flash",
     "candidate_name": "",
     "candidate_email": "",
+    "candidate_phone": "",
+    "candidate_linkedin": "",
+    "candidate_city": "",
     "candidate_profile_pt": "",
     "candidate_profile_en": "",
     "candidate_facts_pt": "",
@@ -91,6 +99,11 @@ DEFAULT_SETTINGS = {
     "adzuna_countries": "br,us,gb,ca",
     "apify_monthly_credit_limit_usd": "5",
     "apify_job_count": "25",
+    "smtp_host": "",
+    "smtp_port": "587",
+    "smtp_user": "",
+    "smtp_from": "",
+    "smtp_use_tls": "1",
 }
 STATUSES = {"new": "Nova", "review": "Revisar", "saved": "Salva", "prepared": "Carta preparada", "applied": "Aplicada", "ignored": "Ignorada", "blocked": "Envio indisponível"}
 BRASILIA = ZoneInfo("America/Sao_Paulo")
@@ -134,6 +147,7 @@ def connect() -> sqlite3.Connection:
 
 def initialize() -> None:
     """Cria o banco e aplica pequenas migrações compatíveis com versões anteriores."""
+    os.makedirs(RESUMES_DIR, exist_ok=True)
     with connect() as db:
         db.executescript(SCHEMA)
         # Additions are applied in place so an existing jobs.db remains usable.
@@ -152,6 +166,58 @@ def initialize() -> None:
           created_at TEXT NOT NULL,
           updated_at TEXT NOT NULL
         )""")
+        db.execute("""CREATE TABLE IF NOT EXISTS resumes (
+          id INTEGER PRIMARY KEY,
+          language TEXT NOT NULL UNIQUE,
+          original_filename TEXT NOT NULL DEFAULT '',
+          stored_path TEXT NOT NULL,
+          file_sha256 TEXT NOT NULL,
+          extracted_text TEXT NOT NULL DEFAULT '',
+          analysis_json TEXT NOT NULL DEFAULT '',
+          analysis_summary TEXT NOT NULL DEFAULT '',
+          analyzed_at TEXT,
+          provider TEXT NOT NULL DEFAULT '',
+          model TEXT NOT NULL DEFAULT '',
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        )""")
+        db.execute("""CREATE TABLE IF NOT EXISTS form_field_rules (
+          id INTEGER PRIMARY KEY,
+          key TEXT NOT NULL,
+          aliases TEXT NOT NULL DEFAULT '',
+          mode TEXT NOT NULL DEFAULT 'text',
+          value_from TEXT NOT NULL DEFAULT '',
+          value TEXT NOT NULL DEFAULT '',
+          sort_order INTEGER NOT NULL DEFAULT 0
+        )""")
+        db.execute("""CREATE TABLE IF NOT EXISTS applications (
+          id INTEGER PRIMARY KEY,
+          job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+          channel TEXT NOT NULL,
+          recipient TEXT NOT NULL DEFAULT '',
+          resume_id INTEGER,
+          cover_letter_id INTEGER,
+          status TEXT NOT NULL,
+          detail TEXT NOT NULL DEFAULT '',
+          attempted_at TEXT NOT NULL
+        )""")
+        db.execute("""CREATE TABLE IF NOT EXISTS form_answers (
+          id INTEGER PRIMARY KEY,
+          job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+          question TEXT NOT NULL,
+          answer TEXT NOT NULL,
+          provider TEXT NOT NULL DEFAULT '',
+          model TEXT NOT NULL DEFAULT '',
+          created_at TEXT NOT NULL
+        )""")
+        decision_cols = {row["name"] for row in db.execute("PRAGMA table_info(ai_decisions)")}
+        if "resume_language" not in decision_cols:
+            db.execute("ALTER TABLE ai_decisions ADD COLUMN resume_language TEXT NOT NULL DEFAULT ''")
+        if "apply_channel" not in decision_cols:
+            db.execute("ALTER TABLE ai_decisions ADD COLUMN apply_channel TEXT NOT NULL DEFAULT ''")
+        if "apply_result" not in decision_cols:
+            db.execute("ALTER TABLE ai_decisions ADD COLUMN apply_result TEXT NOT NULL DEFAULT ''")
+        ensure_default_rules(db)
         for key, value in DEFAULT_SETTINGS.items():
             db.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (key, value))
 
@@ -212,8 +278,10 @@ def ai_generate_letter(provider: str, model: str, language: str, job: dict, cfg:
 Use only the candidate facts provided below. Never invent experience, qualifications, results, employers, dates, or skills. If facts are sparse, keep the letter brief and make no unsupported claims. Do not claim the candidate already applied. Return only the letter, with no subject line or commentary.
 
 Candidate name: {name or '[candidate name]'}
-Candidate-provided facts (the only source of claims about the candidate):
-{facts or '[No candidate facts provided. Do not make claims about experience or skills.]'}
+Candidate-provided facts:
+{facts or '[No candidate facts provided.]'}
+Resume analysis summary (authoritative; do not invent beyond this):
+{cfg.get("resume_summary_pt" if language == "pt" else "resume_summary_en", "") or "[No resume analysis provided.]"}
 
 Job title: {job['title']}
 Company: {job['company']}
@@ -288,92 +356,234 @@ def secret_set(name: str, value: str) -> None:
         raise RuntimeError("Não foi possível acessar o cofre seguro do sistema.") from exc
 
 
-def create_cover_letter(job_id: int) -> None:
+def create_cover_letter(job_id: int, resume_language: str | None = None) -> int:
     cfg = settings()
     with connect() as db:
         job = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+        summaries = resume_summaries(db)
     if not job:
         raise ValueError("Vaga não encontrada.")
-    language = job["language"]
+    language = resume_language or job["language"]
     if language not in ("pt", "en"):
         raise ValueError("Idioma da vaga incerto. Corrija o idioma antes de gerar a carta.")
+    cfg = dict(cfg)
+    cfg["resume_summary_pt"] = summaries.get("pt", "")
+    cfg["resume_summary_en"] = summaries.get("en", "")
     provider = cfg.get("ai_provider", "gemini").casefold()
     model = cfg.get("ai_model", "gemini-2.5-flash").strip()
     letter = ai_generate_letter(provider, model, language, dict(job), cfg)
+    stamp = now_iso()
     with connect() as db:
         db.execute("""INSERT INTO cover_letters(job_id,language,provider,model,body,created_at,updated_at) VALUES(?,?,?,?,?,?,?)
-          ON CONFLICT(job_id) DO UPDATE SET language=excluded.language,provider=excluded.provider,model=excluded.model,body=excluded.body,updated_at=excluded.updated_at""", (job_id, language, provider, model, letter,  now_iso(),  now_iso()))
-        db.execute("UPDATE jobs SET status='prepared' WHERE id=? AND status='new'", (job_id,))
+          ON CONFLICT(job_id) DO UPDATE SET language=excluded.language,provider=excluded.provider,model=excluded.model,body=excluded.body,updated_at=excluded.updated_at""", (job_id, language, provider, model, letter, stamp, stamp))
+        db.execute("UPDATE jobs SET status='prepared' WHERE id=? AND status IN ('new','review')", (job_id,))
+        row = db.execute("SELECT id FROM cover_letters WHERE job_id=?", (job_id,)).fetchone()
+    return int(row["id"])
 
 
 def ai_assess_job(job: dict, cfg: dict[str, str]) -> dict:
-    """Classifica aderência e necessidade provável de carta antes da automação."""
+    """Classifica aderência usando a análise de currículo já salva (sem reenviar o PDF)."""
     language = job.get("language", "unknown")
     if language not in ("pt", "en"):
         raise ValueError("Idioma incerto; a IA não vai escolher um currículo por suposição.")
     facts = cfg.get("candidate_facts_pt" if language == "pt" else "candidate_facts_en", "").strip()
-    prompt = f"""Evaluate whether this candidate should apply to this job. Use only the candidate facts below; do not infer missing qualifications. Consider explicit location/work authorization, seniority, required skills, and role fit. Identify whether the job description asks for a cover letter. Return only JSON with keys: match_score (integer 0-100), should_apply (boolean), cover_letter_required (boolean), reason (short string in {('Portuguese' if language == 'pt' else 'English')}).
+    with connect() as db:
+        summaries = resume_summaries(db)
+    resume_summary_pt = summaries.get("pt", "").strip()
+    resume_summary_en = summaries.get("en", "").strip()
+    if language == "pt" and not resume_summary_pt and not resume_summary_en:
+        raise ValueError("Faça upload e análise de pelo menos um currículo antes da triagem automática.")
+    if language == "en" and not resume_summary_en and not resume_summary_pt:
+        raise ValueError("Faça upload e análise de pelo menos um currículo antes da triagem automática.")
+
+    prompt = f"""Evaluate whether this candidate should apply to this job. Use only the candidate facts below and resume summary in the appropriate language; do not infer missing qualifications. Consider explicit location/work authorization, seniority, required skills, and role fit. Identify whether the job description asks for a cover letter. Return only JSON with keys: match_score (integer 0-100), should_apply (boolean), cover_letter_required (boolean), reason (short string in {('Portuguese' if language == 'pt' else 'English')}), recommended_resume_language (either "en" or "pt").
 Candidate facts: {facts or '[none provided]'}
+Resume summary (PT): {resume_summary_pt or '[none provided]'}
+Resume summary (EN): {resume_summary_en or '[none provided]'}
 Job title: {job['title']}
 Company: {job['company']}
 Location/eligibility: {job['location']}
 Description: {re.sub(r'<[^>]+>', ' ', job['description'])[:10000]}"""
+
     provider = cfg.get("ai_provider", "gemini").casefold()
     model = cfg.get("ai_model", "gemini-2.5-flash").strip()
     api_key = get_ai_key(provider)
     if not api_key:
-        raise ValueError("Configure a chave da API de IA para ativar o julgamento automático.")
-    if provider == "openai":
-        endpoint = "https://api.openai.com/v1/responses"
-        payload = json.dumps({"model": model, "input": prompt, "text": {"format": {"type": "json_object"}}, "store": False, "max_output_tokens": 250}).encode("utf-8")
-        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    elif provider == "gemini":
-        endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{quote_plus(model)}:generateContent?key={quote_plus(api_key)}"
-        payload = json.dumps({"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"maxOutputTokens": 250, "responseMimeType": "application/json"}}).encode("utf-8")
-        headers = {"Content-Type": "application/json"}
-    else:
-        raise ValueError("Provedor de IA inválido.")
-    request = Request(endpoint, data=payload, headers=headers, method="POST")
-    with urlopen(request, timeout=60) as response:
-        result = json.loads(response.read().decode("utf-8"))
+        raise AiUnavailableError("Configure a chave da API de IA para ativar o julgamento automático.")
+    try:
+        if provider == "openai":
+            endpoint = "https://api.openai.com/v1/responses"
+            payload = json.dumps({"model": model, "input": prompt, "text": {"format": {"type": "json_object"}}, "store": False, "max_output_tokens": 300}).encode("utf-8")
+            headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        elif provider == "gemini":
+            endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{quote_plus(model)}:generateContent?key={quote_plus(api_key)}"
+            payload = json.dumps({"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"maxOutputTokens": 300, "responseMimeType": "application/json"}}).encode("utf-8")
+            headers = {"Content-Type": "application/json"}
+        else:
+            raise ValueError("Provedor de IA inválido.")
+        request = Request(endpoint, data=payload, headers=headers, method="POST")
+        with urlopen(request, timeout=60) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")[:300]
+        if exc.code in {401, 403, 429} or "quota" in body.casefold():
+            raise AiUnavailableError(f"IA indisponível (HTTP {exc.code}).") from exc
+        raise
     if provider == "openai":
         raw = "\n".join(part.get("text", "") for item in result.get("output", []) for part in item.get("content", []) if part.get("type") == "output_text")
     else:
         raw = "\n".join(part.get("text", "") for item in result.get("candidates", []) for part in item.get("content", {}).get("parts", []))
     decision = json.loads(raw.strip())
-    return {"match_score": max(0, min(100, int(decision.get("match_score", 0)))), "should_apply": bool(decision.get("should_apply")), "letter_required": bool(decision.get("cover_letter_required")), "reason": str(decision.get("reason", ""))[:1000], "provider": provider, "model": model}
 
-
-# Os feeds ativos só localizam vagas. Este registro ficará vazio até existir um endpoint
-# oficial de candidatura acessível ao candidato, com requisitos e autorização documentados.
-APPLICATION_PROVIDERS: dict[str, object] = {}
+    recommended_language = decision.get("recommended_resume_language")
+    if recommended_language not in ("en", "pt"):
+        match_score = int(decision.get("match_score", 0))
+        if language == "en" and match_score >= 80 and resume_summary_en:
+            recommended_language = "en"
+        elif resume_summary_pt:
+            recommended_language = "pt"
+        elif resume_summary_en:
+            recommended_language = "en"
+        else:
+            recommended_language = language
+    if recommended_language == "pt" and not resume_summary_pt and resume_summary_en:
+        recommended_language = "en"
+    if recommended_language == "en" and not resume_summary_en and resume_summary_pt:
+        recommended_language = "pt"
+    return {
+        "match_score": max(0, min(100, int(decision.get("match_score", 0)))),
+        "should_apply": bool(decision.get("should_apply")),
+        "letter_required": bool(decision.get("cover_letter_required")),
+        "reason": str(decision.get("reason", ""))[:1000],
+        "provider": provider,
+        "model": model,
+        "resume_language": recommended_language,
+    }
 
 
 def process_auto_job(job_id: int) -> str:
-    """Faz triagem automática, prepara a carta quando indicada e registra limites da fonte."""
+    """Triagem com análise salva do currículo; aplica por e-mail ou Playwright quando possível."""
     cfg = settings()
     with connect() as db:
-        job = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
-    if not job:
+        job_row = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+    if not job_row:
         return "vaga removida"
-    decision = ai_assess_job(dict(job), cfg)
-    minimum = max(0, min(100, int(cfg.get("minimum_match_score", "80"))))
+    job = dict(job_row)
+    try:
+        decision = ai_assess_job(job, cfg)
+    except AiUnavailableError as exc:
+        with connect() as db:
+            db.execute("UPDATE jobs SET status='blocked', notes=? WHERE id=?", (f"IA indisponível na triagem: {exc}", job_id))
+        return f"vaga {job_id}: IA indisponível — pulada"
+    except ValueError as exc:
+        with connect() as db:
+            db.execute("UPDATE jobs SET status='blocked', notes=? WHERE id=?", (str(exc), job_id))
+        return f"vaga {job_id}: {exc}"
+
+    minimum = max(0, min(100, int(cfg.get("minimum_match_score", "80") or 80)))
     qualifies = decision["should_apply"] and decision["match_score"] >= minimum
+    resume_language = decision["resume_language"]
     with connect() as db:
-        db.execute("INSERT INTO ai_decisions(job_id,decided_at,match_score,should_apply,letter_required,reason) VALUES(?,?,?,?,?,?)", (job_id,  now_iso(), decision["match_score"], int(qualifies), int(decision["letter_required"]), decision["reason"]))
+        db.execute(
+            """INSERT INTO ai_decisions(job_id,decided_at,match_score,should_apply,letter_required,reason,resume_language,apply_channel,apply_result)
+               VALUES(?,?,?,?,?,?,?,?,?)""",
+            (job_id, now_iso(), decision["match_score"], int(qualifies), int(decision["letter_required"]), decision["reason"], resume_language, "", ""),
+        )
     if not qualifies:
         with connect() as db:
-            db.execute("UPDATE jobs SET status='ignored',notes=? WHERE id=?", (f"IA: score {decision['match_score']}/100. {decision['reason']}", job_id))
+            db.execute("UPDATE jobs SET status='ignored', notes=? WHERE id=?", (f"IA: score {decision['match_score']}/100. {decision['reason']}", job_id))
         return f"IA descartou vaga {job_id} ({decision['match_score']}/100)"
-    if decision["letter_required"]:
-        create_cover_letter(job_id)
-    applier = APPLICATION_PROVIDERS.get(job["source"].casefold())
-    if not applier:
+
+    with connect() as db:
+        resume = get_resume(db, resume_language)
+    if not resume or not (resume["analysis_summary"] or "").strip():
         with connect() as db:
-            db.execute("UPDATE jobs SET status='blocked',notes=? WHERE id=?", (f"IA recomendou candidatura ({decision['match_score']}/100), mas {job['source']} não fornece conector oficial de envio configurado. {decision['reason']}", job_id))
-        return f"vaga {job_id}: envio automático indisponível em {job['source']}"
-    # Appliers are implemented per platform; never guess application fields or bypass a platform.
-    return str(applier(dict(job), cfg, decision))
+            db.execute("UPDATE jobs SET status='blocked', notes=? WHERE id=?", (f"Sem currículo analisado em {resume_language}.", job_id))
+        return f"vaga {job_id}: currículo {resume_language} ausente"
+
+    try:
+        cover_id = create_cover_letter(job_id, resume_language=resume_language)
+    except Exception as exc:
+        with connect() as db:
+            db.execute("UPDATE jobs SET status='blocked', notes=? WHERE id=?", (f"Falha ao gerar carta: {exc}", job_id))
+        return f"vaga {job_id}: falha na carta"
+
+    with connect() as db:
+        letter_row = db.execute("SELECT * FROM cover_letters WHERE job_id=?", (job_id,)).fetchone()
+    cover_body = letter_row["body"] if letter_row else ""
+    stamp = now_iso()
+    provider = cfg.get("ai_provider", "gemini").casefold()
+    model = cfg.get("ai_model", "gemini-2.5-flash").strip()
+    api_key = get_ai_key(provider)
+
+    with connect() as db:
+        ok, detail = apply_via_email(
+            db,
+            job,
+            cfg,
+            cover_letter=cover_body,
+            resume_path=resume["stored_path"],
+            resume_id=int(resume["id"]),
+            cover_letter_id=cover_id,
+            smtp_password=secret_get("smtp_password"),
+            now_iso=stamp,
+        )
+        channel = "email"
+        if not ok:
+            ok, detail = apply_via_browser(
+                db,
+                job,
+                cfg,
+                cover_letter=cover_body,
+                resume_path=resume["stored_path"],
+                resume_id=int(resume["id"]),
+                cover_letter_id=cover_id,
+                resume_summary=resume["analysis_summary"] or "",
+                resume_json=resume["analysis_json"] or "",
+                provider=provider,
+                model=model,
+                api_key=api_key,
+                now_iso=now_iso(),
+            )
+            channel = "browser"
+        if not ok:
+            record_blocked(db, job_id, detail, now_iso(), int(resume["id"]), cover_id)
+            db.execute("UPDATE jobs SET status='blocked', notes=? WHERE id=?", (detail[:900], job_id))
+            db.execute(
+                "UPDATE ai_decisions SET apply_channel=?, apply_result=? WHERE id=(SELECT MAX(id) FROM ai_decisions WHERE job_id=?)",
+                (channel, detail[:500], job_id),
+            )
+            return f"vaga {job_id}: bloqueada — {detail}"
+        db.execute("UPDATE jobs SET status='applied', applied_at=?, notes=? WHERE id=?", (now_iso(), detail[:900], job_id))
+        db.execute(
+            "UPDATE ai_decisions SET apply_channel=?, apply_result=? WHERE id=(SELECT MAX(id) FROM ai_decisions WHERE job_id=?)",
+            (channel, detail[:500], job_id),
+        )
+    return f"vaga {job_id}: aplicada via {channel} — {detail}"
+
+
+def process_auto_apply_batch() -> str:
+    """Processa vagas novas respeitando o limite por ciclo."""
+    cfg = settings()
+    if cfg.get("auto_apply") != "1":
+        return "auto_apply desligado"
+    try:
+        limit = max(1, min(50, int(cfg.get("maximum_applications_per_run", "5") or 5)))
+    except ValueError:
+        limit = 5
+    with connect() as db:
+        rows = db.execute("SELECT id FROM jobs WHERE status='new' ORDER BY id ASC LIMIT ?", (limit,)).fetchall()
+    messages = []
+    for row in rows:
+        if collector.stop_event.is_set():
+            break
+        try:
+            messages.append(process_auto_job(int(row["id"])))
+        except Exception as exc:
+            LOG.exception("Falha no auto-apply da vaga %s", row["id"])
+            messages.append(f"vaga {row['id']}: erro {exc.__class__.__name__}")
+    return "; ".join(messages) if messages else "nenhuma vaga nova para triagem"
+
 
 
 def terms(value: str) -> list[str]:
@@ -655,8 +865,14 @@ class Collector:
             except Exception as exc:  # keep other sources running if one is unavailable
                 LOG.exception("Falha ao consultar %s", source)
                 errors.append(f"{source}: {exc.__class__.__name__}")
-        finished =  now_iso()
+        apply_note = ""
+        if not self.stop_event.is_set() and settings().get("auto_apply") == "1":
+            self._set_progress(f"Triagem/candidatura automática… {found} vaga(s) nova(s).", found)
+            apply_note = process_auto_apply_batch()
+        finished = now_iso()
         message = f"Busca concluída: {found} vaga(s) nova(s)." + (" Avisos: " + "; ".join(errors) if errors else "")
+        if apply_note:
+            message += f" Auto-apply: {apply_note}"
         with connect() as db:
             db.execute("UPDATE runs SET finished_at=?,state=?,found_count=?,message=? WHERE id=?", (finished, "completed" if not self.stop_event.is_set() else "stopped", found, message, run_id))
         with self.lock:
@@ -688,8 +904,9 @@ def job_rows_html(jobs, collecting: bool) -> str:
         description = re.sub(r"<[^>]+>", " ", job["description"])
         lang_label = {"pt": "Português", "en": "English", "unknown": "Incerto"}.get(job["language"], job["language"])
         confidence = f" · {job['language_confidence']:.0%}" if job["language_confidence"] else ""
-        letter_ui = f'<details><summary>{"Carta criada" if job["cover_letter"] else "Carta não criada"}</summary><div class="description">{esc(job["cover_letter"] or "A carta será gerada automaticamente quando uma candidatura compatível solicitar esse documento.")}</div></details>'
-        rows.append(f'''<tr><td><a class="job-title" href="{esc(job['url'])}" target="_blank" rel="noreferrer">{esc(job['title'])}</a><small>{esc(job['company'])}</small></td><td>{esc(job['location'])}</td><td><span class="source">{esc(job['source'])}</span></td><td><span title="Confiança do detector: {confidence}">{esc(lang_label + confidence)}</span></td><td>{esc(STATUSES.get(job['status'], job['status']))}</td><td>{letter_ui}<details><summary>Descrição</summary><div class="description">{esc(description[:1800])}</div></details></td><td><small>{esc(format_brasilia(job['posted_at'] or job['first_seen_at']))}</small></td></tr>''')
+        letter_ui = f'<details><summary>{"Carta criada" if job["cover_letter"] else "Carta não criada"}</summary><div class="description">{esc(job["cover_letter"] or "A carta será gerada automaticamente na candidatura.")}</div></details>'
+        notes = f'<details><summary>Notas</summary><div class="description">{esc(job["notes"] or "—")}</div></details>' if job["notes"] else ""
+        rows.append(f'''<tr><td><a class="job-title" href="{esc(job['url'])}" target="_blank" rel="noreferrer">{esc(job['title'])}</a><small>{esc(job['company'])}</small></td><td>{esc(job['location'])}</td><td><span class="source">{esc(job['source'])}</span></td><td><span title="Confiança do detector: {confidence}">{esc(lang_label + confidence)}</span></td><td>{esc(STATUSES.get(job['status'], job['status']))}</td><td>{letter_ui}{notes}<details><summary>Descrição</summary><div class="description">{esc(description[:1800])}</div></details></td><td><small>{esc(format_brasilia(job['posted_at'] or job['first_seen_at']))}</small></td></tr>''')
     if rows:
         return "".join(rows)
     if collecting:
@@ -719,6 +936,61 @@ def live_payload() -> dict:
     }
 
 
+
+def resume_panels_html() -> str:
+    with connect() as db:
+        resumes = {row["language"]: row for row in db.execute("SELECT * FROM resumes")}
+    blocks = []
+    for lang, label in (("pt", "Português"), ("en", "English")):
+        row = resumes.get(lang)
+        if row:
+            meta = f"{esc(row['original_filename'])} · analisado em {esc(format_brasilia(row['analyzed_at']))}"
+            summary = esc((row["analysis_summary"] or "")[:700])
+            status = f'<p class="hint">{meta}</p><details><summary>Resumo da análise</summary><div class="description">{summary}</div></details>'
+        else:
+            status = '<p class="hint">Nenhum PDF analisado ainda.</p>'
+        blocks.append(
+            f'<div><h3 style="margin:0 0 8px;font-size:15px">Currículo {label}</h3>'
+            f'<form method="post" action="/upload-resume" enctype="multipart/form-data">'
+            f'<input type="hidden" name="language" value="{lang}">'
+            f'<label>Selecionar PDF<input type="file" name="file" accept="application/pdf" required></label>'
+            f'<button style="margin-top:8px">Enviar e analisar</button></form>{status}</div>'
+        )
+    return '<div class="form-grid">' + "".join(blocks) + "</div>"
+
+
+def form_rules_html() -> str:
+    with connect() as db:
+        rules = list_rules(db)
+    rows = []
+    for idx, rule in enumerate(rules, start=1):
+        mode_opts = "".join(
+            f'<option value="{m}" {"selected" if rule["mode"] == m else ""}>{m}</option>'
+            for m in ("text", "select", "file", "cover_letter", "skip")
+        )
+        rows.append(
+            f'<tr><td><input name="rule_key_{idx}" value="{esc(rule["key"])}"></td>'
+            f'<td><input name="rule_aliases_{idx}" value="{esc(rule["aliases"])}"></td>'
+            f'<td><select name="rule_mode_{idx}">{mode_opts}</select></td>'
+            f'<td><input name="rule_value_from_{idx}" value="{esc(rule["value_from"])}" placeholder="ex.: candidate_phone"></td>'
+            f'<td><input name="rule_value_{idx}" value="{esc(rule["value"])}"></td></tr>'
+        )
+    idx = len(rules) + 1
+    mode_opts = "".join(f'<option value="{m}">{m}</option>' for m in ("text", "select", "file", "cover_letter", "skip"))
+    rows.append(
+        f'<tr><td><input name="rule_key_{idx}" placeholder="nova chave"></td>'
+        f'<td><input name="rule_aliases_{idx}" placeholder="aliases"></td>'
+        f'<td><select name="rule_mode_{idx}">{mode_opts}</select></td>'
+        f'<td><input name="rule_value_from_{idx}"></td>'
+        f'<td><input name="rule_value_{idx}"></td></tr>'
+    )
+    return (
+        '<table style="min-width:100%;font-size:13px"><thead><tr>'
+        "<th>Chave</th><th>Aliases</th><th>Modo</th><th>Valor de settings</th><th>Valor fixo / select</th>"
+        "</tr></thead><tbody>" + "".join(rows) + "</tbody></table>"
+    )
+
+
 def render_page(notice: str = "") -> str:
     """Monta o painel local: preferências, controles, histórico e vagas capturadas."""
     cfg = settings()
@@ -729,9 +1001,14 @@ def render_page(notice: str = "") -> str:
     rows = job_rows_html(jobs, collecting)
     history = history_html(runs)
     state_label = state_label_for(status["state"])
+    resume_panel = resume_panels_html()
+    rules_panel = form_rules_html()
     return f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Radar de Vagas</title><style>
       :root{{--ink:#172b36;--muted:#62747d;--line:#dce5e8;--paper:#f4f7f7;--teal:#0b786d;--mint:#d8f0e9;--white:#fff}}*{{box-sizing:border-box}}body{{margin:0;background:var(--paper);color:var(--ink);font:15px/1.5 Inter,Segoe UI,Arial,sans-serif}}header{{background:#102d35;color:white;padding:28px max(24px,calc((100vw - 1280px)/2));display:flex;justify-content:space-between;align-items:center}}h1{{font-size:25px;margin:0}}header p{{margin:5px 0 0;color:#c1d4d6}}main{{max-width:1280px;margin:26px auto;padding:0 24px}}.top{{display:grid;grid-template-columns:1.3fr .7fr;gap:18px}}.panel,.stat,.table-wrap{{background:white;border:1px solid var(--line);border-radius:13px}}.panel{{padding:20px}}h2{{font-size:18px;margin:0 0 14px}}.form-grid{{display:grid;grid-template-columns:1fr 1fr;gap:12px}}label{{display:block;color:var(--muted);font-size:13px;font-weight:600}}input,textarea,select{{font:inherit;color:var(--ink);width:100%;margin-top:5px;padding:9px 10px;border:1px solid #cdd9dc;border-radius:8px;background:white}}.hint{{color:var(--muted);font-size:12px;margin:10px 0}}button{{border:0;border-radius:8px;padding:10px 15px;background:var(--teal);color:white;font-weight:650;cursor:pointer}}button.stop{{background:#a74639}}button.subtle{{padding:7px 10px;background:#eaf2f1;color:var(--ink);margin-top:6px}}.actions{{display:flex;gap:9px;margin-top:12px;align-items:center}}.runtime{{color:var(--muted);font-size:13px}}.stats{{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin:18px 0}}.stat{{padding:13px 15px}}.stat span{{display:block;font-size:12px;color:var(--muted)}}.stat strong{{font-size:23px}}.table-wrap{{overflow:auto}}table{{border-collapse:collapse;width:100%;min-width:950px}}th,td{{padding:13px 12px;text-align:left;border-bottom:1px solid var(--line);vertical-align:top}}th{{font-size:12px;color:var(--muted);background:#f8fafa}}td small{{display:block;color:var(--muted);margin-top:3px}}.job-title{{font-weight:700;color:#145d59;text-decoration:none}}.job-title:hover{{text-decoration:underline}}.source{{background:var(--mint);padding:3px 7px;border-radius:99px;font-size:12px}}select{{min-width:150px;margin:0;padding:7px}}summary{{cursor:pointer;color:var(--teal);font-size:13px}}.description{{max-width:350px;max-height:220px;overflow:auto;padding:8px 0;font-size:13px}}details textarea{{min-width:230px}}.history{{color:var(--muted);font-size:13px;padding-left:20px}}.notice{{padding:10px 13px;background:#e7f4ed;border-radius:8px;margin-bottom:15px}}@media(max-width:800px){{.top{{grid-template-columns:1fr}}.stats{{grid-template-columns:repeat(2,1fr)}}header{{padding:20px 24px}}.form-grid{{grid-template-columns:1fr}}}}
-      </style></head><body><header><div><h1>Radar de Vagas</h1><p>Busca, seleção e candidaturas automáticas</p></div><span id="collector-state">{esc(state_label)}</span></header><main>{f'<div class="notice">{esc(notice)}</div>' if notice else ''}<div class="top"><section class="panel"><h2>Preferências de busca</h2><form method="post" action="/settings"><div class="form-grid"><label>Cargos e termos, separados por vírgula<textarea name="keywords" rows="3">{esc(cfg.get('keywords',''))}</textarea></label><label>Países/regiões aceitos<textarea name="locations" rows="3">{esc(cfg.get('locations',''))}</textarea></label><label>Fontes: remotive, remoteok, adzuna, apify<input name="sources" value="{esc(cfg.get('sources',''))}"></label><label>Intervalo de busca (minutos)<input name="interval_minutes" type="number" min="5" value="{esc(cfg.get('interval_minutes','15'))}"></label><label>Países Adzuna (ex.: br,us,gb,ca)<input name="adzuna_countries" value="{esc(cfg.get('adzuna_countries','br,us,gb,ca'))}"></label><label>Limite mensal Apify (USD)<input name="apify_monthly_credit_limit_usd" type="number" min="0" step="0.01" value="{esc(cfg.get('apify_monthly_credit_limit_usd','5'))}"></label><label>Máximo de vagas por ciclo Apify<input name="apify_job_count" type="number" min="1" max="100" value="{esc(cfg.get('apify_job_count','25'))}"></label></div><button>Salvar preferências</button></form><div class="actions"><form method="post" action="/start"><button>Iniciar bot</button></form><form method="post" action="/stop"><button class="stop">Parar bot</button></form><span class="runtime" id="runtime-message">{esc(status['message'])}</span></div></section><section class="panel"><h2>Execuções recentes</h2><ul class="history" id="run-history">{history}</ul></section></div><section class="panel" style="margin-top:18px"><h2>Perfil e automação</h2><form method="post" action="/ai-settings"><div class="form-grid"><label>Provedor de IA<select name="ai_provider"><option value="gemini" {'selected' if cfg.get('ai_provider') == 'gemini' else ''}>Gemini</option><option value="openai" {'selected' if cfg.get('ai_provider') == 'openai' else ''}>OpenAI</option></select></label><label>Modelo<input name="ai_model" value="{esc(cfg.get('ai_model','gemini-2.5-flash'))}"></label><label>Seu nome<input name="candidate_name" value="{esc(cfg.get('candidate_name',''))}"></label><label>Chave de IA (vazio mantém a salva)<input type="password" name="api_key" autocomplete="new-password"></label><label>Fatos profissionais em português<textarea name="candidate_facts_pt" rows="4">{esc(cfg.get('candidate_facts_pt',''))}</textarea></label><label>Professional facts in English<textarea name="candidate_facts_en" rows="4">{esc(cfg.get('candidate_facts_en',''))}</textarea></label><label>Currículo em português (caminho local)<input name="resume_pt_path" value="{esc(cfg.get('resume_pt_path',''))}"></label><label>English résumé (local path)<input name="resume_en_path" value="{esc(cfg.get('resume_en_path',''))}"></label><label>Score mínimo escolhido pela IA (%)<input name="minimum_match_score" type="number" min="0" max="100" value="{esc(cfg.get('minimum_match_score','80'))}"></label><label>Máximo de candidaturas por ciclo<input name="maximum_applications_per_run" type="number" min="1" max="50" value="{esc(cfg.get('maximum_applications_per_run','5'))}"></label><label>Adzuna App ID (vazio mantém o salvo)<input name="adzuna_app_id" value=""></label><label>Adzuna API key (vazio mantém a salva)<input type="password" name="adzuna_app_key" value=""></label><label>Token Apify (vazio mantém o salvo)<input type="password" name="apify_token" value="" autocomplete="new-password"></label></div><label style="margin:12px 0"><input type="checkbox" name="auto_apply" value="1" {'checked' if cfg.get('auto_apply') == '1' else ''} style="width:auto"> Ativar seleção e candidatura automáticas onde a fonte permitir</label><p class="hint">A IA cria somente cartas de apresentação. Não cria nem altera currículos; os arquivos ficam no caminho local informado. Chaves ficam no cofre de credenciais do Windows. O Adzuna permite pesquisa pessoal pela API e limita o uso a 25 chamadas/minuto, 250/dia, 1.000/semana e 2.500/mês; mantenha a atribuição exibida nos resultados. A fonte apify usa o <a href="https://apify.com/api/job-scraping-api">job scraping API da Apify</a> em paralelo às demais; o bot para de chamá-la quando o uso do ciclo mensal da conta atingir o limite em USD. Token: console Apify → API &amp; Integrations.{f" Último uso consultado: {esc(cfg.get('apify_last_usage_usd','?'))} USD ({esc(cfg.get('apify_last_usage_cycle','ciclo atual'))})." if cfg.get('apify_last_usage_usd') else ""} O envio automático requer um endpoint de candidatura autorizado pela fonte.</p><button>Salvar perfil e automação</button></form></section><div class="stats" id="job-stats">{cards}</div><section class="table-wrap"><table><thead><tr><th>Vaga</th><th>Localidade</th><th>Fonte</th><th>Idioma</th><th>Etapa</th><th>Carta e descrição</th><th>Data</th></tr></thead><tbody id="jobs-body">{rows}</tbody></table></section></main>
+      </style></head><body><header><div><h1>Radar de Vagas</h1><p>Busca, seleção e candidaturas automáticas</p></div><span id="collector-state">{esc(state_label)}</span></header><main>{f'<div class="notice">{esc(notice)}</div>' if notice else ''}<div class="top"><section class="panel"><h2>Preferências de busca</h2><form method="post" action="/settings"><div class="form-grid"><label>Cargos e termos, separados por vírgula<textarea name="keywords" rows="3">{esc(cfg.get('keywords',''))}</textarea></label><label>Países/regiões aceitos<textarea name="locations" rows="3">{esc(cfg.get('locations',''))}</textarea></label><label>Fontes: remotive, remoteok, adzuna, apify<input name="sources" value="{esc(cfg.get('sources',''))}"></label><label>Intervalo de busca (minutos)<input name="interval_minutes" type="number" min="5" value="{esc(cfg.get('interval_minutes','15'))}"></label><label>Países Adzuna (ex.: br,us,gb,ca)<input name="adzuna_countries" value="{esc(cfg.get('adzuna_countries','br,us,gb,ca'))}"></label><label>Limite mensal Apify (USD)<input name="apify_monthly_credit_limit_usd" type="number" min="0" step="0.01" value="{esc(cfg.get('apify_monthly_credit_limit_usd','5'))}"></label><label>Máximo de vagas por ciclo Apify<input name="apify_job_count" type="number" min="1" max="100" value="{esc(cfg.get('apify_job_count','25'))}"></label></div><button>Salvar preferências</button></form><div class="actions"><form method="post" action="/start"><button>Iniciar bot</button></form><form method="post" action="/stop"><button class="stop">Parar bot</button></form><span class="runtime" id="runtime-message">{esc(status['message'])}</span></div></section><section class="panel"><h2>Execuções recentes</h2><ul class="history" id="run-history">{history}</ul></section></div><section class="panel" style="margin-top:18px"><h2>Currículos (PDF)</h2>{resume_panel}<p class="hint">O seletor de arquivos do sistema abre ao escolher o PDF. A IA analisa só quando o arquivo muda (hash). O PDF não é reenviado a cada vaga.</p></section>
+<section class="panel" style="margin-top:18px"><h2>Perfil, SMTP e automação</h2><form method="post" action="/ai-settings"><div class="form-grid"><label>Provedor de IA<select name="ai_provider"><option value="gemini" {'selected' if cfg.get('ai_provider') == 'gemini' else ''}>Gemini</option><option value="openai" {'selected' if cfg.get('ai_provider') == 'openai' else ''}>OpenAI</option></select></label><label>Modelo<input name="ai_model" value="{esc(cfg.get('ai_model','gemini-2.5-flash'))}"></label><label>Seu nome<input name="candidate_name" value="{esc(cfg.get('candidate_name',''))}"></label><label>E-mail<input name="candidate_email" value="{esc(cfg.get('candidate_email',''))}"></label><label>Telefone<input name="candidate_phone" value="{esc(cfg.get('candidate_phone',''))}"></label><label>LinkedIn<input name="candidate_linkedin" value="{esc(cfg.get('candidate_linkedin',''))}"></label><label>Cidade<input name="candidate_city" value="{esc(cfg.get('candidate_city',''))}"></label><label>Chave de IA (vazio mantém a salva)<input type="password" name="api_key" autocomplete="new-password"></label><label>Fatos profissionais em português<textarea name="candidate_facts_pt" rows="3">{esc(cfg.get('candidate_facts_pt',''))}</textarea></label><label>Professional facts in English<textarea name="candidate_facts_en" rows="3">{esc(cfg.get('candidate_facts_en',''))}</textarea></label><label>Score mínimo (%)<input name="minimum_match_score" type="number" min="0" max="100" value="{esc(cfg.get('minimum_match_score','80'))}"></label><label>Máximo de candidaturas por ciclo<input name="maximum_applications_per_run" type="number" min="1" max="50" value="{esc(cfg.get('maximum_applications_per_run','5'))}"></label><label>Adzuna App ID<input name="adzuna_app_id" value=""></label><label>Adzuna API key<input type="password" name="adzuna_app_key" value=""></label><label>Token Apify<input type="password" name="apify_token" value="" autocomplete="new-password"></label></div><label style="margin:12px 0"><input type="checkbox" name="auto_apply" value="1" {'checked' if cfg.get('auto_apply') == '1' else ''} style="width:auto"> Ativar triagem e candidatura automáticas (e-mail SMTP, depois formulário público)</label><p class="hint">Chaves ficam no cofre do sistema. Match usa a análise salva do currículo. Sem e-mail/formulário ou com pergunta aberta sem tokens de IA, a vaga é marcada como bloqueada/pulada.</p><button>Salvar perfil e IA</button></form></section>
+<section class="panel" style="margin-top:18px"><h2>SMTP</h2><form method="post" action="/smtp-settings"><div class="form-grid"><label>Host<input name="smtp_host" value="{esc(cfg.get('smtp_host',''))}"></label><label>Porta<input name="smtp_port" type="number" value="{esc(cfg.get('smtp_port','587'))}"></label><label>Usuário<input name="smtp_user" value="{esc(cfg.get('smtp_user',''))}"></label><label>Remetente (From)<input name="smtp_from" value="{esc(cfg.get('smtp_from',''))}"></label><label>Senha (vazio mantém)<input type="password" name="smtp_password" autocomplete="new-password"></label><label>TLS<select name="smtp_use_tls"><option value="1" {'selected' if cfg.get('smtp_use_tls','1')=='1' else ''}>Sim (STARTTLS)</option><option value="0" {'selected' if cfg.get('smtp_use_tls')=='0' else ''}>Não</option></select></label></div><div class="actions"><button>Salvar SMTP</button></div></form><form method="post" action="/smtp-test" style="margin-top:8px"><button class="subtle" type="submit">Enviar e-mail de teste</button></form></section>
+<section class="panel" style="margin-top:18px"><h2>Regras de formulário (Playwright)</h2><form method="post" action="/profile-settings">{rules_panel}<p class="hint">Para selects (ex.: salário), coloque em "Valor fixo" o texto da opção preferida. Perguntas abertas sem regra usam a IA; se não houver tokens, a vaga é pulada.</p><button>Salvar regras</button></form></section><div class="stats" id="job-stats">{cards}</div><section class="table-wrap"><table><thead><tr><th>Vaga</th><th>Localidade</th><th>Fonte</th><th>Idioma</th><th>Etapa</th><th>Carta e descrição</th><th>Data</th></tr></thead><tbody id="jobs-body">{rows}</tbody></table></section></main>
 <script>
 (function () {{
   var inFlight = false;
@@ -768,6 +1045,48 @@ def parse_form(handler: BaseHTTPRequestHandler) -> dict[str, str]:
     return {key: values[0] for key, values in parsed.items()}
 
 
+def parse_multipart(handler: BaseHTTPRequestHandler) -> tuple[dict[str, str], dict[str, tuple[str, bytes]]]:
+    """Parseia multipart/form-data em campos de texto e arquivos (nome, bytes)."""
+    content_type = handler.headers.get("Content-Type", "")
+    length = int(handler.headers.get("Content-Length", "0"))
+    body = handler.rfile.read(length)
+    if "boundary=" not in content_type:
+        raise ValueError("Upload multipart inválido.")
+    boundary = content_type.split("boundary=", 1)[1].strip().encode("utf-8")
+    if boundary.startswith(b'"') and boundary.endswith(b'"'):
+        boundary = boundary[1:-1]
+    fields: dict[str, str] = {}
+    files: dict[str, tuple[str, bytes]] = {}
+    for part in body.split(b"--" + boundary):
+        if not part or part in (b"--\r\n", b"--", b"\r\n"):
+            continue
+        if part.startswith(b"--"):
+            continue
+        if part.startswith(b"\r\n"):
+            part = part[2:]
+        if part.endswith(b"\r\n"):
+            part = part[:-2]
+        header_blob, sep, content = part.partition(b"\r\n\r\n")
+        if not sep:
+            continue
+        headers = header_blob.decode("utf-8", errors="replace")
+        disposition = ""
+        for line in headers.split("\r\n"):
+            if line.lower().startswith("content-disposition:"):
+                disposition = line
+        name_match = re.search(r'name="([^"]+)"', disposition)
+        if not name_match:
+            continue
+        name = name_match.group(1)
+        filename_match = re.search(r'filename="([^"]*)"', disposition)
+        if filename_match is not None:
+            filename = filename_match.group(1) or "upload.pdf"
+            files[name] = (filename, content)
+        else:
+            fields[name] = content.decode("utf-8", errors="replace")
+    return fields, files
+
+
 class Handler(BaseHTTPRequestHandler):
     """Trata as ações do painel sem depender de um servidor web externo."""
     def send_page(self, body: str, status: int = 200) -> None:
@@ -800,15 +1119,47 @@ class Handler(BaseHTTPRequestHandler):
         self.send_page(render_page())
 
     def do_POST(self) -> None:
+        path = urlparse(self.path).path
+        if path == "/upload-resume":
+            try:
+                fields, files = parse_multipart(self)
+                language = (fields.get("language") or "").strip().casefold()
+                if "file" not in files:
+                    raise ValueError("Selecione um arquivo PDF.")
+                filename, raw = files["file"]
+                cfg = settings()
+                provider = cfg.get("ai_provider", "gemini").casefold()
+                model = cfg.get("ai_model", "gemini-2.5-flash").strip()
+                with connect() as db:
+                    message, _reanalyzed = store_resume_upload(
+                        db,
+                        language=language,
+                        original_filename=filename,
+                        raw_bytes=raw,
+                        resumes_dir=RESUMES_DIR,
+                        now_iso=now_iso(),
+                        provider=provider,
+                        model=model,
+                        api_key=get_ai_key(provider),
+                        get_ai_key=get_ai_key,
+                    )
+                self.redirect(message)
+            except Exception as exc:
+                self.redirect(f"Falha no upload: {exc}")
+            return
+
         form = parse_form(self)
-        if self.path == "/settings":
+        if path == "/settings":
             save_settings(form)
             self.redirect("Filtros salvos.")
-        elif self.path == "/ai-settings":
+        elif path == "/ai-settings":
+            if "auto_apply" not in form:
+                form["auto_apply"] = "0"
             save_settings(form)
             provider = form.get("ai_provider", "gemini").casefold()
             try:
-                save_ai_key(provider, form.get("api_key", ""))
+                if form.get("api_key", "").strip():
+                    save_ai_key(provider, form.get("api_key", ""))
                 secret_set("adzuna_app_id", form.get("adzuna_app_id", ""))
                 secret_set("adzuna_app_key", form.get("adzuna_app_key", ""))
                 secret_set("apify_token", form.get("apify_token", ""))
@@ -816,19 +1167,51 @@ class Handler(BaseHTTPRequestHandler):
                 self.redirect(str(exc))
                 return
             self.redirect("Perfil e integrações salvos.")
-        elif self.path == "/start":
+        elif path == "/smtp-settings":
+            save_settings({k: form.get(k, "") for k in ("smtp_host", "smtp_port", "smtp_user", "smtp_from", "smtp_use_tls")})
+            try:
+                if form.get("smtp_password", "").strip():
+                    secret_set("smtp_password", form["smtp_password"])
+            except RuntimeError as exc:
+                self.redirect(str(exc))
+                return
+            self.redirect("SMTP salvo.")
+        elif path == "/smtp-test":
+            cfg = settings()
+            to_addr = (cfg.get("candidate_email") or cfg.get("smtp_from") or "").strip()
+            if not to_addr:
+                self.redirect("Configure candidate_email ou smtp_from para testar.")
+                return
+            try:
+                send_smtp_email(
+                    cfg=cfg,
+                    password=secret_get("smtp_password"),
+                    to_addrs=[to_addr],
+                    subject="Radar de Vagas — teste SMTP",
+                    body="Este é um e-mail de teste do Radar de Vagas.",
+                    attachment_path=None,
+                )
+                self.redirect(f"E-mail de teste enviado para {to_addr}.")
+            except Exception as exc:
+                self.redirect(f"Falha no teste SMTP: {exc}")
+        elif path == "/profile-settings":
+            save_settings(form)
+            with connect() as db:
+                save_rules_from_form(db, form)
+            self.redirect("Regras de formulário salvas.")
+        elif path == "/start":
             started = collector.start()
             self.redirect("Coleta iniciada." if started else "A coleta já está em execução.")
-        elif self.path == "/stop":
+        elif path == "/stop":
             collector.stop()
             self.redirect("Solicitação para parar enviada.")
-        elif self.path == "/job-status":
+        elif path == "/job-status":
             if form.get("status") in STATUSES and form.get("id", "").isdigit():
                 with connect() as db:
-                    applied =  now_iso() if form["status"] == "applied" else None
+                    applied = now_iso() if form["status"] == "applied" else None
                     db.execute("UPDATE jobs SET status=?, applied_at=COALESCE(?, applied_at) WHERE id=?", (form["status"], applied, int(form["id"])))
             self.redirect("Etapa da vaga atualizada.")
-        elif self.path == "/notes":
+        elif path == "/notes":
             if form.get("id", "").isdigit():
                 with connect() as db:
                     db.execute("UPDATE jobs SET notes=? WHERE id=?", (form.get("notes", ""), int(form["id"])))
