@@ -20,16 +20,20 @@ class LinkedInFilterTests(unittest.TestCase):
         urls = app.build_linkedin_search_urls(
             {
                 "keywords": ["backend engineer"],
-                "locations": ["Brazil"],
+                "locations": ["Remote", "Belo Horizonte"],
                 "experience_levels": [3, 4],
-                "workplace_types": [2],
+                "workplace_types": [2, 3],
             },
-            max_urls=2,
+            max_urls=4,
         )
-        self.assertEqual(len(urls), 1)
-        self.assertIn("f_E=3%2C4", urls[0])
-        self.assertIn("f_WT=2", urls[0])
-        self.assertIn("keywords=backend", urls[0])
+        self.assertGreaterEqual(len(urls), 2)
+        joined = "\n".join(urls)
+        self.assertIn("f_E=3%2C4", joined)
+        self.assertIn("f_WT=2", joined)
+        self.assertIn("f_WT=3", joined)
+        self.assertIn("Belo", joined)
+        # Remote URLs should not be Brazil-only.
+        self.assertTrue(any("f_WT=2" in u and "Remote" in u for u in urls))
 
     def test_fallback_filter_shape(self):
         fb = app._fallback_linkedin_filter(app.settings())

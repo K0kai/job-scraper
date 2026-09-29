@@ -256,6 +256,16 @@ def initialize() -> None:
         db.execute(
             "UPDATE settings SET value='65' WHERE key='minimum_match_score' AND value='80'"
         )
+        # Uma vez: regenerar filtro LinkedIn com geo remote global + híbrido BH.
+        row = db.execute(
+            "SELECT value FROM settings WHERE key='apify_linkedin_geo_v2'"
+        ).fetchone()
+        if not row or row["value"] != "1":
+            db.execute("UPDATE settings SET value='' WHERE key='apify_linkedin_filter_hash'")
+            db.execute(
+                "INSERT INTO settings(key,value) VALUES('apify_linkedin_geo_v2','1') "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
+            )
         ensure_log_table(db)
 
 
@@ -978,13 +988,16 @@ def _resume_filter_fingerprint() -> str:
 
 def _fallback_linkedin_filter(cfg: dict[str, str]) -> dict:
     keywords = terms(cfg.get("keywords", ""))[:4] or ["software engineer"]
-    locations = terms(cfg.get("locations", ""))[:3] or ["remote"]
+    # Remoto global; híbrido só em Belo Horizonte (não priorizar Brasil/país inteiro).
     return {
         "keywords": keywords,
-        "locations": locations,
+        "locations": ["Remote", "Belo Horizonte"],
         "experience_levels": [3, 4],
         "workplace_types": [2, 3],
-        "reason": "Fallback sem IA: keywords/locations das preferências + Mid-Senior/Associate + remote/hybrid.",
+        "reason": (
+            "Fallback: keywords das preferências; locations Remote + Belo Horizonte; "
+            "f_WT remote+hybrid (híbrido pensado para BH)."
+        ),
         "source": "fallback",
     }
 
@@ -1042,7 +1055,6 @@ def ai_generate_linkedin_search_filter(cfg: dict[str, str]) -> dict:
     facts_pt = (cfg.get("candidate_facts_pt") or "").strip()
     facts_en = (cfg.get("candidate_facts_en") or "").strip()
     pref_keywords = cfg.get("keywords", "")
-    pref_locations = cfg.get("locations", "")
     provider = cfg.get("ai_provider", "gemini").casefold()
     model = cfg.get("ai_model", "gemini-2.5-flash").strip()
     api_key = get_ai_key(provider)
@@ -1055,21 +1067,27 @@ The scraper takes LinkedIn search URLs. Choose filters that match THIS candidate
 LinkedIn experience codes (f_E): 1 Internship, 2 Entry, 3 Associate, 4 Mid-Senior, 5 Director, 6 Executive.
 LinkedIn workplace codes (f_WT): 1 On-site, 2 Remote, 3 Hybrid.
 
-Rules:
-- Prefer 2–4 experience codes centered on the candidate's seniority (usually include one level below and the main level; avoid jumping to Director/Executive unless the resume clearly supports it).
-- Prefer workplace types the candidate can actually do (default remote+hybrid if unclear).
-- keywords: 2–5 concrete job-search phrases in the language of the target market (mix role + stack when useful), NOT a dump of every skill.
-- locations: 1–4 strings (countries/regions/cities or "Remote" / "Brazil" / "United States" etc.). Prefer the panel preferences when sensible.
+GEO / WORKPLACE RULES (mandatory — override panel location preferences):
+- Do NOT prioritize Brazil, Brasil, or Brazilian cities as the main search target.
+- Remote (f_WT=2) is the PRIMARY target: the candidate accepts remote work from ANYWHERE worldwide.
+- For remote searches, prefer location strings like "Remote", "Worldwide", "United States", "Europe", or leave broad global remote — NOT "Brazil" as the default.
+- Hybrid (f_WT=3) is allowed ONLY when paired with location "Belo Horizonte" (or "Belo Horizonte, Minas Gerais" / "Belo Horizonte, Brazil").
+- Do NOT use f_WT=1 (On-site) unless the resume explicitly requires it (default: omit on-site).
+- Typical good combo: workplace_types [2, 3] with locations including "Remote" and "Belo Horizonte" (hybrid applies to BH only in intent).
+- Never make "Brazil" the only or primary location.
+
+Other rules:
+- Prefer 2–4 experience codes centered on the candidate's seniority (usually one level below + main; avoid Director/Executive unless clearly supported).
+- keywords: 2–5 concrete job-search phrases (role + stack when useful), preferably in English for global remote reach; PT only if clearly Brazil-hybrid BH search.
 - Do NOT invent employers or skills; only use the resume summaries and facts.
 - Return ONLY JSON with keys:
   keywords (string array),
   locations (string array),
   experience_levels (integer array of f_E codes),
   workplace_types (integer array of f_WT codes),
-  reason (short string in Portuguese explaining the choice).
+  reason (short string in Portuguese explaining the choice, mentioning remote global + hybrid BH).
 
-Panel keyword preferences: {pref_keywords or '[none]'}
-Panel location preferences: {pref_locations or '[none]'}
+Panel keyword preferences (roles/skills only — ignore geo bias here): {pref_keywords or '[none]'}
 Candidate facts PT: {facts_pt or '[none]'}
 Candidate facts EN: {facts_en or '[none]'}
 Resume summary PT: {resume_pt[:6000] or '[none]'}
@@ -1242,18 +1260,45 @@ def linkedin_filter_panel_html(cfg: dict[str, str] | None = None) -> str:
 
 def build_linkedin_search_urls(filter_data: dict, *, max_urls: int = 4) -> list[str]:
     keywords = [str(k) for k in (filter_data.get("keywords") or []) if str(k).strip()][:4]
-    locations = [str(x) for x in (filter_data.get("locations") or []) if str(x).strip()][:3]
+    locations = [str(x) for x in (filter_data.get("locations") or []) if str(x).strip()][:4]
     if not keywords:
         keywords = ["software engineer"]
     if not locations:
-        locations = ["remote"]
+        locations = ["Remote", "Belo Horizonte"]
     experience = [int(x) for x in (filter_data.get("experience_levels") or []) if int(x) in LINKEDIN_EXPERIENCE_CODES]
     workplace = [int(x) for x in (filter_data.get("workplace_types") or []) if int(x) in LINKEDIN_WORKPLACE_CODES]
     f_e = "%2C".join(str(x) for x in experience) if experience else ""
-    f_wt = "%2C".join(str(x) for x in workplace) if workplace else ""
+
+    def _is_bh(loc: str) -> bool:
+        low = loc.casefold()
+        return "belo horizonte" in low or low in {"bh", "bh, mg", "bh - mg"}
+
+    def _is_remote_loc(loc: str) -> bool:
+        low = loc.casefold()
+        return any(
+            token in low
+            for token in ("remote", "remoto", "worldwide", "anywhere", "global", "europe", "united states", "usa", "eua")
+        )
+
+    # Pares intencionais: remote → qualquer lugar remoto; hybrid → só BH.
+    pairs: list[tuple[str, str]] = []
+    if 2 in workplace:
+        remote_locs = [loc for loc in locations if _is_remote_loc(loc)] or ["Remote"]
+        for loc in remote_locs[:2]:
+            pairs.append((loc, "2"))
+    if 3 in workplace:
+        bh_locs = [loc for loc in locations if _is_bh(loc)] or ["Belo Horizonte"]
+        for loc in bh_locs[:1]:
+            pairs.append((loc, "3"))
+    if 1 in workplace and not pairs:
+        pairs.append((locations[0], "1"))
+    if not pairs:
+        # Sem f_WT explícito: remote global + BH.
+        pairs = [("Remote", "2"), ("Belo Horizonte", "3")]
+
     urls: list[str] = []
     for keyword in keywords:
-        for location in locations:
+        for location, f_wt in pairs:
             url = (
                 f"https://www.linkedin.com/jobs/search/?keywords={quote_plus(keyword)}"
                 f"&location={quote_plus(location)}&position=1&pageNum=0"
