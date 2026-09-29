@@ -47,11 +47,13 @@ def is_retryable_error(exc: BaseException) -> bool:
     name = exc.__class__.__name__.casefold()
     if "aiunavailable" in name:
         return True
+    if "operationalerror" in name and "locked" in str(exc).casefold():
+        return True
     msg = str(exc).casefold()
     tokens = (
         "429", "503", "502", "504", "quota", "rate limit", "resource_exhausted",
         "unavailable", "overload", "temporar", "try again", "retry", "high demand",
-        "ia indisponível", "resource exhausted",
+        "ia indisponível", "resource exhausted", "database is locked", "database locked",
     )
     return any(token in msg for token in tokens)
 
@@ -128,10 +130,14 @@ class JobQueue:
                 return
             workers, _, _ = self._limits()
             self._stop.clear()
+            recovered = self.recover_stale_running()
             self._executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="queue-worker")
             self._dispatcher = threading.Thread(target=self._dispatch_loop, daemon=True, name="queue-dispatcher")
             self._dispatcher.start()
-            log_event("info", "queue", f"Fila iniciada com até {workers} worker(s).")
+            msg = f"Fila iniciada com até {workers} worker(s)."
+            if recovered:
+                msg += f" {recovered} job(s) interrompido(s) recolocados como pendentes."
+            log_event("info", "queue", msg)
 
     def stop(self) -> None:
         self._stop.set()
@@ -141,6 +147,23 @@ class JobQueue:
         if ex:
             ex.shutdown(wait=False, cancel_futures=False)
         log_event("info", "queue", "Fila parada.")
+
+    def recover_stale_running(self) -> int:
+        """Jobs 'running' sem processo vivo (ex.: após restart) voltam para pending."""
+        now = _utc_now()
+        _, _, ttl_hours = self._limits()
+        with self._connect() as db:
+            cur = db.execute(
+                """UPDATE queue_jobs
+                   SET status='pending', next_run_at=?, expires_at=?, updated_at=?,
+                       last_error=CASE
+                         WHEN last_error='' THEN 'Interrompido (reinício do app); reenfileirado.'
+                         ELSE last_error
+                       END
+                   WHERE status='running'""",
+                (_iso(now), _iso(now + timedelta(hours=ttl_hours)), _iso(now)),
+            )
+            return int(cur.rowcount or 0)
 
     def enqueue(self, kind: str, payload: dict[str, Any], *, dedupe_key: str | None = None) -> int:
         if kind not in self.handlers:
@@ -212,17 +235,52 @@ class JobQueue:
         return ok
 
     def retry_now(self, job_id: int) -> bool:
-        now = _iso(_utc_now())
+        now = _utc_now()
+        _, max_attempts, ttl_hours = self._limits()
+        with self._lock:
+            fut = self._inflight.get(job_id)
+            if fut is not None and not fut.done():
+                return False
         with self._connect() as db:
             cur = db.execute(
-                """UPDATE queue_jobs SET status='pending', next_run_at=?, updated_at=?, last_error=''
-                   WHERE id=? AND status IN ('retry_wait','failed','cancelled')""",
-                (now, now, job_id),
+                """UPDATE queue_jobs
+                   SET status='pending', next_run_at=?, expires_at=?, updated_at=?,
+                       last_error='', attempts=0, max_attempts=?, result=''
+                   WHERE id=? AND status IN ('retry_wait','failed','cancelled','running')""",
+                (_iso(now), _iso(now + timedelta(hours=ttl_hours)), _iso(now), max_attempts, job_id),
             )
             ok = cur.rowcount > 0
         if ok:
             log_event("info", "queue", f"Job #{job_id} reenfileirado para execução imediata.")
         return ok
+
+    def retry_all(self, *, statuses: tuple[str, ...] = ("failed", "cancelled", "retry_wait", "running")) -> int:
+        """Reenfileira em lote jobs reprocessáveis (útil após falhas em massa / restart)."""
+        now = _utc_now()
+        _, max_attempts, ttl_hours = self._limits()
+        with self._lock:
+            live = {jid for jid, fut in self._inflight.items() if not fut.done()}
+        placeholders = ",".join("?" * len(statuses))
+        with self._connect() as db:
+            rows = db.execute(
+                f"SELECT id FROM queue_jobs WHERE status IN ({placeholders})",
+                statuses,
+            ).fetchall()
+            ids = [int(row["id"]) for row in rows if int(row["id"]) not in live]
+            if not ids:
+                return 0
+            id_ph = ",".join("?" * len(ids))
+            cur = db.execute(
+                f"""UPDATE queue_jobs
+                    SET status='pending', next_run_at=?, expires_at=?, updated_at=?,
+                        last_error='', attempts=0, max_attempts=?, result=''
+                    WHERE id IN ({id_ph})""",
+                [_iso(now), _iso(now + timedelta(hours=ttl_hours)), _iso(now), max_attempts, *ids],
+            )
+            n = int(cur.rowcount or 0)
+        if n:
+            log_event("info", "queue", f"{n} job(s) reenfileirado(s) em lote.")
+        return n
 
     def clear_terminal(self) -> int:
         with self._connect() as db:

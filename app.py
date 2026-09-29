@@ -1803,7 +1803,7 @@ def queue_html(limit: int = 100) -> str:
                 f'<form method="post" action="/queue-cancel" class="js-process-form" style="display:inline">'
                 f'<input type="hidden" name="id" value="{jid}"><button class="subtle" type="submit">Cancelar</button></form>'
             )
-        if row["status"] in {"retry_wait", "failed", "cancelled"}:
+        if row["status"] in {"retry_wait", "failed", "cancelled", "running"}:
             actions.append(
                 f'<form method="post" action="/queue-retry" class="js-process-form" style="display:inline">'
                 f'<input type="hidden" name="id" value="{jid}"><button class="subtle" type="submit">Reenfileirar</button></form>'
@@ -1825,8 +1825,12 @@ def queue_html(limit: int = 100) -> str:
         "</tr></thead><tbody>" + "".join(body) + "</tbody></table>"
     )
     clear_btn = (
-        '<form method="post" action="/queue-clear" class="js-process-form" style="margin-top:10px">'
+        '<div style="margin-top:10px;display:flex;gap:10px;flex-wrap:wrap">'
+        '<form method="post" action="/queue-retry-all" class="js-process-form">'
+        '<button class="subtle" type="submit">Reenfileirar falhos/cancelados/retry</button></form>'
+        '<form method="post" action="/queue-clear" class="js-process-form">'
         '<button class="subtle" type="submit">Limpar concluídos/falhos/cancelados</button></form>'
+        "</div>"
     )
     return summary + table + clear_btn
 
@@ -2312,6 +2316,7 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
     "/stop": 1,
     "/queue-cancel": 1,
     "/queue-retry": 1,
+    "/queue-retry-all": 1,
     "/queue-clear": 1,
     "/clear-logs": 1
   }};
@@ -2627,6 +2632,12 @@ class Handler(BaseHTTPRequestHandler):
                 self.respond_notice(f"Job #{jid} reenfileirado.", notice_kind="info")
             else:
                 self.respond_notice("Não foi possível reenfileirar o job.", notice_kind="error", ok=False)
+        elif path == "/queue-retry-all":
+            n = queue.retry_all()
+            if n:
+                self.respond_notice(f"{n} job(s) reenfileirado(s).", notice_kind="info")
+            else:
+                self.respond_notice("Nenhum job elegível para reenfileirar.", notice_kind="warning")
         elif path == "/queue-clear":
             n = queue.clear_terminal()
             self.respond_notice(f"{n} job(s) removido(s) da fila.", notice_kind="info")
