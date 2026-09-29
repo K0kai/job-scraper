@@ -26,6 +26,7 @@ from resume_pipeline import (
     get_resume,
     mark_resume_analysis_error,
     persist_resume_upload,
+    resume_match_snippets,
     resume_summaries,
     run_resume_analysis,
 )
@@ -103,7 +104,7 @@ DEFAULT_SETTINGS = {
     "resume_pt_path": "",
     "resume_en_path": "",
     "auto_apply": "0",
-    "minimum_match_score": "80",
+    "minimum_match_score": "65",
     "maximum_applications_per_run": "5",
     "adzuna_countries": "br,us,gb,ca",
     "apify_monthly_credit_limit_usd": "5",
@@ -251,6 +252,10 @@ def initialize() -> None:
         ensure_default_rules(db)
         for key, value in DEFAULT_SETTINGS.items():
             db.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (key, value))
+        # Default antigo (80) era rígido demais com a triagem generosa.
+        db.execute(
+            "UPDATE settings SET value='65' WHERE key='minimum_match_score' AND value='80'"
+        )
         ensure_log_table(db)
 
 
@@ -429,39 +434,41 @@ def ai_assess_job(job: dict, cfg: dict[str, str]) -> dict:
     facts = cfg.get("candidate_facts_pt" if language == "pt" else "candidate_facts_en", "").strip()
     with connect() as db:
         summaries = resume_summaries(db)
+        snippets = resume_match_snippets(db)
     resume_summary_pt = summaries.get("pt", "").strip()
     resume_summary_en = summaries.get("en", "").strip()
-    if language == "pt" and not resume_summary_pt and not resume_summary_en:
+    snippet_pt = snippets.get("pt", "").strip()
+    snippet_en = snippets.get("en", "").strip()
+    if language == "pt" and not resume_summary_pt and not resume_summary_en and not snippet_pt and not snippet_en:
         raise ValueError("Faça upload e análise de pelo menos um currículo antes da triagem automática.")
-    if language == "en" and not resume_summary_en and not resume_summary_pt:
+    if language == "en" and not resume_summary_en and not resume_summary_pt and not snippet_en and not snippet_pt:
         raise ValueError("Faça upload e análise de pelo menos um currículo antes da triagem automática.")
 
-    prompt = f"""You are a supportive career coach helping a strong candidate decide whether to APPLY.
+    prompt = f"""You are an ENTHUSIASTIC job-application coach. Your bias is to APPLY when there is any credible path.
 
-Goal: be OPTIMISTIC but honest. Prefer giving the candidate a chance when there is a credible fit.
-Do NOT invent experience, employers, degrees, or tools that are absent from the candidate facts / resume summaries.
-You MAY count transferable skills, adjacent tools in the same family (e.g. React↔Vue, Postgres↔MySQL, AWS↔GCP),
-fast-learning capacity implied by a broad senior/generalist profile, and partial overlap with long requirement lists.
+CRITICAL CALIBRATION (follow strictly):
+- Be GENEROUS with match_score. Most plausible tech/office/remote roles for this candidate should land 65–90, not 20–40.
+- If the job is in the SAME broad field as the resume (e.g. software/engineering/IT/data/web vs software resume), match_score MUST be >= 65 unless a hard blocker applies.
+- If the job title overlaps the candidate's roles/skills even partially, match_score MUST be >= 70.
+- Missing tools from a long JD list is NORMAL — do NOT tank the score. Penalize at most 5–15 points total for missing secondary tools.
+- Prefer transferable and adjacent skills (React↔Vue, AWS↔GCP, SQL dialects, similar frameworks).
+- Do NOT invent employers, degrees, or tools absent from the resume context.
+- Default to should_apply=true whenever match_score >= 50 and no hard blocker.
 
-Scoring guidance (use the FULL 0–100 range generously when there is real overlap):
-- 85–100: strong overlap on core responsibilities and most must-have skills; clear apply.
-- 70–84: solid partial fit — core role matches, some secondary skills missing or only adjacent; still apply.
-- 55–69: stretch but plausible (title/seniority close, several transferable skills); apply if remote/location OK.
-- 40–54: weak overlap; apply only if the role is unusually flexible or the candidate clearly targets this niche.
-- 0–39: clear mismatch (wrong career track, seniority gap of multiple levels, or hard blockers).
+Scoring bands (use the HIGH end when unsure):
+- 85–100: core role fits; several overlapping skills.
+- 70–84: good enough to apply; partial stack overlap or transferable skills.
+- 55–69: stretch / adjacent role in the same field — still apply.
+- 40–54: weak but same industry; apply only if remote/flexible.
+- 0–39: ONLY for hard blockers or totally different careers (nurse, truck driver, accountant with no path, etc.).
 
-Hard blockers for should_apply=false (and low score):
-- Role is a fundamentally different profession (e.g. nurse, accountant, truck driver) with no path from the resume.
-- Explicit non-negotiable work authorization / onsite-only location that conflicts with the candidate facts.
-- Seniority gap of roughly 2+ levels with no supporting evidence (e.g. junior resume vs principal/staff bar).
+Hard blockers (should_apply=false, score usually <40):
+- Fundamentally different profession with no bridge from the resume.
+- Explicit non-negotiable visa/onsite conflict vs candidate facts/location notes.
+- Seniority jump of ~2+ levels with zero supporting evidence.
 
-Do NOT treat these as hard blockers by themselves:
-- Missing 1–3 tools from a long laundry list of requirements.
-- "Nice to have" / preferred / plus skills the candidate lacks.
-- Cover letter requested (set cover_letter_required=true; still may apply).
-- Perfect keyword match missing when the resume shows equivalent experience in plain language.
+Never treat as hard blockers: laundry-list tools, "nice to have", cover letter requested, imperfect keyword match, years stated as "X+" when candidate is close.
 
-Set should_apply=true whenever match_score >= 55 unless a hard blocker applies.
 Identify whether the job description asks for a cover letter.
 Return ONLY JSON with keys:
 match_score (integer 0-100),
@@ -471,8 +478,10 @@ reason (short string in {('Portuguese' if language == 'pt' else 'English')}),
 recommended_resume_language (either "en" or "pt").
 
 Candidate facts: {facts or '[none provided]'}
-Resume summary (PT): {resume_summary_pt or '[none provided]'}
-Resume summary (EN): {resume_summary_en or '[none provided]'}
+Resume profile snippet (PT): {snippet_pt or '[none provided]'}
+Resume profile snippet (EN): {snippet_en or '[none provided]'}
+Resume summary (PT): {(resume_summary_pt[:2500] if resume_summary_pt else '[none provided]')}
+Resume summary (EN): {(resume_summary_en[:2500] if resume_summary_en else '[none provided]')}
 Job title: {job['title']}
 Company: {job['company']}
 Location/eligibility: {job['location']}
@@ -486,11 +495,29 @@ Description: {re.sub(r'<[^>]+>', ' ', job['description'])[:10000]}"""
     try:
         if provider == "openai":
             endpoint = "https://api.openai.com/v1/responses"
-            payload = json.dumps({"model": model, "input": prompt, "text": {"format": {"type": "json_object"}}, "store": False, "max_output_tokens": 300}).encode("utf-8")
+            payload = json.dumps(
+                {
+                    "model": model,
+                    "input": prompt,
+                    "text": {"format": {"type": "json_object"}},
+                    "store": False,
+                    "max_output_tokens": 400,
+                    "temperature": 0.7,
+                }
+            ).encode("utf-8")
             headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
         elif provider == "gemini":
             endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{quote_plus(model)}:generateContent?key={quote_plus(api_key)}"
-            payload = json.dumps({"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"maxOutputTokens": 300, "responseMimeType": "application/json"}}).encode("utf-8")
+            payload = json.dumps(
+                {
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "generationConfig": {
+                        "maxOutputTokens": 400,
+                        "temperature": 0.7,
+                        "responseMimeType": "application/json",
+                    },
+                }
+            ).encode("utf-8")
             headers = {"Content-Type": "application/json"}
         else:
             raise ValueError("Provedor de IA inválido.")
@@ -511,7 +538,7 @@ Description: {re.sub(r'<[^>]+>', ' ', job['description'])[:10000]}"""
     recommended_language = decision.get("recommended_resume_language")
     if recommended_language not in ("en", "pt"):
         match_score = int(decision.get("match_score", 0))
-        if language == "en" and match_score >= 80 and resume_summary_en:
+        if language == "en" and match_score >= 65 and resume_summary_en:
             recommended_language = "en"
         elif resume_summary_pt:
             recommended_language = "pt"
@@ -523,9 +550,17 @@ Description: {re.sub(r'<[^>]+>', ' ', job['description'])[:10000]}"""
         recommended_language = "en"
     if recommended_language == "en" and not resume_summary_en and resume_summary_pt:
         recommended_language = "pt"
+
+    score = max(0, min(100, int(decision.get("match_score", 0))))
+    should_apply = bool(decision.get("should_apply"))
+    # Soft floor: same-field optimistic calibration if the model still underrates.
+    if should_apply and score < 50:
+        score = 50
+    elif score >= 50:
+        should_apply = True
     return {
-        "match_score": max(0, min(100, int(decision.get("match_score", 0)))),
-        "should_apply": bool(decision.get("should_apply")),
+        "match_score": score,
+        "should_apply": should_apply,
         "letter_required": bool(decision.get("cover_letter_required")),
         "reason": str(decision.get("reason", ""))[:1000],
         "provider": provider,

@@ -46,6 +46,57 @@ def resume_summaries(db: sqlite3.Connection) -> dict[str, str]:
     return {row["language"]: row["analysis_summary"] or "" for row in rows}
 
 
+def resume_match_snippets(db: sqlite3.Connection, *, max_chars: int = 3500) -> dict[str, str]:
+    """Trechos densos (skills/senioridade/headline) para a triagem de match."""
+    rows = db.execute(
+        "SELECT language, analysis_json, analysis_summary FROM resumes"
+    ).fetchall()
+    out: dict[str, str] = {}
+    for row in rows:
+        lang = row["language"]
+        parts: list[str] = []
+        try:
+            data = json.loads(row["analysis_json"] or "{}")
+        except json.JSONDecodeError:
+            data = {}
+        if isinstance(data, dict) and data:
+            headline = str(data.get("headline") or "").strip()
+            if headline:
+                parts.append(f"Headline: {headline}")
+            seniority = str(data.get("seniority") or "").strip()
+            years = str(data.get("years_of_experience") or "").strip()
+            if seniority or years:
+                parts.append(f"Seniority: {seniority or '—'} | Years: {years or '—'}")
+            for label, key in (
+                ("Technical skills", "technical_skills"),
+                ("Skills", "skills"),
+                ("Tools", "tools"),
+                ("Domains", "domains"),
+            ):
+                value = data.get(key)
+                if isinstance(value, list) and value:
+                    parts.append(f"{label}: " + ", ".join(str(v) for v in value[:50] if str(v).strip()))
+            experience = data.get("experience")
+            if isinstance(experience, list) and experience:
+                exp_bits = []
+                for item in experience[:8]:
+                    exp_bits.append(str(item)[:220])
+                if exp_bits:
+                    parts.append("Recent experience:\n- " + "\n- ".join(exp_bits))
+            loc = str(data.get("location_notes") or "").strip()
+            auth = str(data.get("work_authorization_notes") or "").strip()
+            if loc:
+                parts.append(f"Location notes: {loc}")
+            if auth:
+                parts.append(f"Work authorization: {auth}")
+        summary = (row["analysis_summary"] or "").strip()
+        if summary:
+            parts.append("Summary excerpt:\n" + summary[:1800])
+        text = "\n".join(parts).strip()
+        out[lang] = text[:max_chars] if text else summary[:max_chars]
+    return out
+
+
 def compose_analysis_dossier(analysis: dict, language: str) -> str:
     """Monta um dossiê longo e estruturado para match e visualização no painel."""
     language_name = "Português" if language == "pt" else "English"
