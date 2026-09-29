@@ -1203,21 +1203,48 @@ def build_apify_run_input(actor: dict, cfg: dict[str, str]) -> dict:
     return built
 
 
+def _apify_item_url(item: dict) -> str:
+    """Extrai URL aplicável de payloads LinkedIn/Indeed (incl. viewJobLink relativo)."""
+    candidates = [
+        item.get("originalApplyUrl"),
+        item.get("link"),
+        item.get("url"),
+        item.get("applyUrl"),
+        item.get("jobUrl"),
+        item.get("externalApplyLink"),
+        item.get("viewJobLink"),
+        item.get("jobLink"),
+    ]
+    for raw in candidates:
+        url = str(raw or "").strip()
+        if not url:
+            continue
+        if url.startswith("http://") or url.startswith("https://"):
+            return url
+        if url.startswith("/"):
+            base = ""
+            for key in ("companyOverviewLink", "companyUrl", "url", "link"):
+                hint = str(item.get(key) or "").strip()
+                if hint.startswith("http://") or hint.startswith("https://"):
+                    parsed = urlparse(hint)
+                    if parsed.scheme and parsed.netloc:
+                        base = f"{parsed.scheme}://{parsed.netloc}"
+                        break
+            if not base:
+                # Indeed default quando só vem path relativo.
+                base = "https://www.indeed.com"
+            return base.rstrip("/") + url
+    return ""
+
+
 def normalize_apify_items(items: list, *, label: str) -> list[dict]:
     results: list[dict] = []
     source_name = f"Apify:{label}" if label else "Apify"
     for item in items:
         if not isinstance(item, dict):
             continue
-        url = str(
-            item.get("link")
-            or item.get("url")
-            or item.get("applyUrl")
-            or item.get("jobUrl")
-            or item.get("externalApplyLink")
-            or ""
-        ).strip()
-        title = str(item.get("title") or item.get("position") or item.get("jobTitle") or "").strip()
+        url = _apify_item_url(item)
+        title = str(item.get("title") or item.get("position") or item.get("jobTitle") or item.get("displayTitle") or "").strip()
         if not url or not title:
             continue
         description = str(
@@ -1225,14 +1252,44 @@ def normalize_apify_items(items: list, *, label: str) -> list[dict]:
             or item.get("descriptionHtml")
             or item.get("description")
             or item.get("jobDescription")
+            or item.get("jobDescriptionHTML")
             or ""
         )
-        company = item.get("companyName") or item.get("company") or {}
+        company = item.get("companyName") or item.get("company") or item.get("companyDetails") or item.get("jobSourceName") or {}
         if isinstance(company, dict):
             company = company.get("name") or company.get("display_name") or ""
-        location = item.get("location") or item.get("jobLocation") or ""
+        location = (
+            item.get("formattedLocation")
+            or item.get("location")
+            or item.get("jobLocation")
+            or ""
+        )
         if isinstance(location, dict):
-            location = location.get("display_name") or location.get("name") or ""
+            formatted = location.get("formatted") or {}
+            if isinstance(formatted, dict):
+                location = (
+                    formatted.get("long")
+                    or formatted.get("short")
+                    or location.get("fullAddress")
+                    or location.get("display_name")
+                    or location.get("name")
+                    or ""
+                )
+            else:
+                location = (
+                    location.get("fullAddress")
+                    or location.get("display_name")
+                    or location.get("name")
+                    or ""
+                )
+        if not location:
+            city = str(item.get("jobLocationCity") or "").strip()
+            state = str(item.get("jobLocationState") or "").strip()
+            location = ", ".join(p for p in (city, state) if p)
+        posted_at = item.get("postedAt") or item.get("publishedAt") or item.get("date") or item.get("pubDate")
+        if isinstance(posted_at, (int, float)) and posted_at > 10_000_000_000:
+            # Indeed pubDate em milissegundos.
+            posted_at = datetime.fromtimestamp(posted_at / 1000, tz=timezone.utc).isoformat(timespec="seconds")
         results.append(
             {
                 "source": source_name,
@@ -1242,7 +1299,7 @@ def normalize_apify_items(items: list, *, label: str) -> list[dict]:
                 "location": str(location or ""),
                 "description": description,
                 "url": url,
-                "posted_at": item.get("postedAt") or item.get("publishedAt") or item.get("date"),
+                "posted_at": posted_at,
             }
         )
     return results
