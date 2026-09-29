@@ -1835,27 +1835,89 @@ def queue_html(limit: int = 100) -> str:
     return summary + table + clear_btn
 
 
-def worth_html(limit: int = 80) -> str:
-    with connect() as db:
-        rows = db.execute(
-            """SELECT jobs.*, cover_letters.body AS cover_letter,
-                      (
+WORTH_PAGE_SIZE = 15
+
+
+def _worth_match_expr() -> str:
+    return """(
                         SELECT match_score FROM ai_decisions
                         WHERE ai_decisions.job_id = jobs.id
                         ORDER BY id DESC LIMIT 1
-                      ) AS match_score
+                      )"""
+
+
+def worth_html(*, page: int = 1, page_size: int = WORTH_PAGE_SIZE, min_match: int = 0) -> str:
+    page = max(1, int(page or 1))
+    page_size = max(5, min(50, int(page_size or WORTH_PAGE_SIZE)))
+    min_match = max(0, min(100, int(min_match or 0)))
+    offset = (page - 1) * page_size
+    match_expr = _worth_match_expr()
+    where = "jobs.status = 'worth'"
+    params: list[object] = []
+    if min_match > 0:
+        where += f" AND COALESCE({match_expr}, 0) >= ?"
+        params.append(min_match)
+
+    with connect() as db:
+        total = int(
+            db.execute(
+                f"SELECT COUNT(*) AS n FROM jobs WHERE {where}",
+                params,
+            ).fetchone()["n"]
+        )
+        rows = db.execute(
+            f"""SELECT jobs.*, cover_letters.body AS cover_letter,
+                      {match_expr} AS match_score
                FROM jobs
                LEFT JOIN cover_letters ON cover_letters.job_id = jobs.id
-               WHERE jobs.status = 'worth'
+               WHERE {where}
                ORDER BY COALESCE(match_score, 0) DESC, jobs.id DESC
-               LIMIT ?""",
-            (limit,),
+               LIMIT ? OFFSET ?""",
+            [*params, page_size, offset],
         ).fetchall()
-    if not rows:
-        return (
-            '<p class="hint">Nenhuma vaga aqui ainda. Quando houver bom match mas LinkedIn, '
-            "falha de formulário/e-mail, a vaga aparece nesta lista para você candidatar manualmente.</p>"
+
+    filter_bar = (
+        '<div class="worth-filters actions" style="margin:0 0 12px;align-items:flex-end;flex-wrap:wrap">'
+        '<label style="margin:0">Match mínimo (%)'
+        f'<input type="number" id="worth-min-match" min="0" max="100" step="1" value="{min_match}" '
+        'style="width:88px;margin-top:4px"></label>'
+        '<button type="button" class="subtle" id="worth-apply-filter">Filtrar</button>'
+        "".join(
+            f'<button type="button" class="subtle worth-match-preset" data-worth-min-match="{n}">'
+            f'{"Todos" if n == 0 else f"{n}+"}</button>'
+            for n in (0, 70, 80, 90)
         )
+        + "</div>"
+    )
+
+    if total == 0:
+        empty = (
+            '<p class="hint">Nenhuma vaga neste filtro. '
+            + (
+                "Ajuste o match mínimo ou limpe o filtro."
+                if min_match > 0
+                else "Quando houver bom match mas LinkedIn, falha de formulário/e-mail, a vaga aparece aqui."
+            )
+            + "</p>"
+        )
+        return filter_bar + empty
+
+    pages = max(1, (total + page_size - 1) // page_size)
+    if page > pages:
+        page = pages
+        offset = (page - 1) * page_size
+        with connect() as db:
+            rows = db.execute(
+                f"""SELECT jobs.*, cover_letters.body AS cover_letter,
+                          {match_expr} AS match_score
+                   FROM jobs
+                   LEFT JOIN cover_letters ON cover_letters.job_id = jobs.id
+                   WHERE {where}
+                   ORDER BY COALESCE(match_score, 0) DESC, jobs.id DESC
+                   LIMIT ? OFFSET ?""",
+                [*params, page_size, offset],
+            ).fetchall()
+
     cards = []
     for job in rows:
         score = job["match_score"]
@@ -1878,7 +1940,30 @@ def worth_html(limit: int = 80) -> str:
             f'<button class="subtle" name="status" value="saved" type="submit">Salvar</button>'
             f"</form></article>"
         )
-    return '<div class="worth-list">' + "".join(cards) + "</div>"
+    start = offset + 1
+    end = offset + len(rows)
+    filter_note = f" · match ≥ {min_match}" if min_match > 0 else ""
+    pager_bits = [
+        f'<div class="worth-pager" data-worth-pages="{pages}">'
+        f'<span class="hint">Mostrando {start}–{end} de {total}{filter_note}</span>'
+        '<div class="actions" style="margin-top:0">'
+    ]
+    if page > 1:
+        pager_bits.append(
+            f'<button type="button" class="subtle" data-worth-page="{page - 1}">Anterior</button>'
+        )
+    else:
+        pager_bits.append('<button type="button" class="subtle" disabled>Anterior</button>')
+    pager_bits.append(f'<span class="hint" style="margin:0">Página {page} / {pages}</span>')
+    if page < pages:
+        pager_bits.append(
+            f'<button type="button" class="subtle" data-worth-page="{page + 1}">Próxima</button>'
+        )
+    else:
+        pager_bits.append('<button type="button" class="subtle" disabled>Próxima</button>')
+    pager_bits.append("</div></div>")
+    pager = "".join(pager_bits)
+    return filter_bar + pager + '<div class="worth-list">' + "".join(cards) + "</div>" + pager
 
 
 def state_label_for(state: str) -> str:
@@ -1905,7 +1990,7 @@ def format_countdown(seconds: int | None) -> str:
     return f"{mins:02d}:{secs:02d}"
 
 
-def live_payload() -> dict:
+def live_payload(*, worth_page: int = 1, worth_min_match: int = 0) -> dict:
     status = collector.snapshot()
     counts, jobs, runs = load_dashboard()
     collecting = status["state"] in {"running", "stopping"}
@@ -1914,7 +1999,7 @@ def live_payload() -> dict:
     history = history_html(runs)
     logs = logs_html()
     queue = queue_html()
-    worth = worth_html()
+    worth = worth_html(page=worth_page, min_match=worth_min_match)
     linkedin_filter = linkedin_filter_panel_html()
     next_in = next_run_countdown_seconds(status.get("next_run_at"))
     return {
@@ -1936,6 +2021,8 @@ def live_payload() -> dict:
         "queue_hash": _live_hash(queue),
         "worth_html": worth,
         "worth_hash": _live_hash(worth),
+        "worth_page": max(1, int(worth_page or 1)),
+        "worth_min_match": max(0, min(100, int(worth_min_match or 0))),
         "resume_status": resume_status_payload(),
         "linkedin_filter_html": linkedin_filter,
         "linkedin_filter_hash": _live_hash(linkedin_filter),
@@ -2154,7 +2241,7 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
         f"{esc(notice) if notice else ''}</div>"
     )
     return f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Radar de Vagas</title><style>
-      :root{{--ink:#172b36;--muted:#62747d;--line:#dce5e8;--paper:#f4f7f7;--teal:#0b786d;--mint:#d8f0e9;--white:#fff}}*{{box-sizing:border-box}}body{{margin:0;background:var(--paper);color:var(--ink);font:15px/1.5 Inter,Segoe UI,Arial,sans-serif}}header{{background:#102d35;color:white;padding:28px max(24px,calc((100vw - 1280px)/2));display:flex;justify-content:space-between;align-items:center}}h1{{font-size:25px;margin:0}}header p{{margin:5px 0 0;color:#c1d4d6}}main{{max-width:1280px;margin:26px auto;padding:0 24px}}.top{{display:grid;grid-template-columns:1.3fr .7fr;gap:18px}}.panel,.stat,.table-wrap{{background:white;border:1px solid var(--line);border-radius:13px}}.panel{{padding:20px}}h2{{font-size:18px;margin:0 0 14px}}.form-grid{{display:grid;grid-template-columns:1fr 1fr;gap:12px}}label{{display:block;color:var(--muted);font-size:13px;font-weight:600}}input,textarea,select{{font:inherit;color:var(--ink);width:100%;margin-top:5px;padding:9px 10px;border:1px solid #cdd9dc;border-radius:8px;background:white}}.hint{{color:var(--muted);font-size:12px;margin:10px 0}}button{{border:0;border-radius:8px;padding:10px 15px;background:var(--teal);color:white;font-weight:650;cursor:pointer}}button.stop{{background:#a74639}}button.subtle{{padding:7px 10px;background:#eaf2f1;color:var(--ink);margin-top:6px}}.actions{{display:flex;gap:9px;margin-top:12px;align-items:center}}.runtime{{color:var(--muted);font-size:13px}}.stats{{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin:18px 0}}.stat{{padding:13px 15px}}.stat span{{display:block;font-size:12px;color:var(--muted)}}.stat strong{{font-size:23px}}.table-wrap{{overflow:auto}}table{{border-collapse:collapse;width:100%;min-width:950px}}th,td{{padding:13px 12px;text-align:left;border-bottom:1px solid var(--line);vertical-align:top}}th{{font-size:12px;color:var(--muted);background:#f8fafa}}td small{{display:block;color:var(--muted);margin-top:3px}}.job-title{{font-weight:700;color:#145d59;text-decoration:none}}.job-title:hover{{text-decoration:underline}}.source{{background:var(--mint);padding:3px 7px;border-radius:99px;font-size:12px}}select{{min-width:150px;margin:0;padding:7px}}summary{{cursor:pointer;color:var(--teal);font-size:13px}}.description{{max-width:350px;max-height:220px;overflow:auto;padding:8px 0;font-size:13px}}details textarea{{min-width:230px}}.history{{color:var(--muted);font-size:13px;padding-left:20px}}.notice{{padding:10px 13px;border-radius:8px;margin-bottom:15px}}.notice-ok{{background:#e7f4ed;border:1px solid #b7dfc8}}.notice-info{{background:#e8f1f8;border:1px solid #b7d0e6}}.notice-error{{background:#fceaea;border:1px solid #e3b0b0;color:#6b2a2a}}.notice-warn{{background:#fff6e5;border:1px solid #e6d0a0}}.analysis-badge{{display:inline-block;padding:4px 10px;border-radius:999px;font-size:12px;font-weight:700;margin:10px 0 6px}}.analysis-ok{{background:#d8f0e9;color:#0b5c52}}.analysis-info{{background:#dceaf6;color:#1d4f74}}.analysis-error{{background:#f6d6d6;color:#7a2424}}.analysis-none{{background:#eceff1;color:#526066}}.analysis-error-text{{color:#7a2424;font-size:13px;margin:8px 0}}.resume-card{{border:1px solid var(--line);border-radius:10px;padding:14px;background:#fbfcfc}}.tabs{{display:flex;gap:8px;margin:0 0 16px}}.tab{{background:#e7eeef;color:var(--ink);padding:9px 16px;border-radius:999px;font-weight:650;cursor:pointer}}.tab.active{{background:var(--teal);color:white}}.tab-panel{{display:none}}.tab-panel.active{{display:block}}.log-console{{font:12.5px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:#0f1c22;color:#d7e6ea;border-radius:10px;padding:12px;max-height:620px;overflow:auto}}.log-line{{display:grid;grid-template-columns:132px 72px 110px 1fr;gap:10px;padding:5px 0;border-bottom:1px solid #1e323b}}.log-time{{color:#8eacb6}}.log-level{{font-weight:700;text-transform:uppercase}}.log-source{{color:#7ec8c0}}.log-msg{{color:#e8f3f5;white-space:pre-wrap;word-break:break-word}}.log-info .log-level{{color:#9ec9ff}}.log-success .log-level{{color:#7ddea8}}.log-warning .log-level{{color:#f0c674}}.log-error .log-level{{color:#f0a0a0}}.log-debug .log-level{{color:#9aa7ad}}.log-empty{{color:#9bb0b8;padding:18px 8px}}.queue-status{{display:inline-block;padding:3px 8px;border-radius:999px;font-size:12px;font-weight:700}}.queue-pending,.queue-retry_wait{{background:#dceaf6;color:#1d4f74}}.queue-running{{background:#d8f0e9;color:#0b5c52}}.queue-succeeded{{background:#e7f4ed;color:#1f6b45}}.queue-failed{{background:#f6d6d6;color:#7a2424}}.queue-cancelled{{background:#eceff1;color:#526066}}.worth-list{{display:grid;gap:14px}}.worth-card{{border:1px solid var(--line);border-radius:12px;padding:14px;background:#fbfcfc}}.worth-head{{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap}}@media(max-width:900px){{.log-line{{grid-template-columns:1fr;gap:2px}}}}@media(max-width:800px){{.top{{grid-template-columns:1fr}}.stats{{grid-template-columns:repeat(2,1fr)}}header{{padding:20px 24px}}.form-grid{{grid-template-columns:1fr}}}}
+      :root{{--ink:#172b36;--muted:#62747d;--line:#dce5e8;--paper:#f4f7f7;--teal:#0b786d;--mint:#d8f0e9;--white:#fff}}*{{box-sizing:border-box}}body{{margin:0;background:var(--paper);color:var(--ink);font:15px/1.5 Inter,Segoe UI,Arial,sans-serif}}header{{background:#102d35;color:white;padding:28px max(24px,calc((100vw - 1280px)/2));display:flex;justify-content:space-between;align-items:center}}h1{{font-size:25px;margin:0}}header p{{margin:5px 0 0;color:#c1d4d6}}main{{max-width:1280px;margin:26px auto;padding:0 24px}}.top{{display:grid;grid-template-columns:1.3fr .7fr;gap:18px}}.panel,.stat,.table-wrap{{background:white;border:1px solid var(--line);border-radius:13px}}.panel{{padding:20px}}h2{{font-size:18px;margin:0 0 14px}}.form-grid{{display:grid;grid-template-columns:1fr 1fr;gap:12px}}label{{display:block;color:var(--muted);font-size:13px;font-weight:600}}input,textarea,select{{font:inherit;color:var(--ink);width:100%;margin-top:5px;padding:9px 10px;border:1px solid #cdd9dc;border-radius:8px;background:white}}.hint{{color:var(--muted);font-size:12px;margin:10px 0}}button{{border:0;border-radius:8px;padding:10px 15px;background:var(--teal);color:white;font-weight:650;cursor:pointer}}button.stop{{background:#a74639}}button.subtle{{padding:7px 10px;background:#eaf2f1;color:var(--ink);margin-top:6px}}.actions{{display:flex;gap:9px;margin-top:12px;align-items:center}}.runtime{{color:var(--muted);font-size:13px}}.stats{{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin:18px 0}}.stat{{padding:13px 15px}}.stat span{{display:block;font-size:12px;color:var(--muted)}}.stat strong{{font-size:23px}}.table-wrap{{overflow:auto}}table{{border-collapse:collapse;width:100%;min-width:950px}}th,td{{padding:13px 12px;text-align:left;border-bottom:1px solid var(--line);vertical-align:top}}th{{font-size:12px;color:var(--muted);background:#f8fafa}}td small{{display:block;color:var(--muted);margin-top:3px}}.job-title{{font-weight:700;color:#145d59;text-decoration:none}}.job-title:hover{{text-decoration:underline}}.source{{background:var(--mint);padding:3px 7px;border-radius:99px;font-size:12px}}select{{min-width:150px;margin:0;padding:7px}}summary{{cursor:pointer;color:var(--teal);font-size:13px}}.description{{max-width:350px;max-height:220px;overflow:auto;padding:8px 0;font-size:13px}}details textarea{{min-width:230px}}.history{{color:var(--muted);font-size:13px;padding-left:20px}}.notice{{padding:10px 13px;border-radius:8px;margin-bottom:15px}}.notice-ok{{background:#e7f4ed;border:1px solid #b7dfc8}}.notice-info{{background:#e8f1f8;border:1px solid #b7d0e6}}.notice-error{{background:#fceaea;border:1px solid #e3b0b0;color:#6b2a2a}}.notice-warn{{background:#fff6e5;border:1px solid #e6d0a0}}.analysis-badge{{display:inline-block;padding:4px 10px;border-radius:999px;font-size:12px;font-weight:700;margin:10px 0 6px}}.analysis-ok{{background:#d8f0e9;color:#0b5c52}}.analysis-info{{background:#dceaf6;color:#1d4f74}}.analysis-error{{background:#f6d6d6;color:#7a2424}}.analysis-none{{background:#eceff1;color:#526066}}.analysis-error-text{{color:#7a2424;font-size:13px;margin:8px 0}}.resume-card{{border:1px solid var(--line);border-radius:10px;padding:14px;background:#fbfcfc}}.tabs{{display:flex;gap:8px;margin:0 0 16px}}.tab{{background:#e7eeef;color:var(--ink);padding:9px 16px;border-radius:999px;font-weight:650;cursor:pointer}}.tab.active{{background:var(--teal);color:white}}.tab-panel{{display:none}}.tab-panel.active{{display:block}}.log-console{{font:12.5px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:#0f1c22;color:#d7e6ea;border-radius:10px;padding:12px;max-height:620px;overflow:auto}}.log-line{{display:grid;grid-template-columns:132px 72px 110px 1fr;gap:10px;padding:5px 0;border-bottom:1px solid #1e323b}}.log-time{{color:#8eacb6}}.log-level{{font-weight:700;text-transform:uppercase}}.log-source{{color:#7ec8c0}}.log-msg{{color:#e8f3f5;white-space:pre-wrap;word-break:break-word}}.log-info .log-level{{color:#9ec9ff}}.log-success .log-level{{color:#7ddea8}}.log-warning .log-level{{color:#f0c674}}.log-error .log-level{{color:#f0a0a0}}.log-debug .log-level{{color:#9aa7ad}}.log-empty{{color:#9bb0b8;padding:18px 8px}}.queue-status{{display:inline-block;padding:3px 8px;border-radius:999px;font-size:12px;font-weight:700}}.queue-pending,.queue-retry_wait{{background:#dceaf6;color:#1d4f74}}.queue-running{{background:#d8f0e9;color:#0b5c52}}.queue-succeeded{{background:#e7f4ed;color:#1f6b45}}.queue-failed{{background:#f6d6d6;color:#7a2424}}.queue-cancelled{{background:#eceff1;color:#526066}}.worth-list{{display:grid;gap:14px}}.worth-card{{border:1px solid var(--line);border-radius:12px;padding:14px;background:#fbfcfc}}.worth-head{{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap}}.worth-pager{{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin:8px 0 14px}}@media(max-width:900px){{.log-line{{grid-template-columns:1fr;gap:2px}}}}@media(max-width:800px){{.top{{grid-template-columns:1fr}}.stats{{grid-template-columns:repeat(2,1fr)}}header{{padding:20px 24px}}.form-grid{{grid-template-columns:1fr}}}}
       </style></head><body><header><div><h1>Radar de Vagas</h1><p>Busca, seleção e candidaturas automáticas</p></div><span id="collector-state">{esc(state_label)}</span></header><main>{notice_html}<nav class="tabs" aria-label="Seções do painel"><button type="button" class="tab active" data-tab="painel">Painel</button><button type="button" class="tab" data-tab="vale">Vale a pena olhar</button><button type="button" class="tab" data-tab="filas">Filas</button><button type="button" class="tab" data-tab="logs">Logs</button></nav><div id="tab-painel" class="tab-panel active"><div class="top"><section class="panel"><h2>Preferências de busca</h2><form method="post" action="/settings"><div class="form-grid"><label>Cargos e termos, separados por vírgula<textarea name="keywords" rows="3">{esc(cfg.get('keywords',''))}</textarea></label><label>Países/regiões aceitos<textarea name="locations" rows="3">{esc(cfg.get('locations',''))}</textarea></label><label>Fontes: remotive, remoteok, adzuna, apify<input name="sources" value="{esc(cfg.get('sources',''))}"></label><label>Intervalo de busca (minutos)<input name="interval_minutes" type="number" min="5" value="{esc(cfg.get('interval_minutes','15'))}"></label><label>Países Adzuna (ex.: br,us,gb,ca)<input name="adzuna_countries" value="{esc(cfg.get('adzuna_countries','br,us,gb,ca'))}"></label><label>Limite mensal Apify (USD)<input name="apify_monthly_credit_limit_usd" type="number" min="0" step="0.01" value="{esc(cfg.get('apify_monthly_credit_limit_usd','5'))}"></label><label>Máximo de vagas por ciclo Apify<input name="apify_job_count" type="number" min="1" max="100" value="{esc(cfg.get('apify_job_count','25'))}"></label><label style="grid-column:1/-1">Actors Apify (JSON — um ou mais scrapers)<textarea name="apify_actors_json" rows="8" style="font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px">{esc(cfg.get('apify_actors_json',''))}</textarea></label></div><p class="hint">Cada actor: <code>id</code>, <code>label</code>, <code>enabled</code>, <code>input_mode</code> (<code>linkedin_search</code> ou <code>custom</code>), <code>count</code> opcional. Em <code>linkedin_search</code>, a IA monta sozinha keywords + f_E (nível) + f_WT (remote/híbrido) a partir do currículo (cache até reanalisar). Em <code>custom</code>, use <code>input_template</code> com placeholders <code>{{keyword}}</code>, <code>{{location}}</code>, <code>{{count}}</code>, <code>{{keywords}}</code>.</p><div id="linkedin-filter-slot">{linkedin_filter_view}</div><button>Salvar preferências</button></form><div class="actions"><form method="post" action="/start" class="js-process-form"><button>Iniciar bot</button></form><form method="post" action="/stop" class="js-process-form"><button class="stop">Parar bot</button></form><span class="runtime" id="runtime-message">{esc(status['message'])}</span><span class="runtime" id="next-run-timer" style="margin-left:12px;font-variant-numeric:tabular-nums">{esc(next_run_timer_text)}</span></div></section><section class="panel"><h2>Execuções recentes</h2><ul class="history" id="run-history">{history}</ul></section></div><section class="panel" style="margin-top:18px"><h2>Currículos (PDF)</h2>{resume_panel}<p class="hint">O seletor de arquivos do sistema abre ao escolher o PDF. A análise agora gera um dossiê completo (skills, experiências, projetos). Use <em>Reanalisar</em> para regenerar com o prompt enriquecido.</p></section>
 <section class="panel" style="margin-top:18px"><h2>Perfil, SMTP e automação</h2><form method="post" action="/ai-settings"><div class="form-grid"><label>Provedor de IA<select name="ai_provider"><option value="gemini" {'selected' if cfg.get('ai_provider') == 'gemini' else ''}>Gemini</option><option value="openai" {'selected' if cfg.get('ai_provider') == 'openai' else ''}>OpenAI</option></select></label><label>Modelo<input name="ai_model" value="{esc(cfg.get('ai_model','gemini-2.5-flash'))}"></label><label>Seu nome<input name="candidate_name" value="{esc(cfg.get('candidate_name',''))}"></label><label>E-mail<input name="candidate_email" value="{esc(cfg.get('candidate_email',''))}"></label><label>Telefone<input name="candidate_phone" value="{esc(cfg.get('candidate_phone',''))}"></label><label>LinkedIn<input name="candidate_linkedin" value="{esc(cfg.get('candidate_linkedin',''))}"></label><label>Cidade<input name="candidate_city" value="{esc(cfg.get('candidate_city',''))}"></label><label>Chave de IA (vazio mantém a salva)<input type="password" name="api_key" autocomplete="new-password"></label><label>Fatos profissionais em português<textarea name="candidate_facts_pt" rows="3">{esc(cfg.get('candidate_facts_pt',''))}</textarea></label><label>Professional facts in English<textarea name="candidate_facts_en" rows="3">{esc(cfg.get('candidate_facts_en',''))}</textarea></label><label>Score mínimo (%)<input name="minimum_match_score" type="number" min="0" max="100" value="{esc(cfg.get('minimum_match_score','80'))}"></label><label>Workers da fila (vagas em paralelo)<input name="queue_max_workers" type="number" min="1" max="8" value="{esc(cfg.get('queue_max_workers','3'))}"></label><label>Máx. tentativas por job<input name="queue_max_attempts" type="number" min="1" max="200" value="{esc(cfg.get('queue_max_attempts','40'))}"></label><label>TTL da fila (horas)<input name="queue_ttl_hours" type="number" min="1" max="168" value="{esc(cfg.get('queue_ttl_hours','24'))}"></label><label>Adzuna App ID<input name="adzuna_app_id" value=""></label><label>Adzuna API key<input type="password" name="adzuna_app_key" value=""></label><label>Token Apify<input type="password" name="apify_token" value="" autocomplete="new-password"></label></div><label style="margin:12px 0"><input type="checkbox" name="auto_apply" value="1" {'checked' if cfg.get('auto_apply') == '1' else ''} style="width:auto"> Ativar triagem e candidatura automáticas (e-mail SMTP, depois formulário público)</label><p class="hint">Chaves ficam no cofre do sistema. Match usa o dossiê completo do currículo. Bom match em LinkedIn ou sem canal de envio vai para a aba <strong>Vale a pena olhar</strong>.</p><button>Salvar perfil e IA</button></form></section>
 <section class="panel" style="margin-top:18px"><h2>SMTP</h2><form method="post" action="/smtp-settings"><div class="form-grid"><label>Host<input name="smtp_host" value="{esc(cfg.get('smtp_host',''))}"></label><label>Porta<input name="smtp_port" type="number" value="{esc(cfg.get('smtp_port','587'))}"></label><label>Usuário<input name="smtp_user" value="{esc(cfg.get('smtp_user',''))}"></label><label>Remetente (From)<input name="smtp_from" value="{esc(cfg.get('smtp_from',''))}"></label><label>Senha (vazio mantém)<input type="password" name="smtp_password" autocomplete="new-password"></label><label>TLS<select name="smtp_use_tls"><option value="1" {'selected' if cfg.get('smtp_use_tls','1')=='1' else ''}>Sim (STARTTLS)</option><option value="0" {'selected' if cfg.get('smtp_use_tls')=='0' else ''}>Não</option></select></label></div><div class="actions"><button>Salvar SMTP</button></div></form><form method="post" action="/smtp-test" style="margin-top:8px"><button class="subtle" type="submit">Enviar e-mail de teste</button></form></section>
@@ -2212,6 +2299,9 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
     }}
   }} catch (e) {{}}
   var appliedHashes = {{}};
+  var worthPage = 1;
+  var worthMinMatch = 0;
+  var worthForceUpdate = false;
   function panelBusy(el) {{
     if (!el) return false;
     try {{
@@ -2248,10 +2338,56 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
     }}
     if (wrap) wrap.scrollTop = wrapTop;
   }}
+  function requestWorthRefresh() {{
+    appliedHashes.worth = null;
+    worthForceUpdate = true;
+    var worthEl = document.getElementById("worth-body");
+    if (worthEl) worthEl.removeAttribute("data-hash");
+    refresh();
+  }}
+  var worthBody = document.getElementById("worth-body");
+  if (worthBody) {{
+    worthBody.addEventListener("click", function (ev) {{
+      var preset = ev.target.closest(".worth-match-preset");
+      if (preset && worthBody.contains(preset)) {{
+        worthMinMatch = parseInt(preset.getAttribute("data-worth-min-match"), 10) || 0;
+        worthPage = 1;
+        requestWorthRefresh();
+        return;
+      }}
+      if (ev.target && ev.target.id === "worth-apply-filter") {{
+        var input = document.getElementById("worth-min-match");
+        var val = input ? parseInt(input.value, 10) : 0;
+        if (isNaN(val)) val = 0;
+        worthMinMatch = Math.max(0, Math.min(100, val));
+        worthPage = 1;
+        requestWorthRefresh();
+        return;
+      }}
+      var btn = ev.target.closest("[data-worth-page]");
+      if (!btn || btn.disabled) return;
+      if (!worthBody.contains(btn)) return;
+      var next = parseInt(btn.getAttribute("data-worth-page"), 10);
+      if (!next || next === worthPage) return;
+      worthPage = next;
+      requestWorthRefresh();
+    }});
+    worthBody.addEventListener("keydown", function (ev) {{
+      if (ev.key !== "Enter") return;
+      if (!ev.target || ev.target.id !== "worth-min-match") return;
+      ev.preventDefault();
+      var applyBtn = document.getElementById("worth-apply-filter");
+      if (applyBtn) applyBtn.click();
+    }});
+  }}
   function refresh() {{
     if (inFlight || document.hidden) return;
     inFlight = true;
-    fetch("/live", {{ headers: {{ Accept: "application/json" }} }})
+    fetch(
+      "/live?worth_page=" + encodeURIComponent(worthPage)
+        + "&worth_min_match=" + encodeURIComponent(worthMinMatch),
+      {{ headers: {{ Accept: "application/json" }} }}
+    )
       .then(function (response) {{ return response.ok ? response.json() : Promise.reject(); }})
       .then(function (data) {{
         var stateEl = document.getElementById("collector-state");
@@ -2269,11 +2405,14 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
           nextRunAtIso = data.next_run_at || null;
           updateNextRunTimer();
         }}
+        if (data.worth_page) worthPage = data.worth_page;
+        if (typeof data.worth_min_match !== "undefined") worthMinMatch = data.worth_min_match;
         applyRegion(statsEl, data.stats_html, data.stats_hash, {{ key: "stats" }});
         applyRegion(jobsEl, data.jobs_html, data.jobs_hash, {{ key: "jobs", skipIfBusy: true, wrapScroll: ".table-wrap" }});
         applyRegion(historyEl, data.history_html, data.history_hash, {{ key: "history" }});
         applyRegion(queueEl, data.queue_html, data.queue_hash, {{ key: "queue", skipIfBusy: true }});
-        applyRegion(worthEl, data.worth_html, data.worth_hash, {{ key: "worth", skipIfBusy: true }});
+        applyRegion(worthEl, data.worth_html, data.worth_hash, {{ key: "worth", skipIfBusy: !worthForceUpdate }});
+        worthForceUpdate = false;
         applyRegion(
           document.getElementById("linkedin-filter-slot"),
           data.linkedin_filter_html,
@@ -2306,7 +2445,7 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
         }}
       }})
       .catch(function () {{}})
-      .then(function () {{ inFlight = false; }});
+      .then(function () {{ inFlight = false; worthForceUpdate = false; }});
   }}
   var noticeTimer = null;
   var PROCESS_PATHS = {{
@@ -2470,9 +2609,23 @@ class Handler(BaseHTTPRequestHandler):
         self.redirect(notice, notice_kind=notice_kind)
 
     def do_GET(self) -> None:
-        path = urlparse(self.path).path
+        parsed = urlparse(self.path)
+        path = parsed.path
         if path == "/live":
-            self.send_json(live_payload())
+            qs = parse_qs(parsed.query)
+            worth_page = 1
+            worth_min_match = 0
+            raw_page = (qs.get("worth_page") or ["1"])[0]
+            raw_min = (qs.get("worth_min_match") or ["0"])[0]
+            try:
+                worth_page = max(1, int(raw_page))
+            except ValueError:
+                worth_page = 1
+            try:
+                worth_min_match = max(0, min(100, int(raw_min)))
+            except ValueError:
+                worth_min_match = 0
+            self.send_json(live_payload(worth_page=worth_page, worth_min_match=worth_min_match))
             return
         self.send_page(render_page())
 
