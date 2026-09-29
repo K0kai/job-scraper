@@ -120,6 +120,64 @@ Resume text:
     return data
 
 
+def _upsert_resume(
+    db: sqlite3.Connection,
+    *,
+    language: str,
+    original_filename: str,
+    stored_path: str,
+    digest: str,
+    extracted_text: str,
+    analysis_json: str,
+    analysis_summary: str,
+    analyzed_at: str | None,
+    provider: str,
+    model: str,
+    analysis_status: str,
+    analysis_error: str,
+    analysis_message: str,
+    now_iso: str,
+) -> None:
+    db.execute(
+        """INSERT INTO resumes(
+             language,original_filename,stored_path,file_sha256,extracted_text,analysis_json,analysis_summary,
+             analyzed_at,provider,model,analysis_status,analysis_error,analysis_message,created_at,updated_at)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+           ON CONFLICT(language) DO UPDATE SET
+             original_filename=excluded.original_filename,
+             stored_path=excluded.stored_path,
+             file_sha256=excluded.file_sha256,
+             extracted_text=excluded.extracted_text,
+             analysis_json=excluded.analysis_json,
+             analysis_summary=excluded.analysis_summary,
+             analyzed_at=excluded.analyzed_at,
+             provider=excluded.provider,
+             model=excluded.model,
+             analysis_status=excluded.analysis_status,
+             analysis_error=excluded.analysis_error,
+             analysis_message=excluded.analysis_message,
+             updated_at=excluded.updated_at
+        """,
+        (
+            language,
+            original_filename,
+            stored_path,
+            digest,
+            extracted_text,
+            analysis_json,
+            analysis_summary,
+            analyzed_at,
+            provider,
+            model,
+            analysis_status,
+            analysis_error[:1000],
+            analysis_message[:500],
+            now_iso,
+            now_iso,
+        ),
+    )
+
+
 def store_resume_upload(
     db: sqlite3.Connection,
     *,
@@ -132,8 +190,11 @@ def store_resume_upload(
     model: str,
     api_key: str,
     get_ai_key: Callable[[str], str] | None = None,
-) -> tuple[str, bool]:
-    """Salva PDF e analisa se o hash mudou. Retorna (mensagem, reanalyzed)."""
+) -> tuple[str, str, bool]:
+    """Salva PDF e analisa se o hash mudou.
+
+    Retorna (mensagem, notice_kind, reanalyzed) onde notice_kind é success|info|error.
+    """
     if language not in {"pt", "en"}:
         raise ValueError("Idioma do currículo deve ser pt ou en.")
     if not raw_bytes.startswith(b"%PDF"):
@@ -151,45 +212,74 @@ def store_resume_upload(
     existing = get_resume(db, language)
     if existing and existing["file_sha256"] == digest and (existing["analysis_summary"] or "").strip():
         os.replace(temp_path, stored_path)
+        message = f"Currículo {language.upper()}: PDF idêntico ao já analisado. Análise da IA reutilizada (sem nova chamada)."
         db.execute(
-            """UPDATE resumes SET original_filename=?, stored_path=?, updated_at=? WHERE language=?""",
-            (original_filename, stored_path, now_iso, language),
+            """UPDATE resumes SET original_filename=?, stored_path=?, analysis_status='reused',
+                   analysis_error='', analysis_message=?, updated_at=? WHERE language=?""",
+            (original_filename, stored_path, message, now_iso, language),
         )
-        return f"Currículo {language.upper()} já analisado (mesmo arquivo). Análise reutilizada.", False
+        return message, "info", False
 
-    text = extract_pdf_text(temp_path)
-    key = api_key or (get_ai_key(provider) if get_ai_key else "")
-    analysis = analyze_resume_text(text, language, provider=provider, model=model, api_key=key)
-    summary = str(analysis.get("summary") or "").strip()
-    os.replace(temp_path, stored_path)
-    db.execute(
-        """INSERT INTO resumes(language,original_filename,stored_path,file_sha256,extracted_text,analysis_json,analysis_summary,analyzed_at,provider,model,created_at,updated_at)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
-           ON CONFLICT(language) DO UPDATE SET
-             original_filename=excluded.original_filename,
-             stored_path=excluded.stored_path,
-             file_sha256=excluded.file_sha256,
-             extracted_text=excluded.extracted_text,
-             analysis_json=excluded.analysis_json,
-             analysis_summary=excluded.analysis_summary,
-             analyzed_at=excluded.analyzed_at,
-             provider=excluded.provider,
-             model=excluded.model,
-             updated_at=excluded.updated_at
-        """,
-        (
-            language,
-            original_filename,
-            stored_path,
-            digest,
-            text,
-            json.dumps(analysis, ensure_ascii=False),
-            summary,
-            now_iso,
-            provider,
-            model,
-            now_iso,
-            now_iso,
-        ),
-    )
-    return f"Currículo {language.upper()} salvo e analisado.", True
+    extracted = ""
+    try:
+        extracted = extract_pdf_text(temp_path)
+        key = api_key or (get_ai_key(provider) if get_ai_key else "")
+        analysis = analyze_resume_text(extracted, language, provider=provider, model=model, api_key=key)
+        summary = str(analysis.get("summary") or "").strip()
+        os.replace(temp_path, stored_path)
+        message = (
+            f"Currículo {language.upper()}: PDF salvo e análise da IA concluída com sucesso "
+            f"({provider}/{model})."
+        )
+        _upsert_resume(
+            db,
+            language=language,
+            original_filename=original_filename,
+            stored_path=stored_path,
+            digest=digest,
+            extracted_text=extracted,
+            analysis_json=json.dumps(analysis, ensure_ascii=False),
+            analysis_summary=summary,
+            analyzed_at=now_iso,
+            provider=provider,
+            model=model,
+            analysis_status="ok",
+            analysis_error="",
+            analysis_message=message,
+            now_iso=now_iso,
+        )
+        return message, "success", True
+    except Exception as exc:
+        # Keep the uploaded file when possible so the user sees the failed attempt.
+        try:
+            os.replace(temp_path, stored_path)
+        except OSError:
+            if os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
+            stored_path = (existing["stored_path"] if existing else stored_path)
+        err = f"{exc.__class__.__name__}: {exc}"
+        message = f"Currículo {language.upper()}: falha na análise da IA. {err}"
+        prev_summary = (existing["analysis_summary"] if existing else "") or ""
+        prev_json = (existing["analysis_json"] if existing else "") or ""
+        prev_analyzed = existing["analyzed_at"] if existing else None
+        _upsert_resume(
+            db,
+            language=language,
+            original_filename=original_filename,
+            stored_path=stored_path if os.path.exists(stored_path) else (existing["stored_path"] if existing else ""),
+            digest=digest,
+            extracted_text=extracted or ((existing["extracted_text"] if existing else "") or ""),
+            analysis_json=prev_json,
+            analysis_summary=prev_summary,
+            analyzed_at=prev_analyzed,
+            provider=provider,
+            model=model,
+            analysis_status="error",
+            analysis_error=err,
+            analysis_message=message,
+            now_iso=now_iso,
+        )
+        return message, "error", False

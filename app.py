@@ -21,6 +21,7 @@ from zoneinfo import ZoneInfo
 from apply_channels import apply_via_browser, apply_via_email, record_blocked, send_smtp_email
 from form_rules import ensure_default_rules, list_rules, save_rules_from_form
 from resume_pipeline import AiUnavailableError, get_resume, resume_summaries, store_resume_upload
+from panel_log import attach_to_logger, clear_logs, ensure_log_table, list_logs, log_event
 
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -178,9 +179,25 @@ def initialize() -> None:
           analyzed_at TEXT,
           provider TEXT NOT NULL DEFAULT '',
           model TEXT NOT NULL DEFAULT '',
+          analysis_status TEXT NOT NULL DEFAULT 'none',
+          analysis_error TEXT NOT NULL DEFAULT '',
+          analysis_message TEXT NOT NULL DEFAULT '',
           created_at TEXT NOT NULL,
           updated_at TEXT NOT NULL
         )""")
+        resume_cols = {row["name"] for row in db.execute("PRAGMA table_info(resumes)")}
+        if "analysis_status" not in resume_cols:
+            db.execute("ALTER TABLE resumes ADD COLUMN analysis_status TEXT NOT NULL DEFAULT 'none'")
+        if "analysis_error" not in resume_cols:
+            db.execute("ALTER TABLE resumes ADD COLUMN analysis_error TEXT NOT NULL DEFAULT ''")
+        if "analysis_message" not in resume_cols:
+            db.execute("ALTER TABLE resumes ADD COLUMN analysis_message TEXT NOT NULL DEFAULT ''")
+        # Backfill: resumes with summary count as successful analysis.
+        db.execute(
+            """UPDATE resumes SET analysis_status='ok',
+                   analysis_message=COALESCE(NULLIF(analysis_message,''), 'Análise concluída com sucesso.')
+               WHERE IFNULL(analysis_summary,'') != '' AND analysis_status IN ('none', '')"""
+        )
         db.execute("""CREATE TABLE IF NOT EXISTS form_field_rules (
           id INTEGER PRIMARY KEY,
           key TEXT NOT NULL,
@@ -220,6 +237,7 @@ def initialize() -> None:
         ensure_default_rules(db)
         for key, value in DEFAULT_SETTINGS.items():
             db.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (key, value))
+        ensure_log_table(db)
 
 
 def settings() -> dict[str, str]:
@@ -469,15 +487,19 @@ def process_auto_job(job_id: int) -> str:
     if not job_row:
         return "vaga removida"
     job = dict(job_row)
+    title = job.get("title", "")
+    log_event("info", "auto-apply", f"Triagem da vaga #{job_id}: {title}")
     try:
         decision = ai_assess_job(job, cfg)
     except AiUnavailableError as exc:
         with connect() as db:
             db.execute("UPDATE jobs SET status='blocked', notes=? WHERE id=?", (f"IA indisponível na triagem: {exc}", job_id))
+        log_event("error", "auto-apply", f"Vaga #{job_id}: IA indisponível — {exc}")
         return f"vaga {job_id}: IA indisponível — pulada"
     except ValueError as exc:
         with connect() as db:
             db.execute("UPDATE jobs SET status='blocked', notes=? WHERE id=?", (str(exc), job_id))
+        log_event("warning", "auto-apply", f"Vaga #{job_id}: {exc}")
         return f"vaga {job_id}: {exc}"
 
     minimum = max(0, min(100, int(cfg.get("minimum_match_score", "80") or 80)))
@@ -489,9 +511,15 @@ def process_auto_job(job_id: int) -> str:
                VALUES(?,?,?,?,?,?,?,?,?)""",
             (job_id, now_iso(), decision["match_score"], int(qualifies), int(decision["letter_required"]), decision["reason"], resume_language, "", ""),
         )
+    log_event(
+        "info",
+        "auto-apply",
+        f"Vaga #{job_id}: score {decision['match_score']}/100, should_apply={decision['should_apply']}, CV={resume_language}. {decision['reason']}",
+    )
     if not qualifies:
         with connect() as db:
             db.execute("UPDATE jobs SET status='ignored', notes=? WHERE id=?", (f"IA: score {decision['match_score']}/100. {decision['reason']}", job_id))
+        log_event("info", "auto-apply", f"Vaga #{job_id} ignorada (score abaixo do mínimo ou should_apply=false).")
         return f"IA descartou vaga {job_id} ({decision['match_score']}/100)"
 
     with connect() as db:
@@ -553,12 +581,14 @@ def process_auto_job(job_id: int) -> str:
                 "UPDATE ai_decisions SET apply_channel=?, apply_result=? WHERE id=(SELECT MAX(id) FROM ai_decisions WHERE job_id=?)",
                 (channel, detail[:500], job_id),
             )
+            log_event("warning", "auto-apply", f"Vaga #{job_id} bloqueada via {channel}: {detail}")
             return f"vaga {job_id}: bloqueada — {detail}"
         db.execute("UPDATE jobs SET status='applied', applied_at=?, notes=? WHERE id=?", (now_iso(), detail[:900], job_id))
         db.execute(
             "UPDATE ai_decisions SET apply_channel=?, apply_result=? WHERE id=(SELECT MAX(id) FROM ai_decisions WHERE job_id=?)",
             (channel, detail[:500], job_id),
         )
+    log_event("success", "auto-apply", f"Vaga #{job_id} aplicada via {channel}: {detail}")
     return f"vaga {job_id}: aplicada via {channel} — {detail}"
 
 
@@ -793,6 +823,7 @@ class Collector:
             self.message = "Iniciando busca…"
             self.thread = threading.Thread(target=self._loop, daemon=True, name="job-collector")
             self.thread.start()
+            log_event("success", "collector", "Bot de coleta iniciado.")
             return True
 
     def _set_progress(self, message: str, found: int | None = None) -> None:
@@ -807,6 +838,7 @@ class Collector:
             if self.state == "running":
                 self.state = "stopping"
                 self.message = "Parando após a busca atual…"
+                log_event("info", "collector", "Parada solicitada; aguardando fim da busca atual.")
 
     def _loop(self) -> None:
         while not self.stop_event.is_set():
@@ -821,9 +853,11 @@ class Collector:
         with self.lock:
             self.state = "stopped"
             self.message = "Coleta parada"
+        log_event("info", "collector", "Coleta parada.")
 
     def _run_once(self) -> None:
-        started =  now_iso()
+        started = now_iso()
+        log_event("info", "collector", "Início do ciclo de busca.")
         with connect() as db:
             cursor = db.execute("INSERT INTO runs(started_at,state) VALUES(?, 'running')", (started,))
             run_id = cursor.lastrowid
@@ -842,8 +876,10 @@ class Collector:
                 errors.append(f"Fonte desconhecida: {source}")
                 continue
             self._set_progress(f"Consultando {source}… {found} vaga(s) nova(s) nesta execução.", found)
+            log_event("info", "collector", f"Consultando fonte {source}…")
             try:
                 jobs = provider()
+                log_event("info", "collector", f"{source}: {len(jobs)} anúncio(s) recebidos antes dos filtros.")
                 for job in jobs:
                     if self.stop_event.is_set():
                         break
@@ -865,14 +901,20 @@ class Collector:
             except Exception as exc:  # keep other sources running if one is unavailable
                 LOG.exception("Falha ao consultar %s", source)
                 errors.append(f"{source}: {exc.__class__.__name__}")
+                log_event("error", "collector", f"Falha ao consultar {source}: {exc}")
         apply_note = ""
         if not self.stop_event.is_set() and settings().get("auto_apply") == "1":
             self._set_progress(f"Triagem/candidatura automática… {found} vaga(s) nova(s).", found)
+            log_event("info", "auto-apply", "Iniciando triagem/candidatura automática do ciclo.")
             apply_note = process_auto_apply_batch()
+            log_event("info", "auto-apply", apply_note or "Batch concluído sem mensagens.")
+        elif not self.stop_event.is_set():
+            log_event("info", "auto-apply", "auto_apply desligado; triagem automática ignorada neste ciclo.")
         finished = now_iso()
         message = f"Busca concluída: {found} vaga(s) nova(s)." + (" Avisos: " + "; ".join(errors) if errors else "")
         if apply_note:
             message += f" Auto-apply: {apply_note}"
+        log_event("success" if not errors else "warning", "collector", message)
         with connect() as db:
             db.execute("UPDATE runs SET finished_at=?,state=?,found_count=?,message=? WHERE id=?", (finished, "completed" if not self.stop_event.is_set() else "stopped", found, message, run_id))
         with self.lock:
@@ -880,6 +922,15 @@ class Collector:
 
 
 collector = Collector()
+
+
+def _boot_logging() -> None:
+    ensure_log_table()
+    attach_to_logger()
+    log_event("info", "app", "Painel de logs ativo.")
+
+
+_boot_logging()
 
 
 def esc(value: object) -> str:
@@ -918,6 +969,26 @@ def history_html(runs) -> str:
     return "".join(f'<li><span>{esc(run["started_at"][:16].replace("T", " "))}</span> {esc(run["message"] or run["state"])}</li>' for run in runs) or "<li>Nenhuma execução ainda.</li>"
 
 
+def logs_html(limit: int = 200) -> str:
+    rows = list_logs(limit)
+    if not rows:
+        return '<div class="log-empty">Nenhum evento ainda. Inicie o bot, envie um currículo ou rode um teste SMTP para ver o fluxo aqui.</div>'
+    parts = []
+    for row in rows:
+        level = esc(row["level"])
+        when = esc(format_brasilia(row["created_at"]))
+        source = esc(row["source"])
+        message = esc(row["message"])
+        parts.append(
+            f'<div class="log-line log-{level}">'
+            f'<span class="log-time">{when}</span>'
+            f'<span class="log-level">{level}</span>'
+            f'<span class="log-source">{source}</span>'
+            f'<span class="log-msg">{message}</span></div>'
+        )
+    return "".join(parts)
+
+
 def state_label_for(state: str) -> str:
     return {"running": "Em execução", "stopping": "Parando", "stopped": "Parada"}.get(state, state)
 
@@ -933,6 +1004,7 @@ def live_payload() -> dict:
         "stats_html": stats_html(counts),
         "jobs_html": job_rows_html(jobs, collecting),
         "history_html": history_html(runs),
+        "logs_html": logs_html(),
     }
 
 
@@ -943,14 +1015,52 @@ def resume_panels_html() -> str:
     blocks = []
     for lang, label in (("pt", "Português"), ("en", "English")):
         row = resumes.get(lang)
-        if row:
-            meta = f"{esc(row['original_filename'])} · analisado em {esc(format_brasilia(row['analyzed_at']))}"
-            summary = esc((row["analysis_summary"] or "")[:700])
-            status = f'<p class="hint">{meta}</p><details><summary>Resumo da análise</summary><div class="description">{summary}</div></details>'
+        if not row:
+            status = (
+                '<div class="analysis-badge analysis-none">Sem PDF</div>'
+                '<p class="hint">Nenhum currículo enviado. Escolha um PDF e clique em enviar para a IA analisar.</p>'
+            )
         else:
-            status = '<p class="hint">Nenhum PDF analisado ainda.</p>'
+            raw_status = (row["analysis_status"] if "analysis_status" in row.keys() else "") or (
+                "ok" if (row["analysis_summary"] or "").strip() else "none"
+            )
+            badge_map = {
+                "ok": ("analysis-ok", "Análise OK"),
+                "reused": ("analysis-info", "Análise reutilizada"),
+                "error": ("analysis-error", "Erro na análise"),
+                "none": ("analysis-none", "Aguardando análise"),
+            }
+            badge_class, badge_label = badge_map.get(raw_status, ("analysis-none", raw_status or "Desconhecido"))
+            filename = esc(row["original_filename"] or "currículo.pdf")
+            when = esc(format_brasilia(row["analyzed_at"])) if row["analyzed_at"] else "—"
+            provider = esc(row["provider"] or "—")
+            model = esc(row["model"] or "—")
+            message = esc(
+                (row["analysis_message"] if "analysis_message" in row.keys() else "")
+                or ("Análise concluída." if raw_status in {"ok", "reused"} else "Sem mensagem.")
+            )
+            error = esc((row["analysis_error"] if "analysis_error" in row.keys() else "") or "")
+            summary = esc((row["analysis_summary"] or "")[:900])
+            error_block = (
+                f'<p class="analysis-error-text"><strong>Detalhe do erro:</strong> {error}</p>'
+                if error and raw_status == "error"
+                else ""
+            )
+            summary_block = (
+                f'<details open><summary>Resumo da análise da IA</summary><div class="description">{summary}</div></details>'
+                if summary
+                else '<p class="hint">Ainda não há resumo salvo (análise incompleta ou falhou).</p>'
+            )
+            status = (
+                f'<div class="analysis-badge {badge_class}">{badge_label}</div>'
+                f'<p class="hint"><strong>Arquivo:</strong> {filename}<br>'
+                f'<strong>Última análise:</strong> {when}<br>'
+                f'<strong>Modelo:</strong> {provider} / {model}</p>'
+                f'<p class="hint">{message}</p>'
+                f"{error_block}{summary_block}"
+            )
         blocks.append(
-            f'<div><h3 style="margin:0 0 8px;font-size:15px">Currículo {label}</h3>'
+            f'<div class="resume-card"><h3 style="margin:0 0 8px;font-size:15px">Currículo {label}</h3>'
             f'<form method="post" action="/upload-resume" enctype="multipart/form-data">'
             f'<input type="hidden" name="language" value="{lang}">'
             f'<label>Selecionar PDF<input type="file" name="file" accept="application/pdf" required></label>'
@@ -991,7 +1101,7 @@ def form_rules_html() -> str:
     )
 
 
-def render_page(notice: str = "") -> str:
+def render_page(notice: str = "", notice_kind: str = "success") -> str:
     """Monta o painel local: preferências, controles, histórico e vagas capturadas."""
     cfg = settings()
     status = collector.snapshot()
@@ -1003,15 +1113,41 @@ def render_page(notice: str = "") -> str:
     state_label = state_label_for(status["state"])
     resume_panel = resume_panels_html()
     rules_panel = form_rules_html()
+    logs_view = logs_html()
+    notice_class = {
+        "success": "notice notice-ok",
+        "info": "notice notice-info",
+        "error": "notice notice-error",
+        "warning": "notice notice-warn",
+    }.get(notice_kind, "notice")
+    notice_html = f'<div class="{notice_class}">{esc(notice)}</div>' if notice else ""
     return f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Radar de Vagas</title><style>
-      :root{{--ink:#172b36;--muted:#62747d;--line:#dce5e8;--paper:#f4f7f7;--teal:#0b786d;--mint:#d8f0e9;--white:#fff}}*{{box-sizing:border-box}}body{{margin:0;background:var(--paper);color:var(--ink);font:15px/1.5 Inter,Segoe UI,Arial,sans-serif}}header{{background:#102d35;color:white;padding:28px max(24px,calc((100vw - 1280px)/2));display:flex;justify-content:space-between;align-items:center}}h1{{font-size:25px;margin:0}}header p{{margin:5px 0 0;color:#c1d4d6}}main{{max-width:1280px;margin:26px auto;padding:0 24px}}.top{{display:grid;grid-template-columns:1.3fr .7fr;gap:18px}}.panel,.stat,.table-wrap{{background:white;border:1px solid var(--line);border-radius:13px}}.panel{{padding:20px}}h2{{font-size:18px;margin:0 0 14px}}.form-grid{{display:grid;grid-template-columns:1fr 1fr;gap:12px}}label{{display:block;color:var(--muted);font-size:13px;font-weight:600}}input,textarea,select{{font:inherit;color:var(--ink);width:100%;margin-top:5px;padding:9px 10px;border:1px solid #cdd9dc;border-radius:8px;background:white}}.hint{{color:var(--muted);font-size:12px;margin:10px 0}}button{{border:0;border-radius:8px;padding:10px 15px;background:var(--teal);color:white;font-weight:650;cursor:pointer}}button.stop{{background:#a74639}}button.subtle{{padding:7px 10px;background:#eaf2f1;color:var(--ink);margin-top:6px}}.actions{{display:flex;gap:9px;margin-top:12px;align-items:center}}.runtime{{color:var(--muted);font-size:13px}}.stats{{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin:18px 0}}.stat{{padding:13px 15px}}.stat span{{display:block;font-size:12px;color:var(--muted)}}.stat strong{{font-size:23px}}.table-wrap{{overflow:auto}}table{{border-collapse:collapse;width:100%;min-width:950px}}th,td{{padding:13px 12px;text-align:left;border-bottom:1px solid var(--line);vertical-align:top}}th{{font-size:12px;color:var(--muted);background:#f8fafa}}td small{{display:block;color:var(--muted);margin-top:3px}}.job-title{{font-weight:700;color:#145d59;text-decoration:none}}.job-title:hover{{text-decoration:underline}}.source{{background:var(--mint);padding:3px 7px;border-radius:99px;font-size:12px}}select{{min-width:150px;margin:0;padding:7px}}summary{{cursor:pointer;color:var(--teal);font-size:13px}}.description{{max-width:350px;max-height:220px;overflow:auto;padding:8px 0;font-size:13px}}details textarea{{min-width:230px}}.history{{color:var(--muted);font-size:13px;padding-left:20px}}.notice{{padding:10px 13px;background:#e7f4ed;border-radius:8px;margin-bottom:15px}}@media(max-width:800px){{.top{{grid-template-columns:1fr}}.stats{{grid-template-columns:repeat(2,1fr)}}header{{padding:20px 24px}}.form-grid{{grid-template-columns:1fr}}}}
-      </style></head><body><header><div><h1>Radar de Vagas</h1><p>Busca, seleção e candidaturas automáticas</p></div><span id="collector-state">{esc(state_label)}</span></header><main>{f'<div class="notice">{esc(notice)}</div>' if notice else ''}<div class="top"><section class="panel"><h2>Preferências de busca</h2><form method="post" action="/settings"><div class="form-grid"><label>Cargos e termos, separados por vírgula<textarea name="keywords" rows="3">{esc(cfg.get('keywords',''))}</textarea></label><label>Países/regiões aceitos<textarea name="locations" rows="3">{esc(cfg.get('locations',''))}</textarea></label><label>Fontes: remotive, remoteok, adzuna, apify<input name="sources" value="{esc(cfg.get('sources',''))}"></label><label>Intervalo de busca (minutos)<input name="interval_minutes" type="number" min="5" value="{esc(cfg.get('interval_minutes','15'))}"></label><label>Países Adzuna (ex.: br,us,gb,ca)<input name="adzuna_countries" value="{esc(cfg.get('adzuna_countries','br,us,gb,ca'))}"></label><label>Limite mensal Apify (USD)<input name="apify_monthly_credit_limit_usd" type="number" min="0" step="0.01" value="{esc(cfg.get('apify_monthly_credit_limit_usd','5'))}"></label><label>Máximo de vagas por ciclo Apify<input name="apify_job_count" type="number" min="1" max="100" value="{esc(cfg.get('apify_job_count','25'))}"></label></div><button>Salvar preferências</button></form><div class="actions"><form method="post" action="/start"><button>Iniciar bot</button></form><form method="post" action="/stop"><button class="stop">Parar bot</button></form><span class="runtime" id="runtime-message">{esc(status['message'])}</span></div></section><section class="panel"><h2>Execuções recentes</h2><ul class="history" id="run-history">{history}</ul></section></div><section class="panel" style="margin-top:18px"><h2>Currículos (PDF)</h2>{resume_panel}<p class="hint">O seletor de arquivos do sistema abre ao escolher o PDF. A IA analisa só quando o arquivo muda (hash). O PDF não é reenviado a cada vaga.</p></section>
+      :root{{--ink:#172b36;--muted:#62747d;--line:#dce5e8;--paper:#f4f7f7;--teal:#0b786d;--mint:#d8f0e9;--white:#fff}}*{{box-sizing:border-box}}body{{margin:0;background:var(--paper);color:var(--ink);font:15px/1.5 Inter,Segoe UI,Arial,sans-serif}}header{{background:#102d35;color:white;padding:28px max(24px,calc((100vw - 1280px)/2));display:flex;justify-content:space-between;align-items:center}}h1{{font-size:25px;margin:0}}header p{{margin:5px 0 0;color:#c1d4d6}}main{{max-width:1280px;margin:26px auto;padding:0 24px}}.top{{display:grid;grid-template-columns:1.3fr .7fr;gap:18px}}.panel,.stat,.table-wrap{{background:white;border:1px solid var(--line);border-radius:13px}}.panel{{padding:20px}}h2{{font-size:18px;margin:0 0 14px}}.form-grid{{display:grid;grid-template-columns:1fr 1fr;gap:12px}}label{{display:block;color:var(--muted);font-size:13px;font-weight:600}}input,textarea,select{{font:inherit;color:var(--ink);width:100%;margin-top:5px;padding:9px 10px;border:1px solid #cdd9dc;border-radius:8px;background:white}}.hint{{color:var(--muted);font-size:12px;margin:10px 0}}button{{border:0;border-radius:8px;padding:10px 15px;background:var(--teal);color:white;font-weight:650;cursor:pointer}}button.stop{{background:#a74639}}button.subtle{{padding:7px 10px;background:#eaf2f1;color:var(--ink);margin-top:6px}}.actions{{display:flex;gap:9px;margin-top:12px;align-items:center}}.runtime{{color:var(--muted);font-size:13px}}.stats{{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin:18px 0}}.stat{{padding:13px 15px}}.stat span{{display:block;font-size:12px;color:var(--muted)}}.stat strong{{font-size:23px}}.table-wrap{{overflow:auto}}table{{border-collapse:collapse;width:100%;min-width:950px}}th,td{{padding:13px 12px;text-align:left;border-bottom:1px solid var(--line);vertical-align:top}}th{{font-size:12px;color:var(--muted);background:#f8fafa}}td small{{display:block;color:var(--muted);margin-top:3px}}.job-title{{font-weight:700;color:#145d59;text-decoration:none}}.job-title:hover{{text-decoration:underline}}.source{{background:var(--mint);padding:3px 7px;border-radius:99px;font-size:12px}}select{{min-width:150px;margin:0;padding:7px}}summary{{cursor:pointer;color:var(--teal);font-size:13px}}.description{{max-width:350px;max-height:220px;overflow:auto;padding:8px 0;font-size:13px}}details textarea{{min-width:230px}}.history{{color:var(--muted);font-size:13px;padding-left:20px}}.notice{{padding:10px 13px;border-radius:8px;margin-bottom:15px}}.notice-ok{{background:#e7f4ed;border:1px solid #b7dfc8}}.notice-info{{background:#e8f1f8;border:1px solid #b7d0e6}}.notice-error{{background:#fceaea;border:1px solid #e3b0b0;color:#6b2a2a}}.notice-warn{{background:#fff6e5;border:1px solid #e6d0a0}}.analysis-badge{{display:inline-block;padding:4px 10px;border-radius:999px;font-size:12px;font-weight:700;margin:10px 0 6px}}.analysis-ok{{background:#d8f0e9;color:#0b5c52}}.analysis-info{{background:#dceaf6;color:#1d4f74}}.analysis-error{{background:#f6d6d6;color:#7a2424}}.analysis-none{{background:#eceff1;color:#526066}}.analysis-error-text{{color:#7a2424;font-size:13px;margin:8px 0}}.resume-card{{border:1px solid var(--line);border-radius:10px;padding:14px;background:#fbfcfc}}.tabs{{display:flex;gap:8px;margin:0 0 16px}}.tab{{background:#e7eeef;color:var(--ink);padding:9px 16px;border-radius:999px;font-weight:650;cursor:pointer}}.tab.active{{background:var(--teal);color:white}}.tab-panel{{display:none}}.tab-panel.active{{display:block}}.log-console{{font:12.5px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:#0f1c22;color:#d7e6ea;border-radius:10px;padding:12px;max-height:620px;overflow:auto}}.log-line{{display:grid;grid-template-columns:132px 72px 110px 1fr;gap:10px;padding:5px 0;border-bottom:1px solid #1e323b}}.log-time{{color:#8eacb6}}.log-level{{font-weight:700;text-transform:uppercase}}.log-source{{color:#7ec8c0}}.log-msg{{color:#e8f3f5;white-space:pre-wrap;word-break:break-word}}.log-info .log-level{{color:#9ec9ff}}.log-success .log-level{{color:#7ddea8}}.log-warning .log-level{{color:#f0c674}}.log-error .log-level{{color:#f0a0a0}}.log-debug .log-level{{color:#9aa7ad}}.log-empty{{color:#9bb0b8;padding:18px 8px}}@media(max-width:900px){{.log-line{{grid-template-columns:1fr;gap:2px}}}}@media(max-width:800px){{.top{{grid-template-columns:1fr}}.stats{{grid-template-columns:repeat(2,1fr)}}header{{padding:20px 24px}}.form-grid{{grid-template-columns:1fr}}}}
+      </style></head><body><header><div><h1>Radar de Vagas</h1><p>Busca, seleção e candidaturas automáticas</p></div><span id="collector-state">{esc(state_label)}</span></header><main>{notice_html}<nav class="tabs" aria-label="Seções do painel"><button type="button" class="tab active" data-tab="painel">Painel</button><button type="button" class="tab" data-tab="logs">Logs</button></nav><div id="tab-painel" class="tab-panel active"><div class="top"><section class="panel"><h2>Preferências de busca</h2><form method="post" action="/settings"><div class="form-grid"><label>Cargos e termos, separados por vírgula<textarea name="keywords" rows="3">{esc(cfg.get('keywords',''))}</textarea></label><label>Países/regiões aceitos<textarea name="locations" rows="3">{esc(cfg.get('locations',''))}</textarea></label><label>Fontes: remotive, remoteok, adzuna, apify<input name="sources" value="{esc(cfg.get('sources',''))}"></label><label>Intervalo de busca (minutos)<input name="interval_minutes" type="number" min="5" value="{esc(cfg.get('interval_minutes','15'))}"></label><label>Países Adzuna (ex.: br,us,gb,ca)<input name="adzuna_countries" value="{esc(cfg.get('adzuna_countries','br,us,gb,ca'))}"></label><label>Limite mensal Apify (USD)<input name="apify_monthly_credit_limit_usd" type="number" min="0" step="0.01" value="{esc(cfg.get('apify_monthly_credit_limit_usd','5'))}"></label><label>Máximo de vagas por ciclo Apify<input name="apify_job_count" type="number" min="1" max="100" value="{esc(cfg.get('apify_job_count','25'))}"></label></div><button>Salvar preferências</button></form><div class="actions"><form method="post" action="/start"><button>Iniciar bot</button></form><form method="post" action="/stop"><button class="stop">Parar bot</button></form><span class="runtime" id="runtime-message">{esc(status['message'])}</span></div></section><section class="panel"><h2>Execuções recentes</h2><ul class="history" id="run-history">{history}</ul></section></div><section class="panel" style="margin-top:18px"><h2>Currículos (PDF)</h2>{resume_panel}<p class="hint">O seletor de arquivos do sistema abre ao escolher o PDF. A IA analisa só quando o arquivo muda (hash). O status abaixo mostra se a análise ocorreu, foi reutilizada ou falhou.</p></section>
 <section class="panel" style="margin-top:18px"><h2>Perfil, SMTP e automação</h2><form method="post" action="/ai-settings"><div class="form-grid"><label>Provedor de IA<select name="ai_provider"><option value="gemini" {'selected' if cfg.get('ai_provider') == 'gemini' else ''}>Gemini</option><option value="openai" {'selected' if cfg.get('ai_provider') == 'openai' else ''}>OpenAI</option></select></label><label>Modelo<input name="ai_model" value="{esc(cfg.get('ai_model','gemini-2.5-flash'))}"></label><label>Seu nome<input name="candidate_name" value="{esc(cfg.get('candidate_name',''))}"></label><label>E-mail<input name="candidate_email" value="{esc(cfg.get('candidate_email',''))}"></label><label>Telefone<input name="candidate_phone" value="{esc(cfg.get('candidate_phone',''))}"></label><label>LinkedIn<input name="candidate_linkedin" value="{esc(cfg.get('candidate_linkedin',''))}"></label><label>Cidade<input name="candidate_city" value="{esc(cfg.get('candidate_city',''))}"></label><label>Chave de IA (vazio mantém a salva)<input type="password" name="api_key" autocomplete="new-password"></label><label>Fatos profissionais em português<textarea name="candidate_facts_pt" rows="3">{esc(cfg.get('candidate_facts_pt',''))}</textarea></label><label>Professional facts in English<textarea name="candidate_facts_en" rows="3">{esc(cfg.get('candidate_facts_en',''))}</textarea></label><label>Score mínimo (%)<input name="minimum_match_score" type="number" min="0" max="100" value="{esc(cfg.get('minimum_match_score','80'))}"></label><label>Máximo de candidaturas por ciclo<input name="maximum_applications_per_run" type="number" min="1" max="50" value="{esc(cfg.get('maximum_applications_per_run','5'))}"></label><label>Adzuna App ID<input name="adzuna_app_id" value=""></label><label>Adzuna API key<input type="password" name="adzuna_app_key" value=""></label><label>Token Apify<input type="password" name="apify_token" value="" autocomplete="new-password"></label></div><label style="margin:12px 0"><input type="checkbox" name="auto_apply" value="1" {'checked' if cfg.get('auto_apply') == '1' else ''} style="width:auto"> Ativar triagem e candidatura automáticas (e-mail SMTP, depois formulário público)</label><p class="hint">Chaves ficam no cofre do sistema. Match usa a análise salva do currículo. Sem e-mail/formulário ou com pergunta aberta sem tokens de IA, a vaga é marcada como bloqueada/pulada.</p><button>Salvar perfil e IA</button></form></section>
 <section class="panel" style="margin-top:18px"><h2>SMTP</h2><form method="post" action="/smtp-settings"><div class="form-grid"><label>Host<input name="smtp_host" value="{esc(cfg.get('smtp_host',''))}"></label><label>Porta<input name="smtp_port" type="number" value="{esc(cfg.get('smtp_port','587'))}"></label><label>Usuário<input name="smtp_user" value="{esc(cfg.get('smtp_user',''))}"></label><label>Remetente (From)<input name="smtp_from" value="{esc(cfg.get('smtp_from',''))}"></label><label>Senha (vazio mantém)<input type="password" name="smtp_password" autocomplete="new-password"></label><label>TLS<select name="smtp_use_tls"><option value="1" {'selected' if cfg.get('smtp_use_tls','1')=='1' else ''}>Sim (STARTTLS)</option><option value="0" {'selected' if cfg.get('smtp_use_tls')=='0' else ''}>Não</option></select></label></div><div class="actions"><button>Salvar SMTP</button></div></form><form method="post" action="/smtp-test" style="margin-top:8px"><button class="subtle" type="submit">Enviar e-mail de teste</button></form></section>
-<section class="panel" style="margin-top:18px"><h2>Regras de formulário (Playwright)</h2><form method="post" action="/profile-settings">{rules_panel}<p class="hint">Para selects (ex.: salário), coloque em "Valor fixo" o texto da opção preferida. Perguntas abertas sem regra usam a IA; se não houver tokens, a vaga é pulada.</p><button>Salvar regras</button></form></section><div class="stats" id="job-stats">{cards}</div><section class="table-wrap"><table><thead><tr><th>Vaga</th><th>Localidade</th><th>Fonte</th><th>Idioma</th><th>Etapa</th><th>Carta e descrição</th><th>Data</th></tr></thead><tbody id="jobs-body">{rows}</tbody></table></section></main>
+<section class="panel" style="margin-top:18px"><h2>Regras de formulário (Playwright)</h2><form method="post" action="/profile-settings">{rules_panel}<p class="hint">Para selects (ex.: salário), coloque em "Valor fixo" o texto da opção preferida. Perguntas abertas sem regra usam a IA; se não houver tokens, a vaga é pulada.</p><button>Salvar regras</button></form></section><div class="stats" id="job-stats">{cards}</div><section class="table-wrap"><table><thead><tr><th>Vaga</th><th>Localidade</th><th>Fonte</th><th>Idioma</th><th>Etapa</th><th>Carta e descrição</th><th>Data</th></tr></thead><tbody id="jobs-body">{rows}</tbody></table></section></div>
+<div id="tab-logs" class="tab-panel"><section class="panel"><div class="actions" style="justify-content:space-between;margin-top:0"><h2 style="margin:0">Logs do processo</h2><form method="post" action="/clear-logs"><button class="subtle" type="submit">Limpar logs</button></form></div><p class="hint">Atualiza automaticamente. Mostra coleta, análise de currículo, triagem da IA, SMTP e Playwright.</p><div id="logs-body" class="log-console">{logs_view}</div></section></div></main>
 <script>
 (function () {{
   var inFlight = false;
+  document.querySelectorAll(".tab").forEach(function (btn) {{
+    btn.addEventListener("click", function () {{
+      var name = btn.getAttribute("data-tab");
+      document.querySelectorAll(".tab").forEach(function (el) {{ el.classList.toggle("active", el === btn); }});
+      document.querySelectorAll(".tab-panel").forEach(function (panel) {{
+        panel.classList.toggle("active", panel.id === "tab-" + name);
+      }});
+      try {{ localStorage.setItem("radar-tab", name); }} catch (e) {{}}
+    }});
+  }});
+  try {{
+    var saved = localStorage.getItem("radar-tab");
+    if (saved) {{
+      var target = document.querySelector('.tab[data-tab="' + saved + '"]');
+      if (target) target.click();
+    }}
+  }} catch (e) {{}}
   function refresh() {{
     if (inFlight || document.hidden) return;
     inFlight = true;
@@ -1023,11 +1159,17 @@ def render_page(notice: str = "") -> str:
         var statsEl = document.getElementById("job-stats");
         var jobsEl = document.getElementById("jobs-body");
         var historyEl = document.getElementById("run-history");
+        var logsEl = document.getElementById("logs-body");
         if (stateEl && stateEl.textContent !== data.state_label) stateEl.textContent = data.state_label;
         if (messageEl && messageEl.textContent !== data.message) messageEl.textContent = data.message;
         if (statsEl && statsEl.innerHTML !== data.stats_html) statsEl.innerHTML = data.stats_html;
         if (jobsEl && jobsEl.innerHTML !== data.jobs_html) jobsEl.innerHTML = data.jobs_html;
         if (historyEl && historyEl.innerHTML !== data.history_html) historyEl.innerHTML = data.history_html;
+        if (logsEl && data.logs_html && logsEl.innerHTML !== data.logs_html) {{
+          var stickBottom = logsEl.scrollTop + logsEl.clientHeight >= logsEl.scrollHeight - 40;
+          logsEl.innerHTML = data.logs_html;
+          if (stickBottom) logsEl.scrollTop = 0;
+        }}
       }})
       .catch(function () {{}})
       .then(function () {{ inFlight = false; }});
@@ -1107,8 +1249,8 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def redirect(self, notice: str = "") -> None:
-        body = render_page(notice)
+    def redirect(self, notice: str = "", notice_kind: str = "success") -> None:
+        body = render_page(notice, notice_kind=notice_kind)
         self.send_page(body)
 
     def do_GET(self) -> None:
@@ -1131,7 +1273,7 @@ class Handler(BaseHTTPRequestHandler):
                 provider = cfg.get("ai_provider", "gemini").casefold()
                 model = cfg.get("ai_model", "gemini-2.5-flash").strip()
                 with connect() as db:
-                    message, _reanalyzed = store_resume_upload(
+                    message, kind, _reanalyzed = store_resume_upload(
                         db,
                         language=language,
                         original_filename=filename,
@@ -1143,14 +1285,17 @@ class Handler(BaseHTTPRequestHandler):
                         api_key=get_ai_key(provider),
                         get_ai_key=get_ai_key,
                     )
-                self.redirect(message)
+                log_event(kind if kind != "info" else "info", "resume", message)
+                self.redirect(message, notice_kind=kind)
             except Exception as exc:
-                self.redirect(f"Falha no upload: {exc}")
+                log_event("error", "resume", f"Falha no upload: {exc}")
+                self.redirect(f"Falha no upload do currículo: {exc}", notice_kind="error")
             return
 
         form = parse_form(self)
         if path == "/settings":
             save_settings(form)
+            log_event("info", "settings", "Preferências de busca salvas.")
             self.redirect("Filtros salvos.")
         elif path == "/ai-settings":
             if "auto_apply" not in form:
@@ -1164,8 +1309,10 @@ class Handler(BaseHTTPRequestHandler):
                 secret_set("adzuna_app_key", form.get("adzuna_app_key", ""))
                 secret_set("apify_token", form.get("apify_token", ""))
             except RuntimeError as exc:
-                self.redirect(str(exc))
+                log_event("error", "settings", str(exc))
+                self.redirect(str(exc), notice_kind="error")
                 return
+            log_event("info", "settings", f"Perfil/IA salvos (auto_apply={form.get('auto_apply')}).")
             self.redirect("Perfil e integrações salvos.")
         elif path == "/smtp-settings":
             save_settings({k: form.get(k, "") for k in ("smtp_host", "smtp_port", "smtp_user", "smtp_from", "smtp_use_tls")})
@@ -1173,14 +1320,15 @@ class Handler(BaseHTTPRequestHandler):
                 if form.get("smtp_password", "").strip():
                     secret_set("smtp_password", form["smtp_password"])
             except RuntimeError as exc:
-                self.redirect(str(exc))
+                self.redirect(str(exc), notice_kind="error")
                 return
+            log_event("info", "smtp", "Configuração SMTP salva.")
             self.redirect("SMTP salvo.")
         elif path == "/smtp-test":
             cfg = settings()
             to_addr = (cfg.get("candidate_email") or cfg.get("smtp_from") or "").strip()
             if not to_addr:
-                self.redirect("Configure candidate_email ou smtp_from para testar.")
+                self.redirect("Configure candidate_email ou smtp_from para testar.", notice_kind="warning")
                 return
             try:
                 send_smtp_email(
@@ -1191,13 +1339,20 @@ class Handler(BaseHTTPRequestHandler):
                     body="Este é um e-mail de teste do Radar de Vagas.",
                     attachment_path=None,
                 )
+                log_event("success", "smtp", f"E-mail de teste enviado para {to_addr}.")
                 self.redirect(f"E-mail de teste enviado para {to_addr}.")
             except Exception as exc:
-                self.redirect(f"Falha no teste SMTP: {exc}")
+                log_event("error", "smtp", f"Falha no teste SMTP: {exc}")
+                self.redirect(f"Falha no teste SMTP: {exc}", notice_kind="error")
+        elif path == "/clear-logs":
+            n = clear_logs()
+            log_event("info", "logs", f"Histórico limpo ({n} entradas removidas).")
+            self.redirect("Logs limpos.", notice_kind="info")
         elif path == "/profile-settings":
             save_settings(form)
             with connect() as db:
                 save_rules_from_form(db, form)
+            log_event("info", "forms", "Regras de formulário salvas.")
             self.redirect("Regras de formulário salvas.")
         elif path == "/start":
             started = collector.start()
