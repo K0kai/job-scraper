@@ -289,7 +289,9 @@ def apply_via_browser(
         return False, detail
 
     with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(headless=True)
+        from browser_engine import chrome_launch_args
+
+        browser = playwright.chromium.launch(headless=True, args=chrome_launch_args())
         page = browser.new_page()
         try:
             page.goto(job["url"], wait_until="domcontentloaded", timeout=45000)

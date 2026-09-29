@@ -793,15 +793,15 @@ def apply_via_linkedin(
     context = None
     try:
         with sync_playwright() as playwright:
-            launch_kwargs: dict = {
-                "user_data_dir": profile,
-                "headless": False,
-                "slow_mo": random.randint(40, 90),
-                "viewport": {"width": 1280, "height": 900},
-                "locale": "en-US",
-                "args": ["--disable-blink-features=AutomationControlled"],
-                "ignore_default_args": ["--enable-automation"],
-            }
+            from browser_engine import persistent_launch_kwargs
+
+            launch_kwargs = persistent_launch_kwargs(
+                profile,
+                headless=False,
+                slow_mo=random.randint(40, 90),
+                viewport={"width": 1280, "height": 900},
+                locale="en-US",
+            )
             try:
                 context = playwright.chromium.launch_persistent_context(channel="chrome", **launch_kwargs)
             except Exception:
