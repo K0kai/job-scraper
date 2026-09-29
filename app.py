@@ -147,12 +147,32 @@ def format_brasilia(value: object) -> str:
     raw = str(value or "").strip()
     if not raw:
         return ""
-    if "T" not in raw and " " not in raw:
-        return raw[:10]
+    if "T" not in raw and " " not in raw and not raw.replace(".", "", 1).isdigit():
+        # Date-only string without time — keep as calendar day when already dd-like, else parse.
+        parsed = parse_utc(raw + "T00:00:00+00:00") if len(raw) >= 10 and raw[4] == "-" else None
+        if parsed is None:
+            return raw[:10]
+        return parsed.astimezone(BRASILIA).strftime("%d/%m/%Y")
     parsed = parse_utc(raw)
     if parsed is None:
         return raw
     return parsed.astimezone(BRASILIA).strftime("%d/%m/%Y %H:%M")
+
+
+def format_brasilia_date(value: object) -> str:
+    """Data em Brasília no formato dd/mm/yyyy (sem hora)."""
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    if "T" not in raw and " " not in raw and not raw.replace(".", "", 1).isdigit():
+        parsed = parse_utc(raw[:10] + "T12:00:00+00:00") if len(raw) >= 10 and raw[4] == "-" else None
+        if parsed is None:
+            return raw[:10]
+        return parsed.astimezone(BRASILIA).strftime("%d/%m/%Y")
+    parsed = parse_utc(raw)
+    if parsed is None:
+        return raw[:10]
+    return parsed.astimezone(BRASILIA).strftime("%d/%m/%Y")
 
 
 def connect() -> sqlite3.Connection:
@@ -1740,7 +1760,7 @@ def job_rows_html(jobs, collecting: bool) -> str:
         confidence = f" · {job['language_confidence']:.0%}" if job["language_confidence"] else ""
         letter_ui = f'<details><summary>{"Carta criada" if job["cover_letter"] else "Carta não criada"}</summary><div class="description">{esc(job["cover_letter"] or "A carta será gerada automaticamente na candidatura.")}</div></details>'
         notes = f'<details><summary>Notas</summary><div class="description">{esc(job["notes"] or "—")}</div></details>' if job["notes"] else ""
-        rows.append(f'''<tr><td><a class="job-title" href="{esc(job['url'])}" target="_blank" rel="noreferrer">{esc(job['title'])}</a><small>{esc(job['company'])}</small></td><td>{esc(job['location'])}</td><td><span class="source">{esc(job['source'])}</span></td><td><span title="Confiança do detector: {confidence}">{esc(lang_label + confidence)}</span></td><td>{esc(STATUSES.get(job['status'], job['status']))}</td><td>{letter_ui}{notes}<details><summary>Descrição</summary><div class="description">{esc(description[:1800])}</div></details></td><td><small>{esc(format_brasilia(job['posted_at'] or job['first_seen_at']))}</small></td></tr>''')
+        rows.append(f'''<tr><td><a class="job-title" href="{esc(job['url'])}" target="_blank" rel="noreferrer">{esc(job['title'])}</a><small>{esc(job['company'])}</small></td><td>{esc(job['location'])}</td><td><span class="source">{esc(job['source'])}</span></td><td><span title="Confiança do detector: {confidence}">{esc(lang_label + confidence)}</span></td><td>{esc(STATUSES.get(job['status'], job['status']))}</td><td>{letter_ui}{notes}<details><summary>Descrição</summary><div class="description">{esc(description[:1800])}</div></details></td><td><small>{esc(format_brasilia_date(job['posted_at'] or job['first_seen_at']))}</small></td></tr>''')
     if rows:
         return "".join(rows)
     if collecting:
@@ -1749,7 +1769,10 @@ def job_rows_html(jobs, collecting: bool) -> str:
 
 
 def history_html(runs) -> str:
-    return "".join(f'<li><span>{esc(run["started_at"][:16].replace("T", " "))}</span> {esc(run["message"] or run["state"])}</li>' for run in runs) or "<li>Nenhuma execução ainda.</li>"
+    return "".join(
+        f'<li><span>{esc(format_brasilia(run["started_at"]))}</span> {esc(run["message"] or run["state"])}</li>'
+        for run in runs
+    ) or "<li>Nenhuma execução ainda.</li>"
 
 
 def logs_html(limit: int = 200) -> str:
