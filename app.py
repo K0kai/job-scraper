@@ -11,7 +11,7 @@ import re
 import sqlite3
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote_plus, urlparse
@@ -1169,6 +1169,77 @@ def get_linkedin_search_filter(cfg: dict[str, str], *, force_refresh: bool = Fal
     return payload
 
 
+def linkedin_filter_panel_html(cfg: dict[str, str] | None = None) -> str:
+    """Bloco somente leitura do filtro LinkedIn em cache (gerado pela IA)."""
+    cfg = cfg or settings()
+    raw = (cfg.get("apify_linkedin_filter_json") or "").strip()
+    if not raw:
+        body = (
+            '<p class="hint" style="margin:0">Ainda não há filtro gerado. Ele aparece após a primeira '
+            "coleta Apify em modo <code>linkedin_search</code> (com currículo já analisado).</p>"
+        )
+        return (
+            '<div id="linkedin-filter-panel" class="resume-card" style="margin-top:12px">'
+            "<h3 style=\"margin:0 0 8px;font-size:14px\">Filtro LinkedIn (IA)</h3>"
+            f"{body}</div>"
+        )
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    exp_labels = {
+        1: "Internship",
+        2: "Entry",
+        3: "Associate",
+        4: "Mid-Senior",
+        5: "Director",
+        6: "Executive",
+    }
+    wt_labels = {1: "On-site", 2: "Remote", 3: "Hybrid"}
+    keywords = data.get("keywords") if isinstance(data.get("keywords"), list) else []
+    locations = data.get("locations") if isinstance(data.get("locations"), list) else []
+    experience = data.get("experience_levels") if isinstance(data.get("experience_levels"), list) else []
+    workplace = data.get("workplace_types") if isinstance(data.get("workplace_types"), list) else []
+    source = esc(str(data.get("source") or "cache"))
+    reason = esc(str(data.get("reason") or "").strip())
+    exp_bits = []
+    for x in experience:
+        try:
+            code = int(x)
+        except (TypeError, ValueError):
+            continue
+        exp_bits.append(f"{exp_labels.get(code, code)} ({code})")
+    wt_bits = []
+    for x in workplace:
+        try:
+            code = int(x)
+        except (TypeError, ValueError):
+            continue
+        wt_bits.append(f"{wt_labels.get(code, code)} ({code})")
+    exp_txt = ", ".join(exp_bits) or "—"
+    wt_txt = ", ".join(wt_bits) or "—"
+    pretty = esc(json.dumps(data, ensure_ascii=False, indent=2))
+    return (
+        '<div id="linkedin-filter-panel" class="resume-card" style="margin-top:12px">'
+        '<h3 style="margin:0 0 8px;font-size:14px">Filtro LinkedIn (IA)</h3>'
+        f'<p class="hint" style="margin:0 0 8px"><strong>Origem:</strong> {source}<br>'
+        f"<strong>Keywords:</strong> {esc(', '.join(str(k) for k in keywords) or '—')}<br>"
+        f"<strong>Locations:</strong> {esc(', '.join(str(x) for x in locations) or '—')}<br>"
+        f"<strong>Nível (f_E):</strong> {esc(exp_txt)}<br>"
+        f"<strong>Local de trabalho (f_WT):</strong> {esc(wt_txt)}</p>"
+        + (f'<p class="hint" style="margin:0 0 8px"><strong>Motivo:</strong> {reason}</p>' if reason else "")
+        + '<details><summary>JSON completo</summary>'
+        f'<pre style="margin:8px 0 0;white-space:pre-wrap;font:12px/1.4 ui-monospace,Menlo,Consolas,monospace;'
+        f'max-height:240px;overflow:auto;background:#f4f7f7;padding:10px;border-radius:8px">{pretty}</pre>'
+        "</details>"
+        '<p class="hint" style="margin:8px 0 0">Somente leitura. Regenera automaticamente quando o currículo '
+        "analisado muda e roda uma nova coleta LinkedIn/Apify.</p>"
+        "</div>"
+    )
+
+
 def build_linkedin_search_urls(filter_data: dict, *, max_urls: int = 4) -> list[str]:
     keywords = [str(k) for k in (filter_data.get("keywords") or []) if str(k).strip()][:4]
     locations = [str(x) for x in (filter_data.get("locations") or []) if str(x).strip()][:3]
@@ -1445,10 +1516,17 @@ class Collector:
         self.message = "Coleta parada"
         self.last_run: str | None = None
         self.last_found = 0
+        self.next_run_at: str | None = None
 
     def snapshot(self) -> dict:
         with self.lock:
-            return {"state": self.state, "message": self.message, "last_run": self.last_run, "last_found": self.last_found}
+            return {
+                "state": self.state,
+                "message": self.message,
+                "last_run": self.last_run,
+                "last_found": self.last_found,
+                "next_run_at": self.next_run_at,
+            }
 
     def start(self) -> bool:
         with self.lock:
@@ -1457,6 +1535,7 @@ class Collector:
             self.stop_event.clear()
             self.state = "running"
             self.message = "Iniciando busca…"
+            self.next_run_at = None
             self.thread = threading.Thread(target=self._loop, daemon=True, name="job-collector")
             self.thread.start()
             log_event("success", "collector", "Bot de coleta iniciado.")
@@ -1478,17 +1557,29 @@ class Collector:
 
     def _loop(self) -> None:
         while not self.stop_event.is_set():
+            with self.lock:
+                self.next_run_at = None
             self._run_once()
+            if self.stop_event.is_set():
+                break
             cfg = settings()
             try:
                 seconds = max(1, int(cfg.get("interval_minutes", "15"))) * 60
             except ValueError:
                 seconds = POLL_SECONDS
+            next_at = datetime.now(timezone.utc) + timedelta(seconds=seconds)
+            with self.lock:
+                self.next_run_at = next_at.isoformat(timespec="seconds")
+                mins = seconds // 60
+                secs = seconds % 60
+                wait_label = f"{mins} min" if secs == 0 else f"{mins} min {secs}s"
+                self.message = f"Aguardando próxima busca ({wait_label})…"
             if self.stop_event.wait(seconds):
                 break
         with self.lock:
             self.state = "stopped"
             self.message = "Coleta parada"
+            self.next_run_at = None
         log_event("info", "collector", "Coleta parada.")
 
     def _run_once(self) -> None:
@@ -1745,6 +1836,26 @@ def state_label_for(state: str) -> str:
     return {"running": "Em execução", "stopping": "Parando", "stopped": "Parada"}.get(state, state)
 
 
+def next_run_countdown_seconds(next_run_at: str | None) -> int | None:
+    if not next_run_at:
+        return None
+    target = parse_utc(next_run_at)
+    if not target:
+        return None
+    return max(0, int((target - datetime.now(timezone.utc)).total_seconds()))
+
+
+def format_countdown(seconds: int | None) -> str:
+    if seconds is None:
+        return ""
+    seconds = max(0, int(seconds))
+    hours, rem = divmod(seconds, 3600)
+    mins, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours:d}:{mins:02d}:{secs:02d}"
+    return f"{mins:02d}:{secs:02d}"
+
+
 def live_payload() -> dict:
     status = collector.snapshot()
     counts, jobs, runs = load_dashboard()
@@ -1755,10 +1866,15 @@ def live_payload() -> dict:
     logs = logs_html()
     queue = queue_html()
     worth = worth_html()
+    linkedin_filter = linkedin_filter_panel_html()
+    next_in = next_run_countdown_seconds(status.get("next_run_at"))
     return {
         "state": status["state"],
         "state_label": state_label_for(status["state"]),
         "message": status["message"],
+        "next_run_at": status.get("next_run_at"),
+        "next_run_in_seconds": next_in,
+        "next_run_label": format_countdown(next_in) if next_in is not None else "",
         "stats_html": stats,
         "stats_hash": _live_hash(stats),
         "jobs_html": jobs_body,
@@ -1772,6 +1888,8 @@ def live_payload() -> dict:
         "worth_html": worth,
         "worth_hash": _live_hash(worth),
         "resume_status": resume_status_payload(),
+        "linkedin_filter_html": linkedin_filter,
+        "linkedin_filter_hash": _live_hash(linkedin_filter),
     }
 
 
@@ -1962,11 +2080,19 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
     rows = job_rows_html(jobs, collecting)
     history = history_html(runs)
     state_label = state_label_for(status["state"])
+    next_in = next_run_countdown_seconds(status.get("next_run_at"))
+    if status["state"] == "stopped":
+        next_run_timer_text = "Próxima busca: — (bot parado)"
+    elif next_in is not None:
+        next_run_timer_text = f"Próxima busca em {format_countdown(next_in)}"
+    else:
+        next_run_timer_text = "Próxima busca: em andamento…"
     resume_panel = resume_panels_html()
     rules_panel = form_rules_html()
     logs_view = logs_html()
     queue_view = queue_html()
     worth_view = worth_html()
+    linkedin_filter_view = linkedin_filter_panel_html(cfg)
     notice_class = {
         "success": "notice notice-ok",
         "info": "notice notice-info",
@@ -1980,7 +2106,7 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
     )
     return f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Radar de Vagas</title><style>
       :root{{--ink:#172b36;--muted:#62747d;--line:#dce5e8;--paper:#f4f7f7;--teal:#0b786d;--mint:#d8f0e9;--white:#fff}}*{{box-sizing:border-box}}body{{margin:0;background:var(--paper);color:var(--ink);font:15px/1.5 Inter,Segoe UI,Arial,sans-serif}}header{{background:#102d35;color:white;padding:28px max(24px,calc((100vw - 1280px)/2));display:flex;justify-content:space-between;align-items:center}}h1{{font-size:25px;margin:0}}header p{{margin:5px 0 0;color:#c1d4d6}}main{{max-width:1280px;margin:26px auto;padding:0 24px}}.top{{display:grid;grid-template-columns:1.3fr .7fr;gap:18px}}.panel,.stat,.table-wrap{{background:white;border:1px solid var(--line);border-radius:13px}}.panel{{padding:20px}}h2{{font-size:18px;margin:0 0 14px}}.form-grid{{display:grid;grid-template-columns:1fr 1fr;gap:12px}}label{{display:block;color:var(--muted);font-size:13px;font-weight:600}}input,textarea,select{{font:inherit;color:var(--ink);width:100%;margin-top:5px;padding:9px 10px;border:1px solid #cdd9dc;border-radius:8px;background:white}}.hint{{color:var(--muted);font-size:12px;margin:10px 0}}button{{border:0;border-radius:8px;padding:10px 15px;background:var(--teal);color:white;font-weight:650;cursor:pointer}}button.stop{{background:#a74639}}button.subtle{{padding:7px 10px;background:#eaf2f1;color:var(--ink);margin-top:6px}}.actions{{display:flex;gap:9px;margin-top:12px;align-items:center}}.runtime{{color:var(--muted);font-size:13px}}.stats{{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin:18px 0}}.stat{{padding:13px 15px}}.stat span{{display:block;font-size:12px;color:var(--muted)}}.stat strong{{font-size:23px}}.table-wrap{{overflow:auto}}table{{border-collapse:collapse;width:100%;min-width:950px}}th,td{{padding:13px 12px;text-align:left;border-bottom:1px solid var(--line);vertical-align:top}}th{{font-size:12px;color:var(--muted);background:#f8fafa}}td small{{display:block;color:var(--muted);margin-top:3px}}.job-title{{font-weight:700;color:#145d59;text-decoration:none}}.job-title:hover{{text-decoration:underline}}.source{{background:var(--mint);padding:3px 7px;border-radius:99px;font-size:12px}}select{{min-width:150px;margin:0;padding:7px}}summary{{cursor:pointer;color:var(--teal);font-size:13px}}.description{{max-width:350px;max-height:220px;overflow:auto;padding:8px 0;font-size:13px}}details textarea{{min-width:230px}}.history{{color:var(--muted);font-size:13px;padding-left:20px}}.notice{{padding:10px 13px;border-radius:8px;margin-bottom:15px}}.notice-ok{{background:#e7f4ed;border:1px solid #b7dfc8}}.notice-info{{background:#e8f1f8;border:1px solid #b7d0e6}}.notice-error{{background:#fceaea;border:1px solid #e3b0b0;color:#6b2a2a}}.notice-warn{{background:#fff6e5;border:1px solid #e6d0a0}}.analysis-badge{{display:inline-block;padding:4px 10px;border-radius:999px;font-size:12px;font-weight:700;margin:10px 0 6px}}.analysis-ok{{background:#d8f0e9;color:#0b5c52}}.analysis-info{{background:#dceaf6;color:#1d4f74}}.analysis-error{{background:#f6d6d6;color:#7a2424}}.analysis-none{{background:#eceff1;color:#526066}}.analysis-error-text{{color:#7a2424;font-size:13px;margin:8px 0}}.resume-card{{border:1px solid var(--line);border-radius:10px;padding:14px;background:#fbfcfc}}.tabs{{display:flex;gap:8px;margin:0 0 16px}}.tab{{background:#e7eeef;color:var(--ink);padding:9px 16px;border-radius:999px;font-weight:650;cursor:pointer}}.tab.active{{background:var(--teal);color:white}}.tab-panel{{display:none}}.tab-panel.active{{display:block}}.log-console{{font:12.5px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:#0f1c22;color:#d7e6ea;border-radius:10px;padding:12px;max-height:620px;overflow:auto}}.log-line{{display:grid;grid-template-columns:132px 72px 110px 1fr;gap:10px;padding:5px 0;border-bottom:1px solid #1e323b}}.log-time{{color:#8eacb6}}.log-level{{font-weight:700;text-transform:uppercase}}.log-source{{color:#7ec8c0}}.log-msg{{color:#e8f3f5;white-space:pre-wrap;word-break:break-word}}.log-info .log-level{{color:#9ec9ff}}.log-success .log-level{{color:#7ddea8}}.log-warning .log-level{{color:#f0c674}}.log-error .log-level{{color:#f0a0a0}}.log-debug .log-level{{color:#9aa7ad}}.log-empty{{color:#9bb0b8;padding:18px 8px}}.queue-status{{display:inline-block;padding:3px 8px;border-radius:999px;font-size:12px;font-weight:700}}.queue-pending,.queue-retry_wait{{background:#dceaf6;color:#1d4f74}}.queue-running{{background:#d8f0e9;color:#0b5c52}}.queue-succeeded{{background:#e7f4ed;color:#1f6b45}}.queue-failed{{background:#f6d6d6;color:#7a2424}}.queue-cancelled{{background:#eceff1;color:#526066}}.worth-list{{display:grid;gap:14px}}.worth-card{{border:1px solid var(--line);border-radius:12px;padding:14px;background:#fbfcfc}}.worth-head{{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap}}@media(max-width:900px){{.log-line{{grid-template-columns:1fr;gap:2px}}}}@media(max-width:800px){{.top{{grid-template-columns:1fr}}.stats{{grid-template-columns:repeat(2,1fr)}}header{{padding:20px 24px}}.form-grid{{grid-template-columns:1fr}}}}
-      </style></head><body><header><div><h1>Radar de Vagas</h1><p>Busca, seleção e candidaturas automáticas</p></div><span id="collector-state">{esc(state_label)}</span></header><main>{notice_html}<nav class="tabs" aria-label="Seções do painel"><button type="button" class="tab active" data-tab="painel">Painel</button><button type="button" class="tab" data-tab="vale">Vale a pena olhar</button><button type="button" class="tab" data-tab="filas">Filas</button><button type="button" class="tab" data-tab="logs">Logs</button></nav><div id="tab-painel" class="tab-panel active"><div class="top"><section class="panel"><h2>Preferências de busca</h2><form method="post" action="/settings"><div class="form-grid"><label>Cargos e termos, separados por vírgula<textarea name="keywords" rows="3">{esc(cfg.get('keywords',''))}</textarea></label><label>Países/regiões aceitos<textarea name="locations" rows="3">{esc(cfg.get('locations',''))}</textarea></label><label>Fontes: remotive, remoteok, adzuna, apify<input name="sources" value="{esc(cfg.get('sources',''))}"></label><label>Intervalo de busca (minutos)<input name="interval_minutes" type="number" min="5" value="{esc(cfg.get('interval_minutes','15'))}"></label><label>Países Adzuna (ex.: br,us,gb,ca)<input name="adzuna_countries" value="{esc(cfg.get('adzuna_countries','br,us,gb,ca'))}"></label><label>Limite mensal Apify (USD)<input name="apify_monthly_credit_limit_usd" type="number" min="0" step="0.01" value="{esc(cfg.get('apify_monthly_credit_limit_usd','5'))}"></label><label>Máximo de vagas por ciclo Apify<input name="apify_job_count" type="number" min="1" max="100" value="{esc(cfg.get('apify_job_count','25'))}"></label><label style="grid-column:1/-1">Actors Apify (JSON — um ou mais scrapers)<textarea name="apify_actors_json" rows="8" style="font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px">{esc(cfg.get('apify_actors_json',''))}</textarea></label></div><p class="hint">Cada actor: <code>id</code>, <code>label</code>, <code>enabled</code>, <code>input_mode</code> (<code>linkedin_search</code> ou <code>custom</code>), <code>count</code> opcional. Em <code>linkedin_search</code>, a IA monta sozinha keywords + f_E (nível) + f_WT (remote/híbrido) a partir do currículo (cache até reanalisar). Em <code>custom</code>, use <code>input_template</code> com placeholders <code>{{keyword}}</code>, <code>{{location}}</code>, <code>{{count}}</code>, <code>{{keywords}}</code>.</p><button>Salvar preferências</button></form><div class="actions"><form method="post" action="/start" class="js-process-form"><button>Iniciar bot</button></form><form method="post" action="/stop" class="js-process-form"><button class="stop">Parar bot</button></form><span class="runtime" id="runtime-message">{esc(status['message'])}</span></div></section><section class="panel"><h2>Execuções recentes</h2><ul class="history" id="run-history">{history}</ul></section></div><section class="panel" style="margin-top:18px"><h2>Currículos (PDF)</h2>{resume_panel}<p class="hint">O seletor de arquivos do sistema abre ao escolher o PDF. A análise agora gera um dossiê completo (skills, experiências, projetos). Use <em>Reanalisar</em> para regenerar com o prompt enriquecido.</p></section>
+      </style></head><body><header><div><h1>Radar de Vagas</h1><p>Busca, seleção e candidaturas automáticas</p></div><span id="collector-state">{esc(state_label)}</span></header><main>{notice_html}<nav class="tabs" aria-label="Seções do painel"><button type="button" class="tab active" data-tab="painel">Painel</button><button type="button" class="tab" data-tab="vale">Vale a pena olhar</button><button type="button" class="tab" data-tab="filas">Filas</button><button type="button" class="tab" data-tab="logs">Logs</button></nav><div id="tab-painel" class="tab-panel active"><div class="top"><section class="panel"><h2>Preferências de busca</h2><form method="post" action="/settings"><div class="form-grid"><label>Cargos e termos, separados por vírgula<textarea name="keywords" rows="3">{esc(cfg.get('keywords',''))}</textarea></label><label>Países/regiões aceitos<textarea name="locations" rows="3">{esc(cfg.get('locations',''))}</textarea></label><label>Fontes: remotive, remoteok, adzuna, apify<input name="sources" value="{esc(cfg.get('sources',''))}"></label><label>Intervalo de busca (minutos)<input name="interval_minutes" type="number" min="5" value="{esc(cfg.get('interval_minutes','15'))}"></label><label>Países Adzuna (ex.: br,us,gb,ca)<input name="adzuna_countries" value="{esc(cfg.get('adzuna_countries','br,us,gb,ca'))}"></label><label>Limite mensal Apify (USD)<input name="apify_monthly_credit_limit_usd" type="number" min="0" step="0.01" value="{esc(cfg.get('apify_monthly_credit_limit_usd','5'))}"></label><label>Máximo de vagas por ciclo Apify<input name="apify_job_count" type="number" min="1" max="100" value="{esc(cfg.get('apify_job_count','25'))}"></label><label style="grid-column:1/-1">Actors Apify (JSON — um ou mais scrapers)<textarea name="apify_actors_json" rows="8" style="font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px">{esc(cfg.get('apify_actors_json',''))}</textarea></label></div><p class="hint">Cada actor: <code>id</code>, <code>label</code>, <code>enabled</code>, <code>input_mode</code> (<code>linkedin_search</code> ou <code>custom</code>), <code>count</code> opcional. Em <code>linkedin_search</code>, a IA monta sozinha keywords + f_E (nível) + f_WT (remote/híbrido) a partir do currículo (cache até reanalisar). Em <code>custom</code>, use <code>input_template</code> com placeholders <code>{{keyword}}</code>, <code>{{location}}</code>, <code>{{count}}</code>, <code>{{keywords}}</code>.</p><div id="linkedin-filter-slot">{linkedin_filter_view}</div><button>Salvar preferências</button></form><div class="actions"><form method="post" action="/start" class="js-process-form"><button>Iniciar bot</button></form><form method="post" action="/stop" class="js-process-form"><button class="stop">Parar bot</button></form><span class="runtime" id="runtime-message">{esc(status['message'])}</span><span class="runtime" id="next-run-timer" style="margin-left:12px;font-variant-numeric:tabular-nums">{esc(next_run_timer_text)}</span></div></section><section class="panel"><h2>Execuções recentes</h2><ul class="history" id="run-history">{history}</ul></section></div><section class="panel" style="margin-top:18px"><h2>Currículos (PDF)</h2>{resume_panel}<p class="hint">O seletor de arquivos do sistema abre ao escolher o PDF. A análise agora gera um dossiê completo (skills, experiências, projetos). Use <em>Reanalisar</em> para regenerar com o prompt enriquecido.</p></section>
 <section class="panel" style="margin-top:18px"><h2>Perfil, SMTP e automação</h2><form method="post" action="/ai-settings"><div class="form-grid"><label>Provedor de IA<select name="ai_provider"><option value="gemini" {'selected' if cfg.get('ai_provider') == 'gemini' else ''}>Gemini</option><option value="openai" {'selected' if cfg.get('ai_provider') == 'openai' else ''}>OpenAI</option></select></label><label>Modelo<input name="ai_model" value="{esc(cfg.get('ai_model','gemini-2.5-flash'))}"></label><label>Seu nome<input name="candidate_name" value="{esc(cfg.get('candidate_name',''))}"></label><label>E-mail<input name="candidate_email" value="{esc(cfg.get('candidate_email',''))}"></label><label>Telefone<input name="candidate_phone" value="{esc(cfg.get('candidate_phone',''))}"></label><label>LinkedIn<input name="candidate_linkedin" value="{esc(cfg.get('candidate_linkedin',''))}"></label><label>Cidade<input name="candidate_city" value="{esc(cfg.get('candidate_city',''))}"></label><label>Chave de IA (vazio mantém a salva)<input type="password" name="api_key" autocomplete="new-password"></label><label>Fatos profissionais em português<textarea name="candidate_facts_pt" rows="3">{esc(cfg.get('candidate_facts_pt',''))}</textarea></label><label>Professional facts in English<textarea name="candidate_facts_en" rows="3">{esc(cfg.get('candidate_facts_en',''))}</textarea></label><label>Score mínimo (%)<input name="minimum_match_score" type="number" min="0" max="100" value="{esc(cfg.get('minimum_match_score','80'))}"></label><label>Máximo de candidaturas por ciclo<input name="maximum_applications_per_run" type="number" min="1" max="50" value="{esc(cfg.get('maximum_applications_per_run','5'))}"></label><label>Workers da fila (paralelo)<input name="queue_max_workers" type="number" min="1" max="8" value="{esc(cfg.get('queue_max_workers','3'))}"></label><label>Máx. tentativas por job<input name="queue_max_attempts" type="number" min="1" max="200" value="{esc(cfg.get('queue_max_attempts','40'))}"></label><label>TTL da fila (horas)<input name="queue_ttl_hours" type="number" min="1" max="168" value="{esc(cfg.get('queue_ttl_hours','24'))}"></label><label>Adzuna App ID<input name="adzuna_app_id" value=""></label><label>Adzuna API key<input type="password" name="adzuna_app_key" value=""></label><label>Token Apify<input type="password" name="apify_token" value="" autocomplete="new-password"></label></div><label style="margin:12px 0"><input type="checkbox" name="auto_apply" value="1" {'checked' if cfg.get('auto_apply') == '1' else ''} style="width:auto"> Ativar triagem e candidatura automáticas (e-mail SMTP, depois formulário público)</label><p class="hint">Chaves ficam no cofre do sistema. Match usa o dossiê completo do currículo. Bom match em LinkedIn ou sem canal de envio vai para a aba <strong>Vale a pena olhar</strong>.</p><button>Salvar perfil e IA</button></form></section>
 <section class="panel" style="margin-top:18px"><h2>SMTP</h2><form method="post" action="/smtp-settings"><div class="form-grid"><label>Host<input name="smtp_host" value="{esc(cfg.get('smtp_host',''))}"></label><label>Porta<input name="smtp_port" type="number" value="{esc(cfg.get('smtp_port','587'))}"></label><label>Usuário<input name="smtp_user" value="{esc(cfg.get('smtp_user',''))}"></label><label>Remetente (From)<input name="smtp_from" value="{esc(cfg.get('smtp_from',''))}"></label><label>Senha (vazio mantém)<input type="password" name="smtp_password" autocomplete="new-password"></label><label>TLS<select name="smtp_use_tls"><option value="1" {'selected' if cfg.get('smtp_use_tls','1')=='1' else ''}>Sim (STARTTLS)</option><option value="0" {'selected' if cfg.get('smtp_use_tls')=='0' else ''}>Não</option></select></label></div><div class="actions"><button>Salvar SMTP</button></div></form><form method="post" action="/smtp-test" style="margin-top:8px"><button class="subtle" type="submit">Enviar e-mail de teste</button></form></section>
 <section class="panel" style="margin-top:18px"><h2>Regras de formulário (Playwright)</h2><form method="post" action="/profile-settings">{rules_panel}<p class="hint">Para selects (ex.: salário), coloque em "Valor fixo" o texto da opção preferida. Perguntas abertas sem regra usam a IA; se não houver tokens, a vaga é pulada.</p><button>Salvar regras</button></form></section><div class="stats" id="job-stats">{cards}</div><section class="table-wrap"><table><thead><tr><th>Vaga</th><th>Localidade</th><th>Fonte</th><th>Idioma</th><th>Etapa</th><th>Carta e descrição</th><th>Data</th></tr></thead><tbody id="jobs-body">{rows}</tbody></table></section></div>
@@ -1990,6 +2116,35 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
 <script>
 (function () {{
   var inFlight = false;
+  var nextRunAtIso = {json.dumps(status.get("next_run_at"))};
+  var collectorState = {json.dumps(status["state"])};
+  function formatCountdownClient(sec) {{
+    sec = Math.max(0, Math.floor(sec));
+    var h = Math.floor(sec / 3600);
+    var m = Math.floor((sec % 3600) / 60);
+    var s = sec % 60;
+    if (h > 0) return h + ":" + String(m).padStart(2, "0") + ":" + String(s).padStart(2, "0");
+    return String(m).padStart(2, "0") + ":" + String(s).padStart(2, "0");
+  }}
+  function updateNextRunTimer() {{
+    var el = document.getElementById("next-run-timer");
+    if (!el) return;
+    if (collectorState === "stopped") {{
+      el.textContent = "Próxima busca: — (bot parado)";
+      return;
+    }}
+    if (!nextRunAtIso) {{
+      el.textContent = "Próxima busca: em andamento…";
+      return;
+    }}
+    var target = Date.parse(nextRunAtIso);
+    if (!target) {{
+      el.textContent = "Próxima busca: —";
+      return;
+    }}
+    var left = Math.max(0, Math.round((target - Date.now()) / 1000));
+    el.textContent = "Próxima busca em " + formatCountdownClient(left);
+  }}
   document.querySelectorAll(".tab").forEach(function (btn) {{
     btn.addEventListener("click", function () {{
       var name = btn.getAttribute("data-tab");
@@ -2060,11 +2215,22 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
         var worthEl = document.getElementById("worth-body");
         if (stateEl && stateEl.textContent !== data.state_label) stateEl.textContent = data.state_label;
         if (messageEl && messageEl.textContent !== data.message) messageEl.textContent = data.message;
+        if (data.state) collectorState = data.state;
+        if (typeof data.next_run_at !== "undefined") {{
+          nextRunAtIso = data.next_run_at || null;
+          updateNextRunTimer();
+        }}
         applyRegion(statsEl, data.stats_html, data.stats_hash, {{ key: "stats" }});
         applyRegion(jobsEl, data.jobs_html, data.jobs_hash, {{ key: "jobs", skipIfBusy: true, wrapScroll: ".table-wrap" }});
         applyRegion(historyEl, data.history_html, data.history_hash, {{ key: "history" }});
         applyRegion(queueEl, data.queue_html, data.queue_hash, {{ key: "queue", skipIfBusy: true }});
         applyRegion(worthEl, data.worth_html, data.worth_hash, {{ key: "worth", skipIfBusy: true }});
+        applyRegion(
+          document.getElementById("linkedin-filter-slot"),
+          data.linkedin_filter_html,
+          data.linkedin_filter_hash,
+          {{ key: "linkedin_filter" }}
+        );
         if (data.resume_status) {{
           ["pt", "en"].forEach(function (lang) {{
             var part = data.resume_status[lang];
@@ -2156,6 +2322,8 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
       }});
   }});
   setInterval(refresh, 1500);
+  setInterval(updateNextRunTimer, 1000);
+  updateNextRunTimer();
   document.addEventListener("visibilitychange", function () {{ if (!document.hidden) refresh(); }});
 }})();
 </script></body></html>'''
