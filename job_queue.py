@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 import sqlite3
 import threading
 import time
@@ -18,6 +19,8 @@ KIND_RESUME = "resume_analysis"
 KIND_APPLY = "job_apply"
 ACTIVE_STATUSES = ("pending", "running", "retry_wait")
 TERMINAL_STATUSES = ("succeeded", "failed", "cancelled")
+# Teto absoluto do jitter de retry (evita intervalos de horas).
+BACKOFF_CAP_SECONDS = 20 * 60
 
 
 def _utc_now() -> datetime:
@@ -37,10 +40,25 @@ def _parse_iso(value: str | None) -> datetime | None:
         return None
 
 
-def backoff_seconds(attempt: int) -> int:
-    """Backoff exponencial com teto de 15 minutos."""
-    base = 30 * (2 ** max(0, attempt - 1))
-    return int(min(900, base))
+def backoff_seconds(attempt: int, *, rate_limited: bool = False) -> int:
+    """Backoff exponencial com jitter aleatório por job (espalha retries sincronizados).
+
+    Sem jitter, vários 429 voltam no mesmo segundo e martelam a IA de novo.
+    Teto: 20 minutos.
+    """
+    floor = 60 if rate_limited else 20
+    # attempt 1 → ~60–180s (429) ou ~20–60s; dobra a cada tentativa até o teto.
+    base = floor * (2 ** max(0, attempt - 1))
+    base = min(BACKOFF_CAP_SECONDS, base)
+    low = floor
+    high = min(BACKOFF_CAP_SECONDS, max(low + 15, int(base * 1.75)))
+    return random.randint(low, high)
+
+
+def is_rate_limit_error(exc: BaseException) -> bool:
+    msg = str(exc).casefold()
+    tokens = ("429", "rate limit", "quota", "resource_exhausted", "resource exhausted", "too many requests")
+    return any(t in msg for t in tokens)
 
 
 def is_retryable_error(exc: BaseException) -> bool:
@@ -131,12 +149,15 @@ class JobQueue:
             workers, _, _ = self._limits()
             self._stop.clear()
             recovered = self.recover_stale_running()
+            respread = self.respread_retry_waits()
             self._executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="queue-worker")
             self._dispatcher = threading.Thread(target=self._dispatch_loop, daemon=True, name="queue-dispatcher")
             self._dispatcher.start()
             msg = f"Fila iniciada com até {workers} worker(s)."
             if recovered:
                 msg += f" {recovered} job(s) interrompido(s) recolocados como pendentes."
+            if respread:
+                msg += f" {respread} retry(s) reespalhado(s) com jitter."
             log_event("info", "queue", msg)
 
     def stop(self) -> None:
@@ -164,6 +185,24 @@ class JobQueue:
                 (_iso(now), _iso(now + timedelta(hours=ttl_hours)), _iso(now)),
             )
             return int(cur.rowcount or 0)
+
+    def respread_retry_waits(self) -> int:
+        """Reespalha next_run_at de jobs em retry_wait para quebrar sincronização (ex.: 429 em massa)."""
+        now = _utc_now()
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT id, attempts, last_error FROM queue_jobs WHERE status='retry_wait'"
+            ).fetchall()
+            n = 0
+            for row in rows:
+                rate_limited = is_rate_limit_error(Exception(row["last_error"] or ""))
+                delay = backoff_seconds(max(1, int(row["attempts"] or 1)), rate_limited=rate_limited)
+                db.execute(
+                    "UPDATE queue_jobs SET next_run_at=?, updated_at=? WHERE id=? AND status='retry_wait'",
+                    (_iso(now + timedelta(seconds=delay)), _iso(now), int(row["id"])),
+                )
+                n += 1
+            return n
 
     def enqueue(self, kind: str, payload: dict[str, Any], *, dedupe_key: str | None = None) -> int:
         if kind not in self.handlers:
@@ -371,7 +410,7 @@ class JobQueue:
             expires = _parse_iso(str(row.get("expires_at") or ""))
             retryable = is_retryable_error(exc)
             if retryable and attempts < max_attempts and (expires is None or now < expires):
-                delay = backoff_seconds(attempts)
+                delay = backoff_seconds(attempts, rate_limited=is_rate_limit_error(exc))
                 next_run = _iso(now + timedelta(seconds=delay))
                 with self._connect() as db:
                     db.execute(
@@ -382,7 +421,7 @@ class JobQueue:
                 log_event(
                     "warning",
                     "queue",
-                    f"Job #{job_id} ({kind}) em retry ({attempts}/{max_attempts}) em {delay}s: {err}",
+                    f"Job #{job_id} ({kind}) em retry ({attempts}/{max_attempts}) em ~{delay}s: {err}",
                 )
             else:
                 self._finish(job_id, "failed", attempts, err[:1000], "")
