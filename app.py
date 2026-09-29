@@ -20,7 +20,9 @@ from zoneinfo import ZoneInfo
 
 from apply_channels import apply_via_browser, apply_via_email, record_blocked, send_smtp_email
 from form_rules import ensure_default_rules, list_rules, save_rules_from_form
-from job_queue import KIND_APPLY, KIND_RESUME, JobQueue
+from job_queue import KIND_APPLY, KIND_LINKEDIN, KIND_RESUME, JobQueue, NonRetryableError
+from linkedin_apply import apply_via_linkedin, default_profile_dir
+from ats_inhire import is_inhire_url
 from resume_pipeline import (
     AiUnavailableError,
     get_resume,
@@ -120,6 +122,16 @@ DEFAULT_SETTINGS = {
     "queue_max_workers": "3",
     "queue_max_attempts": "40",
     "queue_ttl_hours": "24",
+    # LinkedIn Easy Apply — assisted only (never auto-submit). ToS risk remains.
+    "linkedin_easy_apply": "0",
+    "linkedin_risk_ack": "0",
+    "linkedin_chrome_profile": "",
+    "linkedin_max_per_day": "3",
+    "linkedin_min_gap_minutes": "12",
+    "linkedin_human_wait_minutes": "12",
+    "linkedin_login_wait_minutes": "25",
+    # InHire diversity: 0 = No (default), 1 = Yes — "apply as disabled person"
+    "inhire_pcd": "0",
 }
 STATUSES = {"new": "Nova", "review": "Na fila", "worth": "Vale a pena olhar", "saved": "Salva", "prepared": "Carta preparada", "applied": "Aplicada", "ignored": "Ignorada", "blocked": "Envio indisponível"}
 BRASILIA = ZoneInfo("America/Sao_Paulo")
@@ -608,6 +620,13 @@ def is_linkedin_job(job: dict) -> bool:
     return "linkedin.com" in blob or "linkedin" in str(job.get("source") or "").casefold()
 
 
+def is_assisted_apply_job(job: dict) -> bool:
+    """LinkedIn Easy Apply / external Apply, or direct InHire career page."""
+    if is_linkedin_job(job):
+        return True
+    return is_inhire_url(str(job.get("url") or ""))
+
+
 def mark_worth_looking(job_id: int, *, score: int, reason: str, detail: str) -> None:
     note = (
         f"Vale a pena olhar (score {score}/100). {detail} "
@@ -692,13 +711,64 @@ def process_auto_job(job_id: int) -> str:
     api_key = get_ai_key(provider)
     score = int(decision["match_score"])
 
-    # LinkedIn (and similar) with good match: manual review instead of fragile automation.
+    # LinkedIn: optional Easy Apply (supervised Playwright + Chrome profile), else worth-looking.
     if is_linkedin_job(job):
+        if cfg.get("linkedin_easy_apply") == "1":
+            ok, detail = apply_via_linkedin(
+                connect,
+                job,
+                cfg,
+                cover_letter=cover_body,
+                resume_path=resume["stored_path"],
+                resume_id=int(resume["id"]),
+                cover_letter_id=cover_id,
+                resume_summary=resume["analysis_summary"] or "",
+                resume_json=resume["analysis_json"] or "",
+                provider=provider,
+                model=model,
+                api_key=api_key,
+                now_iso=stamp,
+                project_root=ROOT,
+            )
+            channel = "linkedin"
+            if ok:
+                dry = "dry-run" in detail.casefold()
+                human_sent = detail.casefold().startswith("assisted:")
+                job_status = "applied" if human_sent else ("prepared" if dry else "applied")
+                with connect() as db:
+                    if job_status == "applied":
+                        db.execute(
+                            "UPDATE jobs SET status=?, applied_at=?, notes=? WHERE id=?",
+                            (job_status, now_iso(), detail[:900], job_id),
+                        )
+                    else:
+                        db.execute(
+                            "UPDATE jobs SET status=?, notes=? WHERE id=?",
+                            (job_status, detail[:900], job_id),
+                        )
+                    db.execute(
+                        "UPDATE ai_decisions SET apply_channel=?, apply_result=? WHERE id=(SELECT MAX(id) FROM ai_decisions WHERE job_id=?)",
+                        (channel, detail[:500], job_id),
+                    )
+                log_event(
+                    "success" if human_sent else "info",
+                    "auto-apply",
+                    f"Vaga #{job_id} LinkedIn Easy Apply: {detail}",
+                )
+                return f"vaga {job_id}: {detail}"
+            record_blocked(connect, job_id, detail, now_iso(), int(resume["id"]), cover_id)
+            mark_worth_looking(
+                job_id,
+                score=score,
+                reason=decision["reason"],
+                detail=f"Easy Apply LinkedIn falhou ou indisponível: {detail}",
+            )
+            return f"vaga {job_id}: vale a pena olhar — {detail}"
         mark_worth_looking(
             job_id,
             score=score,
             reason=decision["reason"],
-            detail="LinkedIn detectado — candidatura automática indisponível; carta preparada para você enviar manualmente.",
+            detail="LinkedIn detectado — Easy Apply desligado; carta preparada para envio manual.",
         )
         return f"vaga {job_id}: vale a pena olhar (LinkedIn, score {score})"
 
@@ -804,9 +874,160 @@ def handle_job_apply_job(payload: dict) -> str:
     return process_auto_job(job_id)
 
 
+def process_worth_easy_apply(job_id: int) -> str:
+    """Easy Apply assistido a partir de 'Vale a pena olhar' — sem nova busca/triagem."""
+    cfg = settings()
+    if cfg.get("linkedin_easy_apply") != "1":
+        raise ValueError("Ative Easy Apply LinkedIn (e o aceite de risco) no painel.")
+    if cfg.get("linkedin_risk_ack") != "1":
+        raise ValueError("Confirme o aviso de risco/ToS no painel antes do Easy Apply.")
+
+    with connect() as db:
+        job_row = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+    if not job_row:
+        raise ValueError("Vaga removida.")
+    job = dict(job_row)
+    if job.get("status") not in {"worth", "prepared", "review", "blocked"}:
+        raise ValueError(f"Status '{job.get('status')}' não permite Easy Apply manual.")
+    if not is_linkedin_job(job) and not is_inhire_url(str(job.get("url") or "")):
+        raise ValueError("Esta vaga não é LinkedIn/InHire — use e-mail/formulário ou candidatura manual.")
+
+    with connect() as db:
+        decision = db.execute(
+            """SELECT match_score, reason, resume_language FROM ai_decisions
+               WHERE job_id=? ORDER BY id DESC LIMIT 1""",
+            (job_id,),
+        ).fetchone()
+        letter_row = db.execute("SELECT * FROM cover_letters WHERE job_id=?", (job_id,)).fetchone()
+
+    resume_language = (
+        (decision["resume_language"] if decision else None)
+        or job.get("language")
+        or "en"
+    ).casefold()
+    if resume_language not in {"pt", "en"}:
+        resume_language = "en"
+
+    with connect() as db:
+        resume = get_resume(db, resume_language)
+    if not resume or not (resume["analysis_summary"] or "").strip():
+        raise ValueError(f"Sem currículo analisado em {resume_language}.")
+
+    cover_id = int(letter_row["id"]) if letter_row else None
+    cover_body = letter_row["body"] if letter_row else ""
+    if not cover_body.strip():
+        try:
+            cover_id = create_cover_letter(job_id, resume_language=resume_language)
+        except AiUnavailableError:
+            raise
+        with connect() as db:
+            letter_row = db.execute("SELECT * FROM cover_letters WHERE job_id=?", (job_id,)).fetchone()
+        cover_body = letter_row["body"] if letter_row else ""
+        cover_id = int(letter_row["id"]) if letter_row else cover_id
+
+    stamp = now_iso()
+    provider = cfg.get("ai_provider", "gemini").casefold()
+    model = cfg.get("ai_model", "gemini-2.5-flash").strip()
+    api_key = get_ai_key(provider)
+    score = int(decision["match_score"]) if decision and decision["match_score"] is not None else 0
+    reason = (decision["reason"] if decision else "") or "Easy Apply manual a partir de Vale a pena olhar"
+
+    log_event("info", "linkedin", f"Easy Apply manual enfileirado/iniciado para vaga #{job_id}: {job.get('title')}")
+    ok, detail = apply_via_linkedin(
+        connect,
+        job,
+        cfg,
+        cover_letter=cover_body,
+        resume_path=resume["stored_path"],
+        resume_id=int(resume["id"]),
+        cover_letter_id=cover_id,
+        resume_summary=resume["analysis_summary"] or "",
+        resume_json=resume["analysis_json"] or "",
+        provider=provider,
+        model=model,
+        api_key=api_key,
+        now_iso=stamp,
+        project_root=ROOT,
+    )
+    channel = "linkedin"
+    if ok:
+        dry = "dry-run" in detail.casefold()
+        human_sent = detail.casefold().startswith("assisted:")
+        job_status = "applied" if human_sent else ("prepared" if dry else "applied")
+        with connect() as db:
+            if job_status == "applied":
+                db.execute(
+                    "UPDATE jobs SET status=?, applied_at=?, notes=? WHERE id=?",
+                    (job_status, now_iso(), detail[:900], job_id),
+                )
+            else:
+                db.execute(
+                    "UPDATE jobs SET status=?, notes=? WHERE id=?",
+                    (job_status, detail[:900], job_id),
+                )
+            db.execute(
+                """INSERT INTO ai_decisions(job_id,decided_at,match_score,should_apply,letter_required,reason,resume_language,apply_channel,apply_result)
+                   VALUES(?,?,?,?,?,?,?,?,?)""",
+                (job_id, now_iso(), score, 1, 1, reason[:1000], resume_language, channel, detail[:500]),
+            )
+        log_event(
+            "success" if human_sent else "info",
+            "linkedin",
+            f"Vaga #{job_id} Easy Apply (worth): {detail}",
+        )
+        return f"vaga {job_id}: {detail}"
+
+    record_blocked(connect, job_id, detail, now_iso(), int(resume["id"]), cover_id)
+    mark_worth_looking(
+        job_id,
+        score=score,
+        reason=reason,
+        detail=f"Easy Apply LinkedIn falhou ou indisponível: {detail}",
+    )
+    # Queue must show failed (not succeeded) — do not auto-retry auth/UI misses.
+    raise NonRetryableError(f"Easy Apply sem sucesso (vaga #{job_id}): {detail}")
+
+
+def handle_linkedin_apply_job(payload: dict) -> str:
+    job_id = int(payload.get("job_id") or 0)
+    if not job_id:
+        raise ValueError("job_id ausente no payload da fila.")
+    return process_worth_easy_apply(job_id)
+
+
+def enqueue_worth_easy_apply(job_id: int) -> str:
+    """Valida e enfileira Easy Apply; o worker abre o Chrome (não bloqueia o POST)."""
+    cfg = settings()
+    if cfg.get("linkedin_easy_apply") != "1":
+        return "Ative Easy Apply LinkedIn no painel (Perfil/IA)."
+    if cfg.get("linkedin_risk_ack") != "1":
+        return "Confirme o aviso de risco/ToS no painel antes de usar Easy Apply."
+    with connect() as db:
+        job_row = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+    if not job_row:
+        return "Vaga não encontrada."
+    job = dict(job_row)
+    if job.get("status") not in {"worth", "prepared", "blocked"}:
+        return f"Só é possível Easy Apply a partir de Vale a pena olhar (status atual: {job.get('status')})."
+    if not is_assisted_apply_job(job):
+        return "Esta vaga não parece LinkedIn/InHire."
+    qid = queue.enqueue(KIND_LINKEDIN, {"job_id": job_id}, dedupe_key=f"linkedin:{job_id}")
+    with connect() as db:
+        db.execute(
+            "UPDATE jobs SET status='review', notes=? WHERE id=? AND status IN ('worth','prepared','blocked')",
+            (f"Easy Apply / InHire na fila (job #{qid}). Fique atento à janela do Chrome.", job_id),
+        )
+    log_event("info", "linkedin", f"Vaga #{job_id} enfileirada para Easy Apply/InHire (fila #{qid}).")
+    return f"Candidatura assistida enfileirada (fila #{qid}). No Chrome: revise, captcha e Enviar são com você."
+
+
 queue = JobQueue(
     db_path=DB_PATH,
-    handlers={KIND_RESUME: handle_resume_analysis_job, KIND_APPLY: handle_job_apply_job},
+    handlers={
+        KIND_RESUME: handle_resume_analysis_job,
+        KIND_APPLY: handle_job_apply_job,
+        KIND_LINKEDIN: handle_linkedin_apply_job,
+    },
     get_settings=settings,
     connect_fn=connect,
 )
@@ -1806,7 +2027,11 @@ def queue_html(limit: int = 100) -> str:
     )
     if not rows:
         return summary + '<p class="hint">Nenhum job na fila ainda.</p>'
-    kind_label = {KIND_RESUME: "Análise de currículo", KIND_APPLY: "Candidatura"}
+    kind_label = {
+        KIND_RESUME: "Análise de currículo",
+        KIND_APPLY: "Candidatura",
+        KIND_LINKEDIN: "Easy Apply LinkedIn",
+    }
     status_label = {
         "pending": "Pendente",
         "running": "Executando",
@@ -1942,11 +2167,28 @@ def worth_html(*, page: int = 1, page_size: int = WORTH_PAGE_SIZE, min_match: in
             ).fetchall()
 
     cards = []
+    cfg = settings()
+    easy_on = cfg.get("linkedin_easy_apply") == "1" and cfg.get("linkedin_risk_ack") == "1"
     for job in rows:
         score = job["match_score"]
         score_label = f"{int(score)}/100" if score is not None else "—"
         desc = re.sub(r"<[^>]+>", " ", job["description"] or "")[:1200]
         letter = job["cover_letter"] or ""
+        linkedin = is_assisted_apply_job(dict(job))
+        easy_btn = ""
+        if linkedin:
+            if easy_on:
+                easy_btn = (
+                    f'<form method="post" action="/worth-easy-apply" class="js-process-form" style="display:inline">'
+                    f'<input type="hidden" name="id" value="{int(job["id"])}">'
+                    f'<button type="submit" title="LinkedIn Easy Apply ou Apply→InHire; você confirma envio/captcha">'
+                    f"Easy Apply</button></form>"
+                )
+            else:
+                easy_btn = (
+                    '<button type="button" class="subtle" disabled '
+                    'title="Ative Easy Apply + aceite de risco em Perfil/IA">Easy Apply (desligado)</button>'
+                )
         cards.append(
             f'<article class="worth-card">'
             f'<div class="worth-head"><a class="job-title" href="{esc(job["url"])}" target="_blank" rel="noreferrer">{esc(job["title"])}</a>'
@@ -1956,12 +2198,14 @@ def worth_html(*, page: int = 1, page_size: int = WORTH_PAGE_SIZE, min_match: in
             f'<p><a href="{esc(job["url"])}" target="_blank" rel="noreferrer">Abrir vaga para candidatura manual</a></p>'
             f'<details><summary>Descrição</summary><div class="description">{esc(desc)}</div></details>'
             f'<details><summary>{"Carta pronta para copiar" if letter else "Sem carta"}</summary><div class="description">{esc(letter or "—")}</div></details>'
-            f'<form method="post" action="/job-status" class="actions">'
+            f'<div class="actions">'
+            f"{easy_btn}"
+            f'<form method="post" action="/job-status" style="display:inline">'
             f'<input type="hidden" name="id" value="{int(job["id"])}">'
             f'<button class="subtle" name="status" value="applied" type="submit">Marcar como aplicada</button>'
             f'<button class="subtle" name="status" value="ignored" type="submit">Ignorar</button>'
             f'<button class="subtle" name="status" value="saved" type="submit">Salvar</button>'
-            f"</form></article>"
+            f"</form></div></article>"
         )
     start = offset + 1
     end = offset + len(rows)
@@ -2266,10 +2510,20 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
     return f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Radar de Vagas</title><style>
       :root{{--ink:#172b36;--muted:#62747d;--line:#dce5e8;--paper:#f4f7f7;--teal:#0b786d;--mint:#d8f0e9;--white:#fff}}*{{box-sizing:border-box}}body{{margin:0;background:var(--paper);color:var(--ink);font:15px/1.5 Inter,Segoe UI,Arial,sans-serif}}header{{background:#102d35;color:white;padding:28px max(24px,calc((100vw - 1280px)/2));display:flex;justify-content:space-between;align-items:center}}h1{{font-size:25px;margin:0}}header p{{margin:5px 0 0;color:#c1d4d6}}main{{max-width:1280px;margin:26px auto;padding:0 24px}}.top{{display:grid;grid-template-columns:1.3fr .7fr;gap:18px}}.panel,.stat,.table-wrap{{background:white;border:1px solid var(--line);border-radius:13px}}.panel{{padding:20px}}h2{{font-size:18px;margin:0 0 14px}}.form-grid{{display:grid;grid-template-columns:1fr 1fr;gap:12px}}label{{display:block;color:var(--muted);font-size:13px;font-weight:600}}input,textarea,select{{font:inherit;color:var(--ink);width:100%;margin-top:5px;padding:9px 10px;border:1px solid #cdd9dc;border-radius:8px;background:white}}.hint{{color:var(--muted);font-size:12px;margin:10px 0}}button{{border:0;border-radius:8px;padding:10px 15px;background:var(--teal);color:white;font-weight:650;cursor:pointer}}button.stop{{background:#a74639}}button.subtle{{padding:7px 10px;background:#eaf2f1;color:var(--ink);margin-top:6px}}.actions{{display:flex;gap:9px;margin-top:12px;align-items:center}}.runtime{{color:var(--muted);font-size:13px}}.stats{{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin:18px 0}}.stat{{padding:13px 15px}}.stat span{{display:block;font-size:12px;color:var(--muted)}}.stat strong{{font-size:23px}}.table-wrap{{overflow:auto}}table{{border-collapse:collapse;width:100%;min-width:950px}}th,td{{padding:13px 12px;text-align:left;border-bottom:1px solid var(--line);vertical-align:top}}th{{font-size:12px;color:var(--muted);background:#f8fafa}}td small{{display:block;color:var(--muted);margin-top:3px}}.job-title{{font-weight:700;color:#145d59;text-decoration:none}}.job-title:hover{{text-decoration:underline}}.source{{background:var(--mint);padding:3px 7px;border-radius:99px;font-size:12px}}select{{min-width:150px;margin:0;padding:7px}}summary{{cursor:pointer;color:var(--teal);font-size:13px}}.description{{max-width:350px;max-height:220px;overflow:auto;padding:8px 0;font-size:13px}}details textarea{{min-width:230px}}.history{{color:var(--muted);font-size:13px;padding-left:20px}}.notice{{padding:10px 13px;border-radius:8px;margin-bottom:15px}}.notice-ok{{background:#e7f4ed;border:1px solid #b7dfc8}}.notice-info{{background:#e8f1f8;border:1px solid #b7d0e6}}.notice-error{{background:#fceaea;border:1px solid #e3b0b0;color:#6b2a2a}}.notice-warn{{background:#fff6e5;border:1px solid #e6d0a0}}.analysis-badge{{display:inline-block;padding:4px 10px;border-radius:999px;font-size:12px;font-weight:700;margin:10px 0 6px}}.analysis-ok{{background:#d8f0e9;color:#0b5c52}}.analysis-info{{background:#dceaf6;color:#1d4f74}}.analysis-error{{background:#f6d6d6;color:#7a2424}}.analysis-none{{background:#eceff1;color:#526066}}.analysis-error-text{{color:#7a2424;font-size:13px;margin:8px 0}}.resume-card{{border:1px solid var(--line);border-radius:10px;padding:14px;background:#fbfcfc}}.tabs{{display:flex;gap:8px;margin:0 0 16px}}.tab{{background:#e7eeef;color:var(--ink);padding:9px 16px;border-radius:999px;font-weight:650;cursor:pointer}}.tab.active{{background:var(--teal);color:white}}.tab-panel{{display:none}}.tab-panel.active{{display:block}}.log-console{{font:12.5px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:#0f1c22;color:#d7e6ea;border-radius:10px;padding:12px;max-height:620px;overflow:auto}}.log-line{{display:grid;grid-template-columns:132px 72px 110px 1fr;gap:10px;padding:5px 0;border-bottom:1px solid #1e323b}}.log-time{{color:#8eacb6}}.log-level{{font-weight:700;text-transform:uppercase}}.log-source{{color:#7ec8c0}}.log-msg{{color:#e8f3f5;white-space:pre-wrap;word-break:break-word}}.log-info .log-level{{color:#9ec9ff}}.log-success .log-level{{color:#7ddea8}}.log-warning .log-level{{color:#f0c674}}.log-error .log-level{{color:#f0a0a0}}.log-debug .log-level{{color:#9aa7ad}}.log-empty{{color:#9bb0b8;padding:18px 8px}}.queue-status{{display:inline-block;padding:3px 8px;border-radius:999px;font-size:12px;font-weight:700}}.queue-pending,.queue-retry_wait{{background:#dceaf6;color:#1d4f74}}.queue-running{{background:#d8f0e9;color:#0b5c52}}.queue-succeeded{{background:#e7f4ed;color:#1f6b45}}.queue-failed{{background:#f6d6d6;color:#7a2424}}.queue-cancelled{{background:#eceff1;color:#526066}}.worth-list{{display:grid;gap:14px}}.worth-card{{border:1px solid var(--line);border-radius:12px;padding:14px;background:#fbfcfc}}.worth-head{{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap}}.worth-pager{{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin:8px 0 14px}}@media(max-width:900px){{.log-line{{grid-template-columns:1fr;gap:2px}}}}@media(max-width:800px){{.top{{grid-template-columns:1fr}}.stats{{grid-template-columns:repeat(2,1fr)}}header{{padding:20px 24px}}.form-grid{{grid-template-columns:1fr}}}}
       </style></head><body><header><div><h1>Radar de Vagas</h1><p>Busca, seleção e candidaturas automáticas</p></div><span id="collector-state">{esc(state_label)}</span></header><main>{notice_html}<nav class="tabs" aria-label="Seções do painel"><button type="button" class="tab active" data-tab="painel">Painel</button><button type="button" class="tab" data-tab="vale">Vale a pena olhar</button><button type="button" class="tab" data-tab="filas">Filas</button><button type="button" class="tab" data-tab="logs">Logs</button></nav><div id="tab-painel" class="tab-panel active"><div class="top"><section class="panel"><h2>Preferências de busca</h2><form method="post" action="/settings"><div class="form-grid"><label>Cargos e termos, separados por vírgula<textarea name="keywords" rows="3">{esc(cfg.get('keywords',''))}</textarea></label><label>Países/regiões aceitos<textarea name="locations" rows="3">{esc(cfg.get('locations',''))}</textarea></label><label>Fontes: remotive, remoteok, adzuna, apify<input name="sources" value="{esc(cfg.get('sources',''))}"></label><label>Intervalo de busca (minutos)<input name="interval_minutes" type="number" min="5" value="{esc(cfg.get('interval_minutes','15'))}"></label><label>Países Adzuna (ex.: br,us,gb,ca)<input name="adzuna_countries" value="{esc(cfg.get('adzuna_countries','br,us,gb,ca'))}"></label><label>Limite mensal Apify (USD)<input name="apify_monthly_credit_limit_usd" type="number" min="0" step="0.01" value="{esc(cfg.get('apify_monthly_credit_limit_usd','5'))}"></label><label>Máximo de vagas por ciclo Apify<input name="apify_job_count" type="number" min="1" max="100" value="{esc(cfg.get('apify_job_count','25'))}"></label><label style="grid-column:1/-1">Actors Apify (JSON — um ou mais scrapers)<textarea name="apify_actors_json" rows="8" style="font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px">{esc(cfg.get('apify_actors_json',''))}</textarea></label></div><p class="hint">Cada actor: <code>id</code>, <code>label</code>, <code>enabled</code>, <code>input_mode</code> (<code>linkedin_search</code> ou <code>custom</code>), <code>count</code> opcional. Em <code>linkedin_search</code>, a IA monta sozinha keywords + f_E (nível) + f_WT (remote/híbrido) a partir do currículo (cache até reanalisar). Em <code>custom</code>, use <code>input_template</code> com placeholders <code>{{keyword}}</code>, <code>{{location}}</code>, <code>{{count}}</code>, <code>{{keywords}}</code>.</p><div id="linkedin-filter-slot">{linkedin_filter_view}</div><button>Salvar preferências</button></form><div class="actions"><form method="post" action="/start" class="js-process-form"><button>Iniciar bot</button></form><form method="post" action="/stop" class="js-process-form"><button class="stop">Parar bot</button></form><span class="runtime" id="runtime-message">{esc(status['message'])}</span><span class="runtime" id="next-run-timer" style="margin-left:12px;font-variant-numeric:tabular-nums">{esc(next_run_timer_text)}</span></div></section><section class="panel"><h2>Execuções recentes</h2><ul class="history" id="run-history">{history}</ul></section></div><section class="panel" style="margin-top:18px"><h2>Currículos (PDF)</h2>{resume_panel}<p class="hint">O seletor de arquivos do sistema abre ao escolher o PDF. A análise agora gera um dossiê completo (skills, experiências, projetos). Use <em>Reanalisar</em> para regenerar com o prompt enriquecido.</p></section>
-<section class="panel" style="margin-top:18px"><h2>Perfil, SMTP e automação</h2><form method="post" action="/ai-settings"><div class="form-grid"><label>Provedor de IA<select name="ai_provider"><option value="gemini" {'selected' if cfg.get('ai_provider') == 'gemini' else ''}>Gemini</option><option value="openai" {'selected' if cfg.get('ai_provider') == 'openai' else ''}>OpenAI</option></select></label><label>Modelo<input name="ai_model" value="{esc(cfg.get('ai_model','gemini-2.5-flash'))}"></label><label>Seu nome<input name="candidate_name" value="{esc(cfg.get('candidate_name',''))}"></label><label>E-mail<input name="candidate_email" value="{esc(cfg.get('candidate_email',''))}"></label><label>Telefone<input name="candidate_phone" value="{esc(cfg.get('candidate_phone',''))}"></label><label>LinkedIn<input name="candidate_linkedin" value="{esc(cfg.get('candidate_linkedin',''))}"></label><label>Cidade<input name="candidate_city" value="{esc(cfg.get('candidate_city',''))}"></label><label>Chave de IA (vazio mantém a salva)<input type="password" name="api_key" autocomplete="new-password"></label><label>Fatos profissionais em português<textarea name="candidate_facts_pt" rows="3">{esc(cfg.get('candidate_facts_pt',''))}</textarea></label><label>Professional facts in English<textarea name="candidate_facts_en" rows="3">{esc(cfg.get('candidate_facts_en',''))}</textarea></label><label>Score mínimo (%)<input name="minimum_match_score" type="number" min="0" max="100" value="{esc(cfg.get('minimum_match_score','80'))}"></label><label>Workers da fila (vagas em paralelo)<input name="queue_max_workers" type="number" min="1" max="8" value="{esc(cfg.get('queue_max_workers','3'))}"></label><label>Máx. tentativas por job<input name="queue_max_attempts" type="number" min="1" max="200" value="{esc(cfg.get('queue_max_attempts','40'))}"></label><label>TTL da fila (horas)<input name="queue_ttl_hours" type="number" min="1" max="168" value="{esc(cfg.get('queue_ttl_hours','24'))}"></label><label>Adzuna App ID<input name="adzuna_app_id" value=""></label><label>Adzuna API key<input type="password" name="adzuna_app_key" value=""></label><label>Token Apify<input type="password" name="apify_token" value="" autocomplete="new-password"></label></div><label style="margin:12px 0"><input type="checkbox" name="auto_apply" value="1" {'checked' if cfg.get('auto_apply') == '1' else ''} style="width:auto"> Ativar triagem e candidatura automáticas (e-mail SMTP, depois formulário público)</label><p class="hint">Chaves ficam no cofre do sistema. Match usa o dossiê completo do currículo. Bom match em LinkedIn ou sem canal de envio vai para a aba <strong>Vale a pena olhar</strong>.</p><button>Salvar perfil e IA</button></form></section>
+<section class="panel" style="margin-top:18px"><h2>Perfil, SMTP e automação</h2><form method="post" action="/ai-settings"><div class="form-grid"><label>Provedor de IA<select name="ai_provider"><option value="gemini" {'selected' if cfg.get('ai_provider') == 'gemini' else ''}>Gemini</option><option value="openai" {'selected' if cfg.get('ai_provider') == 'openai' else ''}>OpenAI</option></select></label><label>Modelo<input name="ai_model" value="{esc(cfg.get('ai_model','gemini-2.5-flash'))}"></label><label>Seu nome<input name="candidate_name" value="{esc(cfg.get('candidate_name',''))}"></label><label>E-mail<input name="candidate_email" value="{esc(cfg.get('candidate_email',''))}"></label><label>Telefone<input name="candidate_phone" value="{esc(cfg.get('candidate_phone',''))}"></label><label>LinkedIn<input name="candidate_linkedin" value="{esc(cfg.get('candidate_linkedin',''))}"></label><label>Cidade<input name="candidate_city" value="{esc(cfg.get('candidate_city',''))}"></label><label>Chave de IA (vazio mantém a salva)<input type="password" name="api_key" autocomplete="new-password"></label><label>Fatos profissionais em português<textarea name="candidate_facts_pt" rows="3">{esc(cfg.get('candidate_facts_pt',''))}</textarea></label><label>Professional facts in English<textarea name="candidate_facts_en" rows="3">{esc(cfg.get('candidate_facts_en',''))}</textarea></label><label>Score mínimo (%)<input name="minimum_match_score" type="number" min="0" max="100" value="{esc(cfg.get('minimum_match_score','80'))}"></label><label>Workers da fila (vagas em paralelo)<input name="queue_max_workers" type="number" min="1" max="8" value="{esc(cfg.get('queue_max_workers','3'))}"></label><label>Máx. tentativas por job<input name="queue_max_attempts" type="number" min="1" max="200" value="{esc(cfg.get('queue_max_attempts','40'))}"></label><label>TTL da fila (horas)<input name="queue_ttl_hours" type="number" min="1" max="168" value="{esc(cfg.get('queue_ttl_hours','24'))}"></label><label>Adzuna App ID<input name="adzuna_app_id" value=""></label><label>Adzuna API key<input type="password" name="adzuna_app_key" value=""></label><label>Token Apify<input type="password" name="apify_token" value="" autocomplete="new-password"></label></div><label style="margin:12px 0"><input type="checkbox" name="auto_apply" value="1" {'checked' if cfg.get('auto_apply') == '1' else ''} style="width:auto"> Ativar triagem e candidatura automáticas (e-mail SMTP, depois formulário público)</label>
+<label style="margin:12px 0"><input type="checkbox" name="linkedin_easy_apply" value="1" {'checked' if cfg.get('linkedin_easy_apply') == '1' else ''} style="width:auto"> Easy Apply LinkedIn <em>assistido</em> (preenche; <strong>você</strong> clica Enviar — o robô nunca envia sozinho)</label>
+<label style="margin:12px 0"><input type="checkbox" name="linkedin_risk_ack" value="1" {'checked' if cfg.get('linkedin_risk_ack') == '1' else ''} style="width:auto"> Li e aceito: automação no LinkedIn pode violar os termos deles e gerar restrição/banimento da conta; uso por minha conta e risco</label>
+<label>Máx. Easy Apply / dia (teto 8)<input name="linkedin_max_per_day" type="number" min="1" max="8" value="{esc(cfg.get('linkedin_max_per_day','3'))}"></label>
+<label>Intervalo mínimo entre vagas (min, mín. 5)<input name="linkedin_min_gap_minutes" type="number" min="5" max="180" value="{esc(cfg.get('linkedin_min_gap_minutes','12'))}"></label>
+<label>Tempo para você revisar/enviar no Chrome (min)<input name="linkedin_human_wait_minutes" type="number" min="3" max="45" value="{esc(cfg.get('linkedin_human_wait_minutes','12'))}"></label>
+<label>Tempo para login manual no Chrome (min)<input name="linkedin_login_wait_minutes" type="number" min="5" max="60" value="{esc(cfg.get('linkedin_login_wait_minutes','25'))}"></label>
+<label style="margin:12px 0"><input type="checkbox" name="inhire_pcd" value="1" {'checked' if cfg.get('inhire_pcd') == '1' else ''} style="width:auto"> InHire: candidatar como PCD (diversidade)</label>
+<label>Perfil Chrome dedicado (vazio = <code>linkedin_browser_profile</code> — <strong>não</strong> use o perfil do dia a dia)<input name="linkedin_chrome_profile" value="{esc(cfg.get('linkedin_chrome_profile') or '')}" placeholder="{esc(default_profile_dir(ROOT))}"></label>
+<p class="hint">Chaves no cofre do sistema. LinkedIn assistido: Easy Apply <em>ou</em> Apply externo (ex.: InHire) — 1 vaga por vez, limites diários, checkpoint/captcha com você. Na regra de formulário <code>salary</code>, preencha o valor da pretensão (InHire). Sem o aceite de risco, Easy Apply não roda.</p>
+<button>Salvar perfil e IA</button></form></section>
 <section class="panel" style="margin-top:18px"><h2>SMTP</h2><form method="post" action="/smtp-settings"><div class="form-grid"><label>Host<input name="smtp_host" value="{esc(cfg.get('smtp_host',''))}"></label><label>Porta<input name="smtp_port" type="number" value="{esc(cfg.get('smtp_port','587'))}"></label><label>Usuário<input name="smtp_user" value="{esc(cfg.get('smtp_user',''))}"></label><label>Remetente (From)<input name="smtp_from" value="{esc(cfg.get('smtp_from',''))}"></label><label>Senha (vazio mantém)<input type="password" name="smtp_password" autocomplete="new-password"></label><label>TLS<select name="smtp_use_tls"><option value="1" {'selected' if cfg.get('smtp_use_tls','1')=='1' else ''}>Sim (STARTTLS)</option><option value="0" {'selected' if cfg.get('smtp_use_tls')=='0' else ''}>Não</option></select></label></div><div class="actions"><button>Salvar SMTP</button></div></form><form method="post" action="/smtp-test" style="margin-top:8px"><button class="subtle" type="submit">Enviar e-mail de teste</button></form></section>
 <section class="panel" style="margin-top:18px"><h2>Regras de formulário (Playwright)</h2><form method="post" action="/profile-settings">{rules_panel}<p class="hint">Para selects (ex.: salário), coloque em "Valor fixo" o texto da opção preferida. Perguntas abertas sem regra usam a IA; se não houver tokens, a vaga é pulada.</p><button>Salvar regras</button></form></section><div class="stats" id="job-stats">{cards}</div><section class="table-wrap"><table><thead><tr><th>Vaga</th><th>Localidade</th><th>Fonte</th><th>Idioma</th><th>Etapa</th><th>Carta e descrição</th><th>Data</th></tr></thead><tbody id="jobs-body">{rows}</tbody></table></section></div>
-<div id="tab-vale" class="tab-panel"><section class="panel"><h2 style="margin-top:0">Vale a pena olhar</h2><p class="hint">Vagas com bom match que são LinkedIn ou em que e-mail/formulário automático não funcionou. A carta fica pronta para você copiar e candidatar manualmente.</p><div id="worth-body">{worth_view}</div></section></div>
+<div id="tab-vale" class="tab-panel"><section class="panel"><h2 style="margin-top:0">Vale a pena olhar</h2><p class="hint">Vagas com bom match em LinkedIn (Easy Apply desligado/falhou) ou em que e-mail/formulário automático não funcionou. Em vagas LinkedIn, use <strong>Easy Apply</strong> para preencher sem nova busca — você confirma o envio no Chrome.</p><div id="worth-body">{worth_view}</div></section></div>
 <div id="tab-filas" class="tab-panel"><section class="panel"><h2 style="margin-top:0">Filas de IA (async + retry)</h2><p class="hint">Análise de currículo e candidaturas rodam em paralelo (até 3 workers). Em fila/rate-limit da API, o job entra em retry automático até sucesso, expirar (24h) ou cancelar.</p><div id="queue-body">{queue_view}</div></section></div>
 <div id="tab-logs" class="tab-panel"><section class="panel"><div class="actions" style="justify-content:space-between;margin-top:0"><h2 style="margin:0">Logs do processo</h2><form method="post" action="/clear-logs" class="js-process-form"><button class="subtle" type="submit">Limpar logs</button></form></div><p class="hint">Atualiza automaticamente. Mostra coleta, análise de currículo, triagem da IA, SMTP e Playwright.</p><div id="logs-body" class="log-console">{logs_view}</div></section></div></main>
 <script>
@@ -2481,7 +2735,8 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
     "/queue-retry-all": 1,
     "/queue-eval-new": 1,
     "/queue-clear": 1,
-    "/clear-logs": 1
+    "/clear-logs": 1,
+    "/worth-easy-apply": 1
   }};
   function noticeClass(kind) {{
     return {{
@@ -2543,6 +2798,11 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
 
 
 def parse_form(handler: BaseHTTPRequestHandler) -> dict[str, str]:
+    """Parse POST fields from urlencoded or multipart (fetch FormData uses multipart)."""
+    content_type = (handler.headers.get("Content-Type") or "").casefold()
+    if "multipart/form-data" in content_type:
+        fields, _files = parse_multipart(handler)
+        return fields
     length = int(handler.headers.get("Content-Length", "0"))
     raw = handler.rfile.read(length).decode("utf-8")
     parsed = parse_qs(raw, keep_blank_values=True)
@@ -2749,6 +3009,14 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/ai-settings":
             if "auto_apply" not in form:
                 form["auto_apply"] = "0"
+            if "linkedin_easy_apply" not in form:
+                form["linkedin_easy_apply"] = "0"
+            if "linkedin_risk_ack" not in form:
+                form["linkedin_risk_ack"] = "0"
+            if "inhire_pcd" not in form:
+                form["inhire_pcd"] = "0"
+            # Assisted-only: strip any legacy auto-submit flag if present in DB form posts.
+            form.pop("linkedin_stop_before_submit", None)
             save_settings(form)
             provider = form.get("ai_provider", "gemini").casefold()
             try:
@@ -2761,7 +3029,13 @@ class Handler(BaseHTTPRequestHandler):
                 log_event("error", "settings", str(exc))
                 self.redirect(str(exc), notice_kind="error")
                 return
-            log_event("info", "settings", f"Perfil/IA salvos (auto_apply={form.get('auto_apply')}).")
+            log_event(
+                "info",
+                "settings",
+                f"Perfil/IA salvos (auto_apply={form.get('auto_apply')}, "
+                f"linkedin_easy_apply={form.get('linkedin_easy_apply')}, "
+                f"risk_ack={form.get('linkedin_risk_ack')}).",
+            )
             self.redirect("Perfil e integrações salvos.")
         elif path == "/smtp-settings":
             save_settings({k: form.get(k, "") for k in ("smtp_host", "smtp_port", "smtp_user", "smtp_from", "smtp_use_tls")})
@@ -2834,6 +3108,22 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/stop":
             collector.stop()
             self.respond_notice("Solicitação para parar enviada.")
+        elif path == "/worth-easy-apply":
+            job_id = int(form["id"]) if form.get("id", "").isdigit() else 0
+            if not job_id:
+                self.respond_notice("ID da vaga inválido.", notice_kind="error", ok=False)
+                return
+            note = enqueue_worth_easy_apply(job_id)
+            kind = (
+                "error"
+                if note.startswith("Ative")
+                or note.startswith("Confirme")
+                or note.startswith("Só")
+                or note.startswith("Esta")
+                or note.startswith("Vaga não")
+                else "info"
+            )
+            self.respond_notice(note, notice_kind=kind, ok=kind != "error")
         elif path == "/job-status":
             if form.get("status") in STATUSES and form.get("id", "").isdigit():
                 with connect() as db:

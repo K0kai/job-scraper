@@ -17,6 +17,7 @@ LOG = logging.getLogger("job-scraper")
 
 KIND_RESUME = "resume_analysis"
 KIND_APPLY = "job_apply"
+KIND_LINKEDIN = "linkedin_apply"
 ACTIVE_STATUSES = ("pending", "running", "retry_wait")
 TERMINAL_STATUSES = ("succeeded", "failed", "cancelled")
 # Teto absoluto do jitter de retry (evita intervalos de horas).
@@ -63,17 +64,31 @@ def is_rate_limit_error(exc: BaseException) -> bool:
 
 def is_retryable_error(exc: BaseException) -> bool:
     name = exc.__class__.__name__.casefold()
+    if "nonretryable" in name:
+        return False
     if "aiunavailable" in name:
         return True
     if "operationalerror" in name and "locked" in str(exc).casefold():
         return True
     msg = str(exc).casefold()
+    # LinkedIn assisted apply: never auto-retry auth/browser human steps.
+    linkedin_human = (
+        "login", "checkpoint", "captcha", "authwall", "easy apply",
+        "linkedin pediu", "perfil chrome", "manual",
+    )
+    if any(token in msg for token in linkedin_human):
+        return False
     tokens = (
         "429", "503", "502", "504", "quota", "rate limit", "resource_exhausted",
         "unavailable", "overload", "temporar", "try again", "retry", "high demand",
         "ia indisponível", "resource exhausted", "database is locked", "database locked",
     )
     return any(token in msg for token in tokens)
+
+
+class NonRetryableError(Exception):
+    """Queue should mark failed immediately (no retry_wait)."""
+
 
 
 class JobQueue:
@@ -170,10 +185,26 @@ class JobQueue:
         log_event("info", "queue", "Fila parada.")
 
     def recover_stale_running(self) -> int:
-        """Jobs 'running' sem processo vivo (ex.: após restart) voltam para pending."""
+        """Jobs 'running' sem processo vivo (ex.: após restart).
+
+        linkedin_apply is cancelled (not requeued): restarting mid-login must not
+        slam Chrome again before the user finishes signing in.
+        """
         now = _utc_now()
         _, _, ttl_hours = self._limits()
         with self._connect() as db:
+            cur_li = db.execute(
+                """UPDATE queue_jobs
+                   SET status='cancelled', updated_at=?,
+                       last_error=CASE
+                         WHEN last_error='' THEN
+                           'Interrompido no reinício — faça login no perfil Chrome e clique Easy Apply de novo.'
+                         ELSE last_error
+                       END
+                   WHERE status='running' AND kind=?""",
+                (_iso(now), KIND_LINKEDIN),
+            )
+            cancelled_li = int(cur_li.rowcount or 0)
             cur = db.execute(
                 """UPDATE queue_jobs
                    SET status='pending', next_run_at=?, expires_at=?, updated_at=?,
@@ -184,7 +215,7 @@ class JobQueue:
                    WHERE status='running'""",
                 (_iso(now), _iso(now + timedelta(hours=ttl_hours)), _iso(now)),
             )
-            return int(cur.rowcount or 0)
+            return int(cur.rowcount or 0) + cancelled_li
 
     def respread_retry_waits(self) -> int:
         """Reespalha next_run_at de jobs em retry_wait para quebrar sincronização (ex.: 429 em massa)."""
