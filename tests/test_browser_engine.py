@@ -72,5 +72,22 @@ class PydollSmokeTests(unittest.TestCase):
         self.assertTrue(callable(mod.sync_playwright))
 
 
+class NeutralWordingTests(unittest.TestCase):
+    def test_form_rules_panel_says_navegador(self):
+        from app import render_page
+
+        html = render_page()
+        self.assertIn("Regras de formulário (navegador)", html)
+
+    def test_apply_via_browser_error_is_engine_agnostic(self):
+        import inspect
+
+        import apply_channels
+
+        src = inspect.getsource(apply_channels.apply_via_browser)
+        self.assertNotIn("Falha no Playwright", src)
+        self.assertNotIn("via Playwright", src)
+
+
 if __name__ == "__main__":
     unittest.main()

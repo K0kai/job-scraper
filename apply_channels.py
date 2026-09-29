@@ -407,7 +407,7 @@ def apply_via_browser(
                 browser.close()
             except Exception:
                 pass
-            return block(f"Falha no Playwright: {exc}", status="failed")
+            return block(f"Falha no navegador: {exc}", status="failed")
 
     if pending_answers:
         with connect_fn() as db:
@@ -425,10 +425,10 @@ def apply_via_browser(
         resume_id=resume_id,
         cover_letter_id=cover_letter_id,
         status="sent",
-        detail="Formulário enviado via Playwright",
+        detail="Formulário enviado via navegador",
         now_iso=now_iso,
     )
-    return True, "Formulário enviado via Playwright"
+    return True, "Formulário enviado via navegador"
 
 
 def record_blocked(
