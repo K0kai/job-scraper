@@ -7,4 +7,5 @@ resumes/*.pdf
 resumes/*.tmp
 linkedin_browser_profile/
 *.pyc
-tests
+tests/*
+!tests/*.py
