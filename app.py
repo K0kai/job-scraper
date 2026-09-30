@@ -99,6 +99,14 @@ DEFAULT_SETTINGS = {
     "candidate_phone": "",
     "candidate_linkedin": "",
     "candidate_city": "",
+    "candidate_cpf": "",
+    # Expectativa salarial — o robô escolhe BRL×USD pela moeda do campo/vaga
+    "salary_expectation_brl": "",
+    "salary_expectation_usd": "",
+    "salary_currency_preference": "auto",
+    "salary_pj_multiplier": "1.3",
+    # Preferência de contratação (radio Contractor/Employee); 'ask' = deixar com você
+    "candidate_contract_type": "employee",
     "candidate_profile_pt": "",
     "candidate_profile_en": "",
     "candidate_facts_pt": "",
@@ -2487,7 +2495,7 @@ def form_rules_html() -> str:
     for idx, rule in enumerate(rules, start=1):
         mode_opts = "".join(
             f'<option value="{m}" {"selected" if rule["mode"] == m else ""}>{m}</option>'
-            for m in ("text", "select", "file", "cover_letter", "skip")
+            for m in ("text", "select", "salary", "file", "cover_letter", "skip")
         )
         rows.append(
             f'<tr><td><input name="rule_key_{idx}" value="{esc(rule["key"])}"></td>'
@@ -2497,7 +2505,7 @@ def form_rules_html() -> str:
             f'<td><input name="rule_value_{idx}" value="{esc(rule["value"])}"></td></tr>'
         )
     idx = len(rules) + 1
-    mode_opts = "".join(f'<option value="{m}">{m}</option>' for m in ("text", "select", "file", "cover_letter", "skip"))
+    mode_opts = "".join(f'<option value="{m}">{m}</option>' for m in ("text", "select", "salary", "file", "cover_letter", "skip"))
     rows.append(
         f'<tr><td><input name="rule_key_{idx}" placeholder="nova chave"></td>'
         f'<td><input name="rule_aliases_{idx}" placeholder="aliases"></td>'
@@ -2511,6 +2519,121 @@ def form_rules_html() -> str:
         "</tr></thead><tbody>" + "".join(rows) + "</tbody></table>"
     )
 
+
+PAGE_CSS = """*{box-sizing:border-box}
+:root{--bg:#0a0a0b;--panel:#121214;--panel2:#17171a;--line:#26262b;--line2:#33333a;
+--ink:#ededf0;--muted:#8a8a93;--muted2:#5c5c66;--accent:#e5484d;--accent2:#ff6369;
+--ok:#4ea36b;--info:#3f6f9e;--warn:#b98a3a;--err:#c2544d;--white:#fff}
+html,body{height:100%}
+body{margin:0;background:var(--bg);color:var(--ink);
+font:14.5px/1.55 ui-sans-serif,Inter,Segoe UI,Arial,sans-serif;-webkit-font-smoothing:antialiased}
+.shell{display:grid;grid-template-columns:248px 1fr;min-height:100vh}
+.sidebar{background:#0c0c0e;border-right:1px solid var(--line);display:flex;flex-direction:column;
+position:sticky;top:0;height:100vh;padding:20px 14px;gap:18px}
+.brand strong{display:block;font-size:15px;letter-spacing:.02em;color:var(--white)}
+.brand small{display:block;color:var(--muted2);font-size:11.5px;margin-top:4px;font-weight:500}
+.brand{border-bottom:1px solid var(--line);padding-bottom:14px}
+.nav-label{display:block;color:var(--muted2);font-size:10.5px;font-weight:700;letter-spacing:.14em;
+text-transform:uppercase;margin:6px 8px 4px}
+.tabs{display:flex;flex-direction:column;gap:2px}
+.tab{background:transparent;border:0;color:var(--muted);text-align:left;padding:9px 11px;border-radius:8px;
+font:inherit;font-weight:600;font-size:13.5px;cursor:pointer;display:flex;align-items:center;gap:9px;
+border-left:2px solid transparent;transition:background .12s,color .12s}
+.tab:hover{background:var(--panel2);color:var(--ink)}
+.tab.active{background:var(--panel2);color:var(--white);border-left:2px solid var(--accent)}
+.sidebar-foot{margin-top:auto;border-top:1px solid var(--line);padding-top:14px}
+#collector-state{font-size:12px;font-weight:700;color:var(--muted);display:inline-flex;align-items:center;gap:7px}
+#collector-state::before{content:"";width:8px;height:8px;border-radius:50%;background:var(--muted2)}
+.content{padding:26px max(24px,calc((100vw - 1180px)/2));overflow-x:auto}
+h1{font-size:20px;margin:0}
+h2{font-size:16px;margin:0 0 16px;font-weight:700;letter-spacing:-.01em;color:var(--white)}
+h3{font-size:13px}
+main{max-width:1180px;margin:0 auto;padding:0 24px}
+.top{display:grid;grid-template-columns:1.3fr .7fr;gap:16px}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:20px;margin-bottom:18px}
+.runbar{display:flex;flex-wrap:wrap;gap:12px;align-items:center;padding:14px 18px}
+.runbar .actions{margin-top:0}
+.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+label{display:block;color:var(--muted);font-size:12.5px;font-weight:600}
+input,textarea,select{font:inherit;color:var(--ink);width:100%;margin-top:6px;padding:9px 11px;
+border:1px solid var(--line2);border-radius:9px;background:#0e0e10;transition:border-color .12s,background .12s}
+input:focus,textarea:focus,select:focus{outline:none;border-color:var(--accent);background:#101012}
+input[type=checkbox]{width:auto;margin:0;accent-color:var(--accent)}
+option{background:#0e0e10;color:var(--ink)}
+.hint{color:var(--muted2);font-size:11.5px;margin:12px 0 0;line-height:1.5}
+.hint code{background:#000;border:1px solid var(--line);border-radius:5px;padding:1px 5px;color:var(--muted);font-size:11px}
+button{border:1px solid transparent;border-radius:9px;padding:9px 15px;background:var(--white);color:#0a0a0a;
+font-weight:700;font-size:13px;cursor:pointer;transition:filter .12s,background .12s}
+button:hover{filter:brightness(.92)}
+button.stop{background:var(--accent);color:var(--white)}
+button.subtle{padding:6px 10px;background:transparent;color:var(--muted);border:1px solid var(--line2);font-weight:600}
+button.subtle:hover{color:var(--ink);border-color:var(--muted2);background:var(--panel2)}
+.actions{display:flex;gap:9px;margin-top:14px;align-items:center;flex-wrap:wrap}
+.runtime{color:var(--muted);font-size:12.5px;font-variant-numeric:tabular-nums}
+.stats{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin:4px 0 18px}
+.stat{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:13px 15px}
+.stat span{display:block;font-size:11px;color:var(--muted2)}
+.stat strong{font-size:22px;color:var(--white);font-variant-numeric:tabular-nums}
+.table-wrap{overflow:auto;border:1px solid var(--line);border-radius:12px}
+table{border-collapse:collapse;width:100%;min-width:900px;font-size:13px}
+th,td{padding:11px 12px;text-align:left;border-bottom:1px solid var(--line);vertical-align:top}
+th{font-size:10.5px;color:var(--muted2);background:#0f0f11;text-transform:uppercase;letter-spacing:.08em}
+tr:last-child td{border-bottom:0}
+td small{display:block;color:var(--muted2);margin-top:3px}
+.job-title{font-weight:700;color:var(--white);text-decoration:none}
+.job-title:hover{color:var(--accent2)}
+.source{background:var(--panel2);border:1px solid var(--line);color:var(--muted);padding:2px 8px;
+border-radius:99px;font-size:11px}
+select{min-width:150px;margin:0;padding:7px}
+summary{cursor:pointer;color:var(--muted);font-size:13px}
+.description{max-width:360px;max-height:220px;overflow:auto;padding:8px 0;font-size:12.5px;color:var(--muted)}
+details textarea{min-width:230px}
+.history{color:var(--muted);font-size:12.5px;padding-left:18px}
+.notice{padding:11px 14px;border-radius:10px;margin-bottom:16px;font-size:13px;font-weight:600;
+border:1px solid var(--line2);background:var(--panel2)}
+.notice-ok{border-color:var(--ok);color:#8fd6a6;background:rgba(78,163,107,.1)}
+.notice-info{border-color:var(--info);color:#9ec9ff;background:rgba(63,111,158,.12)}
+.notice-error{border-color:var(--err);color:#f0a0a0;background:rgba(194,84,77,.12)}
+.notice-warn{border-color:var(--warn);color:#f0c674;background:rgba(185,138,58,.1)}
+.analysis-badge{display:inline-block;padding:3px 10px;border-radius:999px;font-size:11.5px;font-weight:700;margin:6px 0}
+.analysis-ok{background:rgba(78,163,107,.16);color:#8fd6a6}
+.analysis-info{background:rgba(63,111,158,.2);color:#9ec9ff}
+.analysis-error{background:rgba(194,84,77,.2);color:#f0a0a0}
+.analysis-none{background:var(--panel2);color:var(--muted)}
+.analysis-error-text{color:#f0a0a0;font-size:12.5px;margin:8px 0}
+.resume-card{border:1px solid var(--line);border-radius:12px;padding:16px;background:var(--panel2)}
+.resume-dossier summary{color:var(--muted)}
+.resume-dossier-scroll{background:#0e0e10}
+.log-console{font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:#08080a;
+color:#c9c9d1;border:1px solid var(--line);border-radius:10px;padding:12px;max-height:600px;overflow:auto}
+.log-line{display:grid;grid-template-columns:128px 66px 104px 1fr;gap:10px;padding:5px 0;border-bottom:1px solid #141417}
+.log-time{color:var(--muted2)}
+.log-level{font-weight:700;text-transform:uppercase}
+.log-source{color:var(--muted)}
+.log-msg{color:#d6d6de;white-space:pre-wrap;word-break:break-word}
+.log-info .log-level{color:#9ec9ff}
+.log-success .log-level{color:#8fd6a6}
+.log-warning .log-level{color:#f0c674}
+.log-error .log-level{color:#f0a0a0}
+.log-debug .log-level{color:var(--muted2)}
+.log-empty{color:var(--muted2);padding:18px 8px}
+.queue-status{display:inline-block;padding:3px 8px;border-radius:999px;font-size:11px;font-weight:700}
+.queue-pending,.queue-retry_wait{background:rgba(63,111,158,.2);color:#9ec9ff}
+.queue-running{background:rgba(78,163,107,.16);color:#8fd6a6}
+.queue-succeeded{background:rgba(78,163,107,.16);color:#8fd6a6}
+.queue-failed{background:rgba(194,84,77,.2);color:#f0a0a0}
+.queue-cancelled{background:var(--panel2);color:var(--muted)}
+.worth-list{display:grid;gap:14px}
+.worth-card{border:1px solid var(--line);border-radius:12px;padding:15px;background:var(--panel)}
+.worth-head{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap}
+.worth-pager{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin:8px 0 14px}
+.tab-panel{display:none}
+.tab-panel.active{display:block}
+.subtle{color:var(--muted)}
+@media(max-width:900px){.log-line{grid-template-columns:1fr;gap:2px}}
+@media(max-width:820px){.shell{grid-template-columns:1fr}.sidebar{position:static;height:auto}
+.top{grid-template-columns:1fr}.stats{grid-template-columns:repeat(2,1fr)}
+.form-grid{grid-template-columns:1fr}}"""
 
 def render_page(notice: str = "", notice_kind: str = "success") -> str:
     """Monta o painel local: preferências, controles, histórico e vagas capturadas."""
@@ -2546,60 +2669,55 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
         f'{" hidden" if not notice else ""}>'
         f"{esc(notice) if notice else ''}</div>"
     )
-    return f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Radar de Vagas</title><style>
-      :root{{--ink:#172b36;--muted:#62747d;--line:#dce5e8;--paper:#f4f7f7;--teal:#0b786d;--mint:#d8f0e9;--white:#fff}}*{{box-sizing:border-box}}body{{margin:0;background:var(--paper);color:var(--ink);font:15px/1.5 Inter,Segoe UI,Arial,sans-serif}}header{{background:#102d35;color:white;padding:28px max(24px,calc((100vw - 1280px)/2));display:flex;justify-content:space-between;align-items:center}}h1{{font-size:25px;margin:0}}header p{{margin:5px 0 0;color:#c1d4d6}}main{{max-width:1280px;margin:26px auto;padding:0 24px}}.top{{display:grid;grid-template-columns:1.3fr .7fr;gap:18px}}.panel,.stat,.table-wrap{{background:white;border:1px solid var(--line);border-radius:13px}}.panel{{padding:20px}}h2{{font-size:18px;margin:0 0 14px}}.form-grid{{display:grid;grid-template-columns:1fr 1fr;gap:12px}}label{{display:block;color:var(--muted);font-size:13px;font-weight:600}}input,textarea,select{{font:inherit;color:var(--ink);width:100%;margin-top:5px;padding:9px 10px;border:1px solid #cdd9dc;border-radius:8px;background:white}}.hint{{color:var(--muted);font-size:12px;margin:10px 0}}button{{border:0;border-radius:8px;padding:10px 15px;background:var(--teal);color:white;font-weight:650;cursor:pointer}}button.stop{{background:#a74639}}button.subtle{{padding:7px 10px;background:#eaf2f1;color:var(--ink);margin-top:6px}}.actions{{display:flex;gap:9px;margin-top:12px;align-items:center}}.runtime{{color:var(--muted);font-size:13px}}.stats{{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin:18px 0}}.stat{{padding:13px 15px}}.stat span{{display:block;font-size:12px;color:var(--muted)}}.stat strong{{font-size:23px}}.table-wrap{{overflow:auto}}table{{border-collapse:collapse;width:100%;min-width:950px}}th,td{{padding:13px 12px;text-align:left;border-bottom:1px solid var(--line);vertical-align:top}}th{{font-size:12px;color:var(--muted);background:#f8fafa}}td small{{display:block;color:var(--muted);margin-top:3px}}.job-title{{font-weight:700;color:#145d59;text-decoration:none}}.job-title:hover{{text-decoration:underline}}.source{{background:var(--mint);padding:3px 7px;border-radius:99px;font-size:12px}}select{{min-width:150px;margin:0;padding:7px}}summary{{cursor:pointer;color:var(--teal);font-size:13px}}.description{{max-width:350px;max-height:220px;overflow:auto;padding:8px 0;font-size:13px}}details textarea{{min-width:230px}}.history{{color:var(--muted);font-size:13px;padding-left:20px}}.notice{{padding:10px 13px;border-radius:8px;margin-bottom:15px}}.notice-ok{{background:#e7f4ed;border:1px solid #b7dfc8}}.notice-info{{background:#e8f1f8;border:1px solid #b7d0e6}}.notice-error{{background:#fceaea;border:1px solid #e3b0b0;color:#6b2a2a}}.notice-warn{{background:#fff6e5;border:1px solid #e6d0a0}}.analysis-badge{{display:inline-block;padding:4px 10px;border-radius:999px;font-size:12px;font-weight:700;margin:10px 0 6px}}.analysis-ok{{background:#d8f0e9;color:#0b5c52}}.analysis-info{{background:#dceaf6;color:#1d4f74}}.analysis-error{{background:#f6d6d6;color:#7a2424}}.analysis-none{{background:#eceff1;color:#526066}}.analysis-error-text{{color:#7a2424;font-size:13px;margin:8px 0}}.resume-card{{border:1px solid var(--line);border-radius:10px;padding:14px;background:#fbfcfc}}.tabs{{display:flex;gap:8px;margin:0 0 16px}}.tab{{background:#e7eeef;color:var(--ink);padding:9px 16px;border-radius:999px;font-weight:650;cursor:pointer}}.tab.active{{background:var(--teal);color:white}}.tab-panel{{display:none}}.tab-panel.active{{display:block}}.log-console{{font:12.5px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:#0f1c22;color:#d7e6ea;border-radius:10px;padding:12px;max-height:620px;overflow:auto}}.log-line{{display:grid;grid-template-columns:132px 72px 110px 1fr;gap:10px;padding:5px 0;border-bottom:1px solid #1e323b}}.log-time{{color:#8eacb6}}.log-level{{font-weight:700;text-transform:uppercase}}.log-source{{color:#7ec8c0}}.log-msg{{color:#e8f3f5;white-space:pre-wrap;word-break:break-word}}.log-info .log-level{{color:#9ec9ff}}.log-success .log-level{{color:#7ddea8}}.log-warning .log-level{{color:#f0c674}}.log-error .log-level{{color:#f0a0a0}}.log-debug .log-level{{color:#9aa7ad}}.log-empty{{color:#9bb0b8;padding:18px 8px}}.queue-status{{display:inline-block;padding:3px 8px;border-radius:999px;font-size:12px;font-weight:700}}.queue-pending,.queue-retry_wait{{background:#dceaf6;color:#1d4f74}}.queue-running{{background:#d8f0e9;color:#0b5c52}}.queue-succeeded{{background:#e7f4ed;color:#1f6b45}}.queue-failed{{background:#f6d6d6;color:#7a2424}}.queue-cancelled{{background:#eceff1;color:#526066}}.worth-list{{display:grid;gap:14px}}.worth-card{{border:1px solid var(--line);border-radius:12px;padding:14px;background:#fbfcfc}}.worth-head{{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap}}.worth-pager{{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin:8px 0 14px}}@media(max-width:900px){{.log-line{{grid-template-columns:1fr;gap:2px}}}}@media(max-width:800px){{.top{{grid-template-columns:1fr}}.stats{{grid-template-columns:repeat(2,1fr)}}header{{padding:20px 24px}}.form-grid{{grid-template-columns:1fr}}}}
-      </style></head><body><header><div><h1>Radar de Vagas</h1><p>Busca, seleção e candidaturas automáticas</p></div><span id="collector-state">{esc(state_label)}</span></header><main>{notice_html}<nav class="tabs" aria-label="Seções do painel"><button type="button" class="tab active" data-tab="painel">Painel</button><button type="button" class="tab" data-tab="vale">Vale a pena olhar</button><button type="button" class="tab" data-tab="filas">Filas</button><button type="button" class="tab" data-tab="logs">Logs</button></nav><div id="tab-painel" class="tab-panel active"><div class="top"><section class="panel"><h2>Preferências de busca</h2><form method="post" action="/settings"><div class="form-grid"><label>Cargos e termos, separados por vírgula<textarea name="keywords" rows="3">{esc(cfg.get('keywords',''))}</textarea></label><label>Países/regiões aceitos<textarea name="locations" rows="3">{esc(cfg.get('locations',''))}</textarea></label><label>Fontes: remotive, remoteok, adzuna, apify<input name="sources" value="{esc(cfg.get('sources',''))}"></label><label>Intervalo de busca (minutos)<input name="interval_minutes" type="number" min="5" value="{esc(cfg.get('interval_minutes','15'))}"></label><label>Países Adzuna (ex.: br,us,gb,ca)<input name="adzuna_countries" value="{esc(cfg.get('adzuna_countries','br,us,gb,ca'))}"></label><label>Limite mensal Apify (USD)<input name="apify_monthly_credit_limit_usd" type="number" min="0" step="0.01" value="{esc(cfg.get('apify_monthly_credit_limit_usd','5'))}"></label><label>Máximo de vagas por ciclo Apify<input name="apify_job_count" type="number" min="1" max="100" value="{esc(cfg.get('apify_job_count','25'))}"></label><label style="grid-column:1/-1">Actors Apify (JSON — um ou mais scrapers)<textarea name="apify_actors_json" rows="8" style="font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px">{esc(cfg.get('apify_actors_json',''))}</textarea></label></div><p class="hint">Cada actor: <code>id</code>, <code>label</code>, <code>enabled</code>, <code>input_mode</code> (<code>linkedin_search</code> ou <code>custom</code>), <code>count</code> opcional. Em <code>linkedin_search</code>, a IA monta sozinha keywords + f_E (nível) + f_WT (remote/híbrido) a partir do currículo (cache até reanalisar). Em <code>custom</code>, use <code>input_template</code> com placeholders <code>{{keyword}}</code>, <code>{{location}}</code>, <code>{{count}}</code>, <code>{{keywords}}</code>.</p><div id="linkedin-filter-slot">{linkedin_filter_view}</div><button>Salvar preferências</button></form><div class="actions"><form method="post" action="/start" class="js-process-form"><button>Iniciar bot</button></form><form method="post" action="/stop" class="js-process-form"><button class="stop">Parar bot</button></form><span class="runtime" id="runtime-message">{esc(status['message'])}</span><span class="runtime" id="next-run-timer" style="margin-left:12px;font-variant-numeric:tabular-nums">{esc(next_run_timer_text)}</span></div></section><section class="panel"><h2>Execuções recentes</h2><ul class="history" id="run-history">{history}</ul></section></div><section class="panel" style="margin-top:18px"><h2>Currículos (PDF)</h2>{resume_panel}<p class="hint">O seletor de arquivos do sistema abre ao escolher o PDF. A análise agora gera um dossiê completo (skills, experiências, projetos). Use <em>Reanalisar</em> para regenerar com o prompt enriquecido.</p></section>
-<section class="panel" style="margin-top:18px"><h2>Perfil, SMTP e automação</h2><form method="post" action="/ai-settings"><div class="form-grid"><label>Provedor de IA<select name="ai_provider"><option value="gemini" {'selected' if cfg.get('ai_provider') == 'gemini' else ''}>Gemini</option><option value="openai" {'selected' if cfg.get('ai_provider') == 'openai' else ''}>OpenAI</option></select></label><label>Modelo<input name="ai_model" value="{esc(cfg.get('ai_model','gemini-2.5-flash'))}"></label><label>Motor de navegador<select name="browser_engine"><option value="pydoll" {'selected' if cfg.get('browser_engine','pydoll') == 'pydoll' else ''}>Pydoll (CDP, stealth — padrão)</option><option value="playwright" {'selected' if cfg.get('browser_engine','pydoll') == 'playwright' else ''}>Playwright (fallback)</option></select></label><label>Seu nome<input name="candidate_name" value="{esc(cfg.get('candidate_name',''))}"></label><label>E-mail<input name="candidate_email" value="{esc(cfg.get('candidate_email',''))}"></label><label>Telefone<input name="candidate_phone" value="{esc(cfg.get('candidate_phone',''))}"></label><label>LinkedIn<input name="candidate_linkedin" value="{esc(cfg.get('candidate_linkedin',''))}"></label><label>Cidade<input name="candidate_city" value="{esc(cfg.get('candidate_city',''))}"></label><label>Chave de IA (vazio mantém a salva)<input type="password" name="api_key" autocomplete="new-password"></label><label>Fatos profissionais em português<textarea name="candidate_facts_pt" rows="3">{esc(cfg.get('candidate_facts_pt',''))}</textarea></label><label>Professional facts in English<textarea name="candidate_facts_en" rows="3">{esc(cfg.get('candidate_facts_en',''))}</textarea></label><label>Score mínimo (%)<input name="minimum_match_score" type="number" min="0" max="100" value="{esc(cfg.get('minimum_match_score','80'))}"></label><label>Workers da fila (vagas em paralelo)<input name="queue_max_workers" type="number" min="1" max="8" value="{esc(cfg.get('queue_max_workers','3'))}"></label><label>Máx. tentativas por job<input name="queue_max_attempts" type="number" min="1" max="200" value="{esc(cfg.get('queue_max_attempts','40'))}"></label><label>TTL da fila (horas)<input name="queue_ttl_hours" type="number" min="1" max="168" value="{esc(cfg.get('queue_ttl_hours','24'))}"></label><label>Adzuna App ID<input name="adzuna_app_id" value=""></label><label>Adzuna API key<input type="password" name="adzuna_app_key" value=""></label><label>Token Apify<input type="password" name="apify_token" value="" autocomplete="new-password"></label></div><label style="margin:12px 0"><input type="checkbox" name="auto_apply" value="1" {'checked' if cfg.get('auto_apply') == '1' else ''} style="width:auto"> Ativar triagem e candidatura automáticas (e-mail SMTP, depois formulário público)</label>
-<label style="margin:12px 0"><input type="checkbox" name="linkedin_easy_apply" value="1" {'checked' if cfg.get('linkedin_easy_apply') == '1' else ''} style="width:auto"> Easy Apply LinkedIn <em>assistido</em> (preenche; <strong>você</strong> clica Enviar — o robô nunca envia sozinho)</label>
-<label style="margin:12px 0"><input type="checkbox" name="linkedin_risk_ack" value="1" {'checked' if cfg.get('linkedin_risk_ack') == '1' else ''} style="width:auto"> Li e aceito: automação no LinkedIn pode violar os termos deles e gerar restrição/banimento da conta; uso por minha conta e risco</label>
-<h3 style="margin:16px 0 6px">Perfil de diversidade (respostas suas — nunca a IA decide identidade)</h3>
-<div class="form-grid">
-<label>Gênero<select name="candidate_gender">
-<option value="not_informed" {'selected' if cfg.get('candidate_gender','not_informed') == 'not_informed' else ''}>Prefiro não informar</option>
-<option value="female" {'selected' if cfg.get('candidate_gender') == 'female' else ''}>Mulher</option>
-<option value="male" {'selected' if cfg.get('candidate_gender') == 'male' else ''}>Homem</option>
-<option value="other" {'selected' if cfg.get('candidate_gender') == 'other' else ''}>Outro / não binário</option>
-</select></label>
-<label>Raça/etnia (autodeclarada)<select name="candidate_race">
-<option value="not_informed" {'selected' if cfg.get('candidate_race','not_informed') == 'not_informed' else ''}>Prefiro não informar</option>
-<option value="white" {'selected' if cfg.get('candidate_race') == 'white' else ''}>Branca</option>
-<option value="black" {'selected' if cfg.get('candidate_race') == 'black' else ''}>Preta</option>
-<option value="pardo" {'selected' if cfg.get('candidate_race') == 'pardo' else ''}>Parda</option>
-<option value="asian" {'selected' if cfg.get('candidate_race') == 'asian' else ''}>Amarela/asiática</option>
-<option value="indigenous" {'selected' if cfg.get('candidate_race') == 'indigenous' else ''}>Indígena</option>
-</select></label>
-<label>PCD (deficiência)<select name="candidate_pcd">
-<option value="no" {'selected' if cfg.get('candidate_pcd','no') in ('no','0') else ''}>Não sou PCD</option>
-<option value="yes" {'selected' if cfg.get('candidate_pcd') in ('yes','1') or (cfg.get('candidate_pcd','no') in ('no','') and cfg.get('inhire_pcd') == '1') else ''}>Sou PCD</option>
-<option value="not_informed" {'selected' if cfg.get('candidate_pcd') == 'not_informed' else ''}>Prefiro não informar</option>
-</select></label>
-<label>LGBTQ+ (orientação/identidade)<select name="candidate_lgbtq">
-<option value="not_informed" {'selected' if cfg.get('candidate_lgbtq','not_informed') == 'not_informed' else ''}>Prefiro não informar</option>
-<option value="no" {'selected' if cfg.get('candidate_lgbtq') == 'no' else ''}>Hétero / cis (não)</option>
-<option value="gay" {'selected' if cfg.get('candidate_lgbtq') == 'gay' else ''}>Homossexual / gay</option>
-<option value="lesbian" {'selected' if cfg.get('candidate_lgbtq') == 'lesbian' else ''}>Lésbica</option>
-<option value="bisexual" {'selected' if cfg.get('candidate_lgbtq') == 'bisexual' else ''}>Bissexual</option>
-<option value="pansexual" {'selected' if cfg.get('candidate_lgbtq') == 'pansexual' else ''}>Pansexual</option>
-<option value="asexual" {'selected' if cfg.get('candidate_lgbtq') == 'asexual' else ''}>Assexual</option>
-<option value="other" {'selected' if cfg.get('candidate_lgbtq') == 'other' else ''}>Outra (use a nota)</option>
-<option value="yes" {'selected' if cfg.get('candidate_lgbtq') == 'yes' else ''}>Sou LGBTI+ (genérico)</option>
-</select></label>
+    return f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Radar de Vagas</title>
+<style>{PAGE_CSS}</style></head><body>
+<div class="shell">
+<aside class="sidebar">
+<div class="brand"><strong>Radar de Vagas</strong><small>coleta &middot; triagem &middot; candidaturas</small></div>
+<nav class="tabs" aria-label="Seções do painel">
+<span class="nav-label">Operação</span>
+<button type="button" class="tab active" data-tab="painel">Visão geral</button>
+<button type="button" class="tab" data-tab="vale">Vale a pena olhar</button>
+<button type="button" class="tab" data-tab="filas">Filas de IA</button>
+<button type="button" class="tab" data-tab="logs">Logs</button>
+<span class="nav-label">Configuração</span>
+<button type="button" class="tab" data-tab="busca">Busca &amp; coleta</button>
+<button type="button" class="tab" data-tab="curriculos">Currículos</button>
+<button type="button" class="tab" data-tab="perfil">Perfil &amp; diversidade</button>
+<button type="button" class="tab" data-tab="ia">IA &amp; integrações</button>
+<button type="button" class="tab" data-tab="automacao">Automação &amp; LinkedIn</button>
+<button type="button" class="tab" data-tab="smtp">SMTP</button>
+</nav>
+<div class="sidebar-foot"><span id="collector-state">{esc(state_label)}</span></div>
+</aside>
+<main class="content">{notice_html}
+
+<div id="tab-painel" class="tab-panel active">
+<section class="panel runbar"><div class="actions" style="margin:0"><form method="post" action="/start" class="js-process-form"><button>Iniciar bot</button></form><form method="post" action="/stop" class="js-process-form"><button class="stop">Parar bot</button></form><span class="runtime" id="runtime-message">{esc(status['message'])}</span><span class="runtime" id="next-run-timer" style="margin-left:14px">{esc(next_run_timer_text)}</span></div></section>
+<div class="stats" id="job-stats">{cards}</div>
+<section class="table-wrap"><table><thead><tr><th>Vaga</th><th>Localidade</th><th>Fonte</th><th>Idioma</th><th>Etapa</th><th>Carta e descrição</th><th>Data</th></tr></thead><tbody id="jobs-body">{rows}</tbody></table></section>
+<section class="panel" style="margin-top:18px"><h2>Execuções recentes</h2><ul class="history" id="run-history">{history}</ul></section>
 </div>
-<label>Nota livre p/ perguntas de diversidade fora das opções<textarea name="candidate_diversity_note" rows="2">{esc(cfg.get('candidate_diversity_note',''))}</textarea></label>
-<p class="hint">Esses valores respondem perguntas de diversidade (radio/select/checkbox) nos formulários. "Prefiro não informar" deixa a pergunta em branco para você no Chrome — o robô não chuta. Perguntas da empresa <em>sem</em> relação com identidade (skills, disponibilidade…) são respondidas pela IA usando a análise do currículo, com cache por pergunta parecida.</p>
-<label>Máx. Easy Apply / dia (teto 8)<input name="linkedin_max_per_day" type="number" min="1" max="8" value="{esc(cfg.get('linkedin_max_per_day','3'))}"></label>
-<label>Intervalo mínimo entre vagas (min, mín. 5)<input name="linkedin_min_gap_minutes" type="number" min="5" max="180" value="{esc(cfg.get('linkedin_min_gap_minutes','12'))}"></label>
-<label>Tempo para você revisar/enviar no Chrome (min)<input name="linkedin_human_wait_minutes" type="number" min="3" max="45" value="{esc(cfg.get('linkedin_human_wait_minutes','12'))}"></label>
-<label>Tempo para login manual no Chrome (min)<input name="linkedin_login_wait_minutes" type="number" min="5" max="60" value="{esc(cfg.get('linkedin_login_wait_minutes','25'))}"></label>
-<label style="margin:12px 0"><input type="checkbox" name="inhire_pcd" value="1" {'checked' if cfg.get('inhire_pcd') == '1' else ''} style="width:auto"> InHire: candidatar como PCD (diversidade)</label>
-<label>Perfil Chrome dedicado (vazio = <code>linkedin_browser_profile</code> — <strong>não</strong> use o perfil do dia a dia)<input name="linkedin_chrome_profile" value="{esc(cfg.get('linkedin_chrome_profile') or '')}" placeholder="{esc(default_profile_dir(ROOT))}"></label>
-<p class="hint">Chaves no cofre do sistema. LinkedIn assistido: Easy Apply <em>ou</em> Apply externo (ex.: InHire) — 1 vaga por vez, limites diários, checkpoint/captcha com você. Na regra de formulário <code>salary</code>, preencha o valor da pretensão (InHire). Sem o aceite de risco, Easy Apply não roda.</p>
-<button>Salvar perfil e IA</button></form></section>
-<section class="panel" style="margin-top:18px"><h2>SMTP</h2><form method="post" action="/smtp-settings"><div class="form-grid"><label>Host<input name="smtp_host" value="{esc(cfg.get('smtp_host',''))}"></label><label>Porta<input name="smtp_port" type="number" value="{esc(cfg.get('smtp_port','587'))}"></label><label>Usuário<input name="smtp_user" value="{esc(cfg.get('smtp_user',''))}"></label><label>Remetente (From)<input name="smtp_from" value="{esc(cfg.get('smtp_from',''))}"></label><label>Senha (vazio mantém)<input type="password" name="smtp_password" autocomplete="new-password"></label><label>TLS<select name="smtp_use_tls"><option value="1" {'selected' if cfg.get('smtp_use_tls','1')=='1' else ''}>Sim (STARTTLS)</option><option value="0" {'selected' if cfg.get('smtp_use_tls')=='0' else ''}>Não</option></select></label></div><div class="actions"><button>Salvar SMTP</button></div></form><form method="post" action="/smtp-test" style="margin-top:8px"><button class="subtle" type="submit">Enviar e-mail de teste</button></form></section>
-<section class="panel" style="margin-top:18px"><h2>Regras de formulário (navegador)</h2><form method="post" action="/profile-settings">{rules_panel}<p class="hint">Para selects (ex.: salário), coloque em "Valor fixo" o texto da opção preferida. Perguntas abertas sem regra usam a IA; se não houver tokens, a vaga é pulada.</p><button>Salvar regras</button></form></section><div class="stats" id="job-stats">{cards}</div><section class="table-wrap"><table><thead><tr><th>Vaga</th><th>Localidade</th><th>Fonte</th><th>Idioma</th><th>Etapa</th><th>Carta e descrição</th><th>Data</th></tr></thead><tbody id="jobs-body">{rows}</tbody></table></section></div>
-<div id="tab-vale" class="tab-panel"><section class="panel"><h2 style="margin-top:0">Vale a pena olhar</h2><p class="hint">Vagas com bom match em LinkedIn (Easy Apply desligado/falhou) ou em que e-mail/formulário automático não funcionou. Em vagas LinkedIn, use <strong>Easy Apply</strong> para preencher sem nova busca — você confirma o envio no Chrome.</p><div id="worth-body">{worth_view}</div></section></div>
-<div id="tab-filas" class="tab-panel"><section class="panel"><h2 style="margin-top:0">Filas de IA (async + retry)</h2><p class="hint">Análise de currículo e candidaturas rodam em paralelo (até 3 workers). Em fila/rate-limit da API, o job entra em retry automático até sucesso, expirar (24h) ou cancelar.</p><div id="queue-body">{queue_view}</div></section></div>
-<div id="tab-logs" class="tab-panel"><section class="panel"><div class="actions" style="justify-content:space-between;margin-top:0"><h2 style="margin:0">Logs do processo</h2><form method="post" action="/clear-logs" class="js-process-form"><button class="subtle" type="submit">Limpar logs</button></form></div><p class="hint">Atualiza automaticamente. Mostra coleta, análise de currículo, triagem da IA, SMTP e navegador.</p><div id="logs-body" class="log-console">{logs_view}</div></section></div></main>
+
+<div id="tab-busca" class="tab-panel"><section class="panel"><h2>Busca &amp; coleta</h2><form method="post" action="/settings"><div class="form-grid"><label>Cargos e termos, separados por vírgula<textarea name="keywords" rows="3">{esc(cfg.get('keywords',''))}</textarea></label><label>Países/regiões aceitos<textarea name="locations" rows="3">{esc(cfg.get('locations',''))}</textarea></label><label>Fontes: remotive, remoteok, adzuna, apify<input name="sources" value="{esc(cfg.get('sources',''))}"></label><label>Intervalo de busca (minutos)<input name="interval_minutes" type="number" min="5" value="{esc(cfg.get('interval_minutes','15'))}"></label><label>Países Adzuna (ex.: br,us,gb,ca)<input name="adzuna_countries" value="{esc(cfg.get('adzuna_countries','br,us,gb,ca'))}"></label><label>Limite mensal Apify (USD)<input name="apify_monthly_credit_limit_usd" type="number" min="0" step="0.01" value="{esc(cfg.get('apify_monthly_credit_limit_usd','5'))}"></label><label>Máximo de vagas por ciclo Apify<input name="apify_job_count" type="number" min="1" max="100" value="{esc(cfg.get('apify_job_count','25'))}"></label><label style="grid-column:1/-1">Actors Apify (JSON — um ou mais scrapers)<textarea name="apify_actors_json" rows="8" style="font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px">{esc(cfg.get('apify_actors_json',''))}</textarea></label></div><p class="hint">Cada actor: <code>id</code>, <code>label</code>, <code>enabled</code>, <code>input_mode</code> (<code>linkedin_search</code> ou <code>custom</code>), <code>count</code> opcional. Em <code>linkedin_search</code>, a IA monta sozinha keywords + f_E (nível) + f_WT (remote/híbrido) a partir do currículo (cache até reanalisar). Em <code>custom</code>, use <code>input_template</code> com placeholders <code>{{keyword}}</code>, <code>{{location}}</code>, <code>{{count}}</code>, <code>{{keywords}}</code>.</p><div id="linkedin-filter-slot">{linkedin_filter_view}</div><button>Salvar preferências</button></form></section></div>
+
+<div id="tab-curriculos" class="tab-panel"><section class="panel"><h2>Currículos (PDF)</h2>{resume_panel}<p class="hint">O seletor de arquivos do sistema abre ao escolher o PDF. A análise agora gera um dossiê completo (skills, experiências, projetos). Use <em>Reanalisar</em> para regenerar com o prompt enriquecido.</p></section></div>
+
+<div id="tab-perfil" class="tab-panel"><section class="panel"><h2>Perfil &amp; diversidade</h2><form method="post" action="/candidate-settings"><h3 style="margin:0 0 12px;color:var(--muted)">Dados pessoais</h3><div class="form-grid"><label>Seu nome<input name="candidate_name" value="{esc(cfg.get('candidate_name',''))}"></label><label>E-mail<input name="candidate_email" value="{esc(cfg.get('candidate_email',''))}"></label><label>Telefone<input name="candidate_phone" value="{esc(cfg.get('candidate_phone',''))}"></label><label>LinkedIn<input name="candidate_linkedin" value="{esc(cfg.get('candidate_linkedin',''))}"></label><label>Cidade<input name="candidate_city" value="{esc(cfg.get('candidate_city',''))}"></label><label>CPF<input name="candidate_cpf" value="{esc(cfg.get('candidate_cpf',''))}" placeholder="000.000.000-00"></label></div><h3 style="margin:20px 0 12px;color:var(--muted)">Pretensão salarial &amp; contratação</h3><div class="form-grid"><label>Pretensão base — CLT (BRL)<input name="salary_expectation_brl" value="{esc(cfg.get('salary_expectation_brl',''))}" placeholder="ex.: 6000"></label><label>Pretensão (USD)<input name="salary_expectation_usd" value="{esc(cfg.get('salary_expectation_usd',''))}" placeholder="ex.: 80000"></label><label>Moeda da pretensão<select name="salary_currency_preference"><option value="auto" {'selected' if cfg.get('salary_currency_preference','auto')=='auto' else ''}>Detectar na página (padrão)</option><option value="BRL" {'selected' if cfg.get('salary_currency_preference')=='BRL' else ''}>Sempre BRL (R$)</option><option value="USD" {'selected' if cfg.get('salary_currency_preference')=='USD' else ''}>Sempre USD ($)</option></select></label><label>Multiplicador PJ (só BRL)<input name="salary_pj_multiplier" value="{esc(cfg.get('salary_pj_multiplier','1.3'))}" placeholder="ex.: 1.3" step="0.05" min="1"></label><label>Tipo de contratação preferido<select name="candidate_contract_type"><option value="employee" {'selected' if cfg.get('candidate_contract_type','employee')=='employee' else ''}>Employee (CLT / efetivo)</option><option value="contractor" {'selected' if cfg.get('candidate_contract_type')=='contractor' else ''}>Contractor (PJ / autônomo)</option><option value="ask" {'selected' if cfg.get('candidate_contract_type')=='ask' else ''}>Perguntar — deixar comigo no Chrome</option></select></label></div><p class="hint">A pretensão usa o valor BRL ou USD conforme a moeda do campo na vaga (placeholder <code>R$</code> vs <code>$</code>). O valor <strong>BRL é a base CLT</strong>: se a contratação preferida for <strong>PJ/Contractor</strong>, ele é multiplicado pelo <strong>multiplicador PJ</strong> (aceita decimal; só em reais — USD nunca é multiplicado). O radio Contractor/Employee segue a preferência (com "Perguntar" o robô deixa você decidir).</p><h3 style="margin:22px 0 12px;color:var(--muted)">Perfil de diversidade (a IA nunca decide identidade)</h3><div class="form-grid"><label>Gênero<select name="candidate_gender"><option value="not_informed" {'selected' if cfg.get('candidate_gender','not_informed') == 'not_informed' else ''}>Prefiro não informar</option><option value="female" {'selected' if cfg.get('candidate_gender') == 'female' else ''}>Mulher</option><option value="male" {'selected' if cfg.get('candidate_gender') == 'male' else ''}>Homem</option><option value="other" {'selected' if cfg.get('candidate_gender') == 'other' else ''}>Outro / não binário</option></select></label><label>Raça/etnia (autodeclarada)<select name="candidate_race"><option value="not_informed" {'selected' if cfg.get('candidate_race','not_informed') == 'not_informed' else ''}>Prefiro não informar</option><option value="white" {'selected' if cfg.get('candidate_race') == 'white' else ''}>Branca</option><option value="black" {'selected' if cfg.get('candidate_race') == 'black' else ''}>Preta</option><option value="pardo" {'selected' if cfg.get('candidate_race') == 'pardo' else ''}>Parda</option><option value="asian" {'selected' if cfg.get('candidate_race') == 'asian' else ''}>Amarela/asiática</option><option value="indigenous" {'selected' if cfg.get('candidate_race') == 'indigenous' else ''}>Indígena</option></select></label><label>PCD (deficiência)<select name="candidate_pcd"><option value="no" {'selected' if cfg.get('candidate_pcd','no') in ('no','0') else ''}>Não sou PCD</option><option value="yes" {'selected' if cfg.get('candidate_pcd') in ('yes','1') or (cfg.get('candidate_pcd','no') in ('no','') and cfg.get('inhire_pcd') == '1') else ''}>Sou PCD</option><option value="not_informed" {'selected' if cfg.get('candidate_pcd') == 'not_informed' else ''}>Prefiro não informar</option></select></label><label>LGBTQ+ (orientação/identidade)<select name="candidate_lgbtq"><option value="not_informed" {'selected' if cfg.get('candidate_lgbtq','not_informed') == 'not_informed' else ''}>Prefiro não informar</option><option value="no" {'selected' if cfg.get('candidate_lgbtq') == 'no' else ''}>Hétero / cis (não)</option><option value="gay" {'selected' if cfg.get('candidate_lgbtq') == 'gay' else ''}>Homossexual / gay</option><option value="lesbian" {'selected' if cfg.get('candidate_lgbtq') == 'lesbian' else ''}>Lésbica</option><option value="bisexual" {'selected' if cfg.get('candidate_lgbtq') == 'bisexual' else ''}>Bissexual</option><option value="pansexual" {'selected' if cfg.get('candidate_lgbtq') == 'pansexual' else ''}>Pansexual</option><option value="asexual" {'selected' if cfg.get('candidate_lgbtq') == 'asexual' else ''}>Assexual</option><option value="other" {'selected' if cfg.get('candidate_lgbtq') == 'other' else ''}>Outra (use a nota)</option><option value="yes" {'selected' if cfg.get('candidate_lgbtq') == 'yes' else ''}>Sou LGBTI+ (genérico)</option></select></label></div><label style="margin-top:14px">Nota livre p/ perguntas de diversidade fora das opções<textarea name="candidate_diversity_note" rows="2">{esc(cfg.get('candidate_diversity_note',''))}</textarea></label><p class="hint">Esses valores respondem perguntas de diversidade (radio/select/checkbox). "Prefiro não informar" deixa a pergunta em branco para você no Chrome — o robô não chuta. Perguntas da empresa <em>sem</em> relação com identidade são respondidas pela IA com a análise do currículo.</p><button style="margin-top:16px">Salvar perfil</button></form></section></div>
+
+<div id="tab-ia" class="tab-panel"><section class="panel"><h2>IA &amp; integrações</h2><form method="post" action="/ai-settings"><div class="form-grid"><label>Provedor de IA<select name="ai_provider"><option value="gemini" {'selected' if cfg.get('ai_provider') == 'gemini' else ''}>Gemini</option><option value="openai" {'selected' if cfg.get('ai_provider') == 'openai' else ''}>OpenAI</option></select></label><label>Modelo<input name="ai_model" value="{esc(cfg.get('ai_model','gemini-2.5-flash'))}"></label><label>Motor de navegador<select name="browser_engine"><option value="pydoll" {'selected' if cfg.get('browser_engine','pydoll') == 'pydoll' else ''}>Pydoll (CDP, stealth — padrão)</option><option value="playwright" {'selected' if cfg.get('browser_engine','pydoll') == 'playwright' else ''}>Playwright (fallback)</option></select></label><label>Chave de IA (vazio mantém a salva)<input type="password" name="api_key" autocomplete="new-password"></label><label>Adzuna App ID<input name="adzuna_app_id" value=""></label><label>Adzuna API key<input type="password" name="adzuna_app_key" value=""></label><label>Token Apify<input type="password" name="apify_token" value="" autocomplete="new-password"></label></div><label style="margin-top:14px">Fatos profissionais em português<textarea name="candidate_facts_pt" rows="3">{esc(cfg.get('candidate_facts_pt',''))}</textarea></label><label style="margin-top:12px">Professional facts in English<textarea name="candidate_facts_en" rows="3">{esc(cfg.get('candidate_facts_en',''))}</textarea></label><p class="hint">Chaves vão para o cofre do sistema. Os fatos alimentam a IA nas perguntas abertas e de opções.</p><button style="margin-top:14px">Salvar IA e integrações</button></form></section><section class="panel"><h2>Regras de formulário (navegador)</h2><form method="post" action="/profile-settings">{rules_panel}<p class="hint">Modo <code>salary</code> escolhe automaticamente BRL×USD pela moeda do campo e aplica o multiplicador PJ ao valor BRL quando a contratação preferida é PJ; "Valor fixo" só é usado como desempate. No modo <code>select</code>, coloque em "Valor fixo" o texto da opção preferida. Perguntas abertas sem regra usam a IA.</p><button>Salvar regras</button></form></section></div>
+
+<div id="tab-automacao" class="tab-panel"><section class="panel"><h2>Automação &amp; LinkedIn</h2><form method="post" action="/automation-settings"><label style="margin:0 0 12px;display:flex;gap:8px;align-items:flex-start"><input type="checkbox" name="auto_apply" value="1" {'checked' if cfg.get('auto_apply') == '1' else ''} style="width:auto;margin-top:3px"> <span>Ativar triagem e candidatura automáticas (e-mail SMTP, depois formulário público)</span></label><label style="margin:0 0 12px;display:flex;gap:8px;align-items:flex-start"><input type="checkbox" name="linkedin_easy_apply" value="1" {'checked' if cfg.get('linkedin_easy_apply') == '1' else ''} style="width:auto;margin-top:3px"> <span>Easy Apply LinkedIn <em>assistido</em> (preenche; <strong>você</strong> clica Enviar — o robô nunca envia sozinho)</span></label><label style="margin:0 0 18px;display:flex;gap:8px;align-items:flex-start"><input type="checkbox" name="linkedin_risk_ack" value="1" {'checked' if cfg.get('linkedin_risk_ack') == '1' else ''} style="width:auto;margin-top:3px"> <span>Li e aceito: automação no LinkedIn pode violar os termos deles e gerar restrição/banimento; uso por minha conta e risco</span></label><div class="form-grid"><label>Score mínimo (%)<input name="minimum_match_score" type="number" min="0" max="100" value="{esc(cfg.get('minimum_match_score','80'))}"></label><label>Workers da fila (vagas em paralelo)<input name="queue_max_workers" type="number" min="1" max="8" value="{esc(cfg.get('queue_max_workers','3'))}"></label><label>Máx. tentativas por job<input name="queue_max_attempts" type="number" min="1" max="200" value="{esc(cfg.get('queue_max_attempts','40'))}"></label><label>TTL da fila (horas)<input name="queue_ttl_hours" type="number" min="1" max="168" value="{esc(cfg.get('queue_ttl_hours','24'))}"></label><label>Máx. Easy Apply / dia (teto 8)<input name="linkedin_max_per_day" type="number" min="1" max="8" value="{esc(cfg.get('linkedin_max_per_day','3'))}"></label><label>Intervalo mínimo entre vagas (min, mín. 5)<input name="linkedin_min_gap_minutes" type="number" min="5" max="180" value="{esc(cfg.get('linkedin_min_gap_minutes','12'))}"></label><label>Tempo para você revisar/enviar (min)<input name="linkedin_human_wait_minutes" type="number" min="3" max="45" value="{esc(cfg.get('linkedin_human_wait_minutes','12'))}"></label><label>Tempo para login manual (min)<input name="linkedin_login_wait_minutes" type="number" min="5" max="60" value="{esc(cfg.get('linkedin_login_wait_minutes','25'))}"></label><label>Perfil Chrome dedicado<input name="linkedin_chrome_profile" value="{esc(cfg.get('linkedin_chrome_profile') or '')}" placeholder="{esc(default_profile_dir(ROOT))}"></label></div><label style="margin:14px 0 0;display:flex;gap:8px;align-items:flex-start"><input type="checkbox" name="inhire_pcd" value="1" {'checked' if cfg.get('inhire_pcd') == '1' else ''} style="width:auto;margin-top:3px"> <span>InHire: candidatar como PCD (diversidade)</span></label><p class="hint">LinkedIn assistido: Easy Apply <em>ou</em> Apply externo (ex.: InHire) — 1 vaga por vez, limites diários, checkpoint/captcha com você. Sem o aceite de risco, Easy Apply não roda.</p><button style="margin-top:14px">Salvar automação</button></form></section></div>
+
+<div id="tab-smtp" class="tab-panel"><section class="panel"><h2>SMTP</h2><form method="post" action="/smtp-settings"><div class="form-grid"><label>Host<input name="smtp_host" value="{esc(cfg.get('smtp_host',''))}"></label><label>Porta<input name="smtp_port" type="number" value="{esc(cfg.get('smtp_port','587'))}"></label><label>Usuário<input name="smtp_user" value="{esc(cfg.get('smtp_user',''))}"></label><label>Remetente (From)<input name="smtp_from" value="{esc(cfg.get('smtp_from',''))}"></label><label>Senha (vazio mantém)<input type="password" name="smtp_password" autocomplete="new-password"></label><label>TLS<select name="smtp_use_tls"><option value="1" {'selected' if cfg.get('smtp_use_tls','1')=='1' else ''}>Sim (STARTTLS)</option><option value="0" {'selected' if cfg.get('smtp_use_tls')=='0' else ''}>Não</option></select></label></div><div class="actions"><button>Salvar SMTP</button></div></form><form method="post" action="/smtp-test" style="margin-top:8px"><button class="subtle" type="submit">Enviar e-mail de teste</button></form></section></div>
+
+<div id="tab-vale" class="tab-panel"><section class="panel"><h2>Vale a pena olhar</h2><p class="hint">Vagas com bom match em LinkedIn (Easy Apply desligado/falhou) ou em que e-mail/formulário automático não funcionou. Em vagas LinkedIn, use <strong>Easy Apply</strong> para preencher sem nova busca — você confirma o envio no Chrome.</p><div id="worth-body">{worth_view}</div></section></div>
+
+<div id="tab-filas" class="tab-panel"><section class="panel"><h2>Filas de IA (async + retry)</h2><p class="hint">Análise de currículo e candidaturas rodam em paralelo (até 3 workers). Em fila/rate-limit da API, o job entra em retry automático até sucesso, expirar (24h) ou cancelar.</p><div id="queue-body">{queue_view}</div></section></div>
+
+<div id="tab-logs" class="tab-panel"><section class="panel"><div class="actions" style="justify-content:space-between;margin-top:0"><h2 style="margin:0">Logs do processo</h2><form method="post" action="/clear-logs" class="js-process-form"><button class="subtle" type="submit">Limpar logs</button></form></div><p class="hint">Atualiza automaticamente. Mostra coleta, análise de currículo, triagem da IA, SMTP e navegador.</p><div id="logs-body" class="log-console">{logs_view}</div></section></div>
+
+</main></div>
 <script>
 (function () {{
   var inFlight = false;
@@ -3080,15 +3198,11 @@ class Handler(BaseHTTPRequestHandler):
             save_settings(form)
             log_event("info", "settings", "Preferências de busca salvas.")
             self.redirect("Filtros salvos.")
+        elif path == "/candidate-settings":
+            save_settings(form)
+            log_event("info", "settings", "Perfil do candidato salvo (dados, salário, diversidade).")
+            self.redirect("Perfil salvo.")
         elif path == "/ai-settings":
-            if "auto_apply" not in form:
-                form["auto_apply"] = "0"
-            if "linkedin_easy_apply" not in form:
-                form["linkedin_easy_apply"] = "0"
-            if "linkedin_risk_ack" not in form:
-                form["linkedin_risk_ack"] = "0"
-            if "inhire_pcd" not in form:
-                form["inhire_pcd"] = "0"
             # Assisted-only: strip any legacy auto-submit flag if present in DB form posts.
             form.pop("linkedin_stop_before_submit", None)
             save_settings(form)
@@ -3103,14 +3217,28 @@ class Handler(BaseHTTPRequestHandler):
                 log_event("error", "settings", str(exc))
                 self.redirect(str(exc), notice_kind="error")
                 return
+            log_event("info", "settings", f"IA/integrações salvas (provedor={provider}).")
+            self.redirect("IA e integrações salvas.")
+        elif path == "/automation-settings":
+            if "auto_apply" not in form:
+                form["auto_apply"] = "0"
+            if "linkedin_easy_apply" not in form:
+                form["linkedin_easy_apply"] = "0"
+            if "linkedin_risk_ack" not in form:
+                form["linkedin_risk_ack"] = "0"
+            if "inhire_pcd" not in form:
+                form["inhire_pcd"] = "0"
+            # Assisted-only: strip any legacy auto-submit flag if present in DB form posts.
+            form.pop("linkedin_stop_before_submit", None)
+            save_settings(form)
             log_event(
                 "info",
                 "settings",
-                f"Perfil/IA salvos (auto_apply={form.get('auto_apply')}, "
+                f"Automação salva (auto_apply={form.get('auto_apply')}, "
                 f"linkedin_easy_apply={form.get('linkedin_easy_apply')}, "
                 f"risk_ack={form.get('linkedin_risk_ack')}).",
             )
-            self.redirect("Perfil e integrações salvos.")
+            self.redirect("Automação salva.")
         elif path == "/smtp-settings":
             save_settings({k: form.get(k, "") for k in ("smtp_host", "smtp_port", "smtp_user", "smtp_from", "smtp_use_tls")})
             try:
