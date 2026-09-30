@@ -366,6 +366,13 @@ class JobQueue:
             rows = db.execute("SELECT status, COUNT(*) AS n FROM queue_jobs GROUP BY status").fetchall()
         return {row["status"]: int(row["n"]) for row in rows}
 
+    def _linkedin_running(self, db: sqlite3.Connection) -> bool:
+        row = db.execute(
+            "SELECT 1 FROM queue_jobs WHERE kind=? AND status='running' LIMIT 1",
+            (KIND_LINKEDIN,),
+        ).fetchone()
+        return row is not None
+
     def _claim_batch(self, limit: int) -> list[sqlite3.Row]:
         now = _utc_now()
         now_s = _iso(now)
@@ -377,13 +384,22 @@ class JobQueue:
                    WHERE status IN ('pending','retry_wait') AND expires_at < ?""",
                 (now_s, now_s),
             )
+            linkedin_busy = self._linkedin_running(db)
+            # Fetch extra candidates so filtering Easy Apply still fills worker slots.
+            fetch_n = max(limit * 4, limit + 8)
             rows = db.execute(
                 """SELECT * FROM queue_jobs
                    WHERE status IN ('pending','retry_wait') AND next_run_at <= ?
                    ORDER BY id ASC LIMIT ?""",
-                (now_s, limit),
+                (now_s, fetch_n),
             ).fetchall()
+            claimed_linkedin = False
             for row in rows:
+                if len(claimed) >= limit:
+                    break
+                kind = str(row["kind"])
+                if kind == KIND_LINKEDIN and (linkedin_busy or claimed_linkedin):
+                    continue
                 cur = db.execute(
                     """UPDATE queue_jobs SET status='running', updated_at=?
                        WHERE id=? AND status IN ('pending','retry_wait')""",
@@ -391,6 +407,8 @@ class JobQueue:
                 )
                 if cur.rowcount:
                     claimed.append(row)
+                    if kind == KIND_LINKEDIN:
+                        claimed_linkedin = True
         return claimed
 
     def _dispatch_loop(self) -> None:

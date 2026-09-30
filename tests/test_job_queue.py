@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from job_queue import JobQueue, backoff_seconds, is_retryable_error
+from job_queue import KIND_APPLY, KIND_LINKEDIN, JobQueue, backoff_seconds, is_retryable_error
 
 
 class QueueRetryTests(unittest.TestCase):
@@ -80,6 +80,63 @@ class QueueRetryTests(unittest.TestCase):
         self.assertGreater(len(set(samples)), 1)
         late = [backoff_seconds(10, rate_limited=True) for _ in range(20)]
         self.assertTrue(all(s <= 20 * 60 for s in late))
+
+
+class LinkedInQueueConcurrencyTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db_path = str(Path(self.tmp.name) / "q.db")
+        self.queue = JobQueue(
+            db_path=self.db_path,
+            handlers={
+                KIND_LINKEDIN: lambda payload: "ok",
+                KIND_APPLY: lambda payload: "ok",
+            },
+            get_settings=lambda: {
+                "queue_max_workers": "3",
+                "queue_max_attempts": "5",
+                "queue_ttl_hours": "24",
+            },
+        )
+
+    def tearDown(self) -> None:
+        self.queue.stop()
+        self.tmp.cleanup()
+
+    def test_claim_batch_only_one_linkedin_at_a_time(self) -> None:
+        a = self.queue.enqueue(KIND_LINKEDIN, {"job_id": 1}, dedupe_key="linkedin:1")
+        b = self.queue.enqueue(KIND_LINKEDIN, {"job_id": 2}, dedupe_key="linkedin:2")
+        c = self.queue.enqueue(KIND_APPLY, {"job_id": 3}, dedupe_key="apply:3")
+        claimed = self.queue._claim_batch(3)
+        kinds = [row["kind"] for row in claimed]
+        self.assertEqual(kinds.count(KIND_LINKEDIN), 1)
+        self.assertIn(KIND_APPLY, kinds)
+        claimed_ids = {int(row["id"]) for row in claimed}
+        self.assertTrue(claimed_ids & {a, b})
+        # segundo linkedin permanece pending
+        with self.queue._connect() as db:
+            statuses = {
+                int(r["id"]): r["status"]
+                for r in db.execute(
+                    "SELECT id, status FROM queue_jobs WHERE id IN (?,?,?)", (a, b, c)
+                )
+            }
+        linkedin_running = sum(
+            1 for jid in (a, b) if statuses[jid] == "running"
+        )
+        self.assertEqual(linkedin_running, 1)
+        self.assertEqual(statuses[c], "running")
+
+    def test_claim_skips_linkedin_when_one_already_running(self) -> None:
+        a = self.queue.enqueue(KIND_LINKEDIN, {"job_id": 1}, dedupe_key="linkedin:1")
+        b = self.queue.enqueue(KIND_LINKEDIN, {"job_id": 2}, dedupe_key="linkedin:2")
+        with self.queue._connect() as db:
+            db.execute("UPDATE queue_jobs SET status='running' WHERE id=?", (a,))
+        claimed = self.queue._claim_batch(2)
+        self.assertEqual(claimed, [])
+        with self.queue._connect() as db:
+            row = db.execute("SELECT status FROM queue_jobs WHERE id=?", (b,)).fetchone()
+        self.assertEqual(row["status"], "pending")
 
 
 if __name__ == "__main__":

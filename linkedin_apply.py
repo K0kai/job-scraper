@@ -83,10 +83,10 @@ def _url_has_path_token(url: str, tokens: tuple[str, ...]) -> bool:
     return any(tok in _path_tokens(url) for tok in tokens)
 
 # Conservative defaults — override via settings, never raise above hard ceilings.
-HARD_MAX_PER_DAY = 8
-HARD_MIN_GAP_MINUTES = 5
-DEFAULT_MAX_PER_DAY = 3
-DEFAULT_MIN_GAP_MINUTES = 12
+# Easy Apply: only min-gap pacing (no daily cap). Floor/ceiling clamp the setting.
+HARD_MIN_GAP_MINUTES = 1
+HARD_MAX_GAP_MINUTES = 30
+DEFAULT_MIN_GAP_MINUTES = 3
 DEFAULT_HUMAN_WAIT_MINUTES = 12
 DEFAULT_LOGIN_WAIT_MINUTES = 25
 
@@ -268,16 +268,6 @@ def _wait_for_manual_login(page, *, minutes: int, profile: str) -> bool:
     return False
 
 
-def count_linkedin_actions_since(connect_fn: ConnectFn, since_iso: str) -> int:
-    with connect_fn() as db:
-        row = db.execute(
-            """SELECT COUNT(*) AS n FROM applications
-               WHERE channel='linkedin' AND attempted_at >= ?""",
-            (since_iso,),
-        ).fetchone()
-    return int(row["n"] if row else 0)
-
-
 def last_linkedin_action_at(connect_fn: ConnectFn) -> datetime | None:
     with connect_fn() as db:
         row = db.execute(
@@ -298,19 +288,18 @@ def last_linkedin_action_at(connect_fn: ConnectFn) -> datetime | None:
 
 
 def rate_limit_block_reason(connect_fn: ConnectFn, cfg: dict[str, str]) -> str | None:
-    """Return a human-readable block reason if daily/gap caps would be exceeded."""
-    max_day = _int_setting(cfg, "linkedin_max_per_day", DEFAULT_MAX_PER_DAY, lo=1, hi=HARD_MAX_PER_DAY)
+    """Return a human-readable block reason if min-gap pacing would be exceeded.
+
+    No daily cap — only spacing between LinkedIn Easy Apply actions.
+    """
     min_gap = _int_setting(
-        cfg, "linkedin_min_gap_minutes", DEFAULT_MIN_GAP_MINUTES, lo=HARD_MIN_GAP_MINUTES, hi=180
+        cfg,
+        "linkedin_min_gap_minutes",
+        DEFAULT_MIN_GAP_MINUTES,
+        lo=HARD_MIN_GAP_MINUTES,
+        hi=HARD_MAX_GAP_MINUTES,
     )
     now = datetime.now(timezone.utc)
-    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat(timespec="seconds")
-    used = count_linkedin_actions_since(connect_fn, day_start)
-    if used >= max_day:
-        return (
-            f"Limite diário LinkedIn atingido ({used}/{max_day}). "
-            "Aguarde amanhã ou reduza o ritmo — teto rígido de segurança."
-        )
     last = last_linkedin_action_at(connect_fn)
     if last is not None:
         elapsed = (now - last.astimezone(timezone.utc)).total_seconds() / 60.0
@@ -823,7 +812,7 @@ def apply_via_linkedin(
     Assisted Easy Apply only:
     - requires risk acknowledgement
     - never clicks Submit
-    - daily + gap rate limits
+    - min-gap pacing only (no daily cap); queue runs at most one at a time
     - headed Chrome persistent profile (manual login once)
     - leaves Review open for you to send
     """
@@ -848,10 +837,8 @@ def apply_via_linkedin(
 
     limit_reason = rate_limit_block_reason(connect_fn, cfg)
     if limit_reason:
-        # Gap → let the job queue retry later; daily cap → hard stop for today.
-        if "Intervalo mínimo" in limit_reason:
-            raise RuntimeError(f"LinkedIn pacing — try again later. {limit_reason}")
-        return False, limit_reason
+        # Gap → let the job queue retry later.
+        raise RuntimeError(f"LinkedIn pacing — try again later. {limit_reason}")
 
     profile = (cfg.get("linkedin_chrome_profile") or "").strip() or default_profile_dir(project_root)
     os.makedirs(profile, exist_ok=True)
