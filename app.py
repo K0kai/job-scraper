@@ -3212,8 +3212,16 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self.send_page("Não encontrado", 404)
 
+    #: endpoints de polling — o browser bate a cada poucos segundos; sem isso
+    #: o terminal/LOG enche de linha repetida e sota o que importa.
+    QUIET_PATHS = ("/live", "/favicon.ico")
+
     def log_message(self, fmt: str, *args: object) -> None:
-        LOG.info("%s - %s", self.address_string(), fmt % args)
+        line = fmt % args
+        if any(p in line for p in self.QUIET_PATHS):
+            LOG.debug("%s - %s", self.address_string(), line)
+            return
+        LOG.info("%s - %s", self.address_string(), line)
 
 
 if __name__ == "__main__":
