@@ -1064,6 +1064,9 @@ def apply_via_linkedin(
                     api_key=api_key,
                     pending_answers=pending_answers,
                     open_count=open_count,
+                    ai_ctx=ai_ctx,
+                    now_iso=now_iso,
+                    connect_fn=connect_fn,
                 )
                 if err:
                     # Still leave browser open briefly so you can finish by hand.

@@ -133,6 +133,12 @@ DEFAULT_SETTINGS = {
     "linkedin_login_wait_minutes": "25",
     # InHire diversity: 0 = No (default), 1 = Yes — "apply as disabled person"
     "inhire_pcd": "0",
+    # Perfil de diversidade (identidade NUNCA vem de IA; 'not_informed' = não informar)
+    "candidate_gender": "not_informed",
+    "candidate_race": "not_informed",
+    "candidate_lgbtq": "not_informed",
+    "candidate_pcd": "no",
+    "candidate_diversity_note": "",
 }
 STATUSES = {"new": "Nova", "review": "Na fila", "worth": "Vale a pena olhar", "saved": "Salva", "prepared": "Carta preparada", "applied": "Aplicada", "ignored": "Ignorada", "blocked": "Envio indisponível"}
 BRASILIA = ZoneInfo("America/Sao_Paulo")
@@ -2546,6 +2552,35 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
 <section class="panel" style="margin-top:18px"><h2>Perfil, SMTP e automação</h2><form method="post" action="/ai-settings"><div class="form-grid"><label>Provedor de IA<select name="ai_provider"><option value="gemini" {'selected' if cfg.get('ai_provider') == 'gemini' else ''}>Gemini</option><option value="openai" {'selected' if cfg.get('ai_provider') == 'openai' else ''}>OpenAI</option></select></label><label>Modelo<input name="ai_model" value="{esc(cfg.get('ai_model','gemini-2.5-flash'))}"></label><label>Motor de navegador<select name="browser_engine"><option value="pydoll" {'selected' if cfg.get('browser_engine','pydoll') == 'pydoll' else ''}>Pydoll (CDP, stealth — padrão)</option><option value="playwright" {'selected' if cfg.get('browser_engine','pydoll') == 'playwright' else ''}>Playwright (fallback)</option></select></label><label>Seu nome<input name="candidate_name" value="{esc(cfg.get('candidate_name',''))}"></label><label>E-mail<input name="candidate_email" value="{esc(cfg.get('candidate_email',''))}"></label><label>Telefone<input name="candidate_phone" value="{esc(cfg.get('candidate_phone',''))}"></label><label>LinkedIn<input name="candidate_linkedin" value="{esc(cfg.get('candidate_linkedin',''))}"></label><label>Cidade<input name="candidate_city" value="{esc(cfg.get('candidate_city',''))}"></label><label>Chave de IA (vazio mantém a salva)<input type="password" name="api_key" autocomplete="new-password"></label><label>Fatos profissionais em português<textarea name="candidate_facts_pt" rows="3">{esc(cfg.get('candidate_facts_pt',''))}</textarea></label><label>Professional facts in English<textarea name="candidate_facts_en" rows="3">{esc(cfg.get('candidate_facts_en',''))}</textarea></label><label>Score mínimo (%)<input name="minimum_match_score" type="number" min="0" max="100" value="{esc(cfg.get('minimum_match_score','80'))}"></label><label>Workers da fila (vagas em paralelo)<input name="queue_max_workers" type="number" min="1" max="8" value="{esc(cfg.get('queue_max_workers','3'))}"></label><label>Máx. tentativas por job<input name="queue_max_attempts" type="number" min="1" max="200" value="{esc(cfg.get('queue_max_attempts','40'))}"></label><label>TTL da fila (horas)<input name="queue_ttl_hours" type="number" min="1" max="168" value="{esc(cfg.get('queue_ttl_hours','24'))}"></label><label>Adzuna App ID<input name="adzuna_app_id" value=""></label><label>Adzuna API key<input type="password" name="adzuna_app_key" value=""></label><label>Token Apify<input type="password" name="apify_token" value="" autocomplete="new-password"></label></div><label style="margin:12px 0"><input type="checkbox" name="auto_apply" value="1" {'checked' if cfg.get('auto_apply') == '1' else ''} style="width:auto"> Ativar triagem e candidatura automáticas (e-mail SMTP, depois formulário público)</label>
 <label style="margin:12px 0"><input type="checkbox" name="linkedin_easy_apply" value="1" {'checked' if cfg.get('linkedin_easy_apply') == '1' else ''} style="width:auto"> Easy Apply LinkedIn <em>assistido</em> (preenche; <strong>você</strong> clica Enviar — o robô nunca envia sozinho)</label>
 <label style="margin:12px 0"><input type="checkbox" name="linkedin_risk_ack" value="1" {'checked' if cfg.get('linkedin_risk_ack') == '1' else ''} style="width:auto"> Li e aceito: automação no LinkedIn pode violar os termos deles e gerar restrição/banimento da conta; uso por minha conta e risco</label>
+<h3 style="margin:16px 0 6px">Perfil de diversidade (respostas suas — nunca a IA decide identidade)</h3>
+<div class="form-grid">
+<label>Gênero<select name="candidate_gender">
+<option value="not_informed" {'selected' if cfg.get('candidate_gender','not_informed') == 'not_informed' else ''}>Prefiro não informar</option>
+<option value="female" {'selected' if cfg.get('candidate_gender') == 'female' else ''}>Mulher</option>
+<option value="male" {'selected' if cfg.get('candidate_gender') == 'male' else ''}>Homem</option>
+<option value="other" {'selected' if cfg.get('candidate_gender') == 'other' else ''}>Outro / não binário</option>
+</select></label>
+<label>Raça/etnia (autodeclarada)<select name="candidate_race">
+<option value="not_informed" {'selected' if cfg.get('candidate_race','not_informed') == 'not_informed' else ''}>Prefiro não informar</option>
+<option value="white" {'selected' if cfg.get('candidate_race') == 'white' else ''}>Branca</option>
+<option value="black" {'selected' if cfg.get('candidate_race') == 'black' else ''}>Preta</option>
+<option value="pardo" {'selected' if cfg.get('candidate_race') == 'pardo' else ''}>Parda</option>
+<option value="asian" {'selected' if cfg.get('candidate_race') == 'asian' else ''}>Amarela/asiática</option>
+<option value="indigenous" {'selected' if cfg.get('candidate_race') == 'indigenous' else ''}>Indígena</option>
+</select></label>
+<label>PCD (deficiência)<select name="candidate_pcd">
+<option value="no" {'selected' if cfg.get('candidate_pcd','no') in ('no','0') else ''}>Não sou PCD</option>
+<option value="yes" {'selected' if cfg.get('candidate_pcd') in ('yes','1') or (cfg.get('candidate_pcd','no') in ('no','') and cfg.get('inhire_pcd') == '1') else ''}>Sou PCD</option>
+<option value="not_informed" {'selected' if cfg.get('candidate_pcd') == 'not_informed' else ''}>Prefiro não informar</option>
+</select></label>
+<label>LGBTQ+<select name="candidate_lgbtq">
+<option value="not_informed" {'selected' if cfg.get('candidate_lgbtq','not_informed') == 'not_informed' else ''}>Prefiro não informar</option>
+<option value="yes" {'selected' if cfg.get('candidate_lgbtq') == 'yes' else ''}>Sim</option>
+<option value="no" {'selected' if cfg.get('candidate_lgbtq') == 'no' else ''}>Não</option>
+</select></label>
+</div>
+<label>Nota livre p/ perguntas de diversidade fora das opções<textarea name="candidate_diversity_note" rows="2">{esc(cfg.get('candidate_diversity_note',''))}</textarea></label>
+<p class="hint">Esses valores respondem perguntas de diversidade (radio/select/checkbox) nos formulários. "Prefiro não informar" deixa a pergunta em branco para você no Chrome — o robô não chuta. Perguntas da empresa <em>sem</em> relação com identidade (skills, disponibilidade…) são respondidas pela IA usando a análise do currículo, com cache por pergunta parecida.</p>
 <label>Máx. Easy Apply / dia (teto 8)<input name="linkedin_max_per_day" type="number" min="1" max="8" value="{esc(cfg.get('linkedin_max_per_day','3'))}"></label>
 <label>Intervalo mínimo entre vagas (min, mín. 5)<input name="linkedin_min_gap_minutes" type="number" min="5" max="180" value="{esc(cfg.get('linkedin_min_gap_minutes','12'))}"></label>
 <label>Tempo para você revisar/enviar no Chrome (min)<input name="linkedin_human_wait_minutes" type="number" min="3" max="45" value="{esc(cfg.get('linkedin_human_wait_minutes','12'))}"></label>

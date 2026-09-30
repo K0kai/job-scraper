@@ -8,9 +8,6 @@ import smtplib
 import sqlite3
 from email.message import EmailMessage
 from typing import Callable
-from urllib.error import HTTPError
-from urllib.parse import quote_plus
-from urllib.request import Request, urlopen
 
 from form_rules import find_rule_for_label, list_rules, pick_select_option, resolve_rule_value
 from resume_pipeline import AiUnavailableError, get_resume

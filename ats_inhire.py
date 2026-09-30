@@ -254,11 +254,18 @@ def _fill_diversity_step(page, *, cfg: dict[str, str]) -> None:
         except Exception:
             pass
 
-    pcd_yes = (cfg.get("inhire_pcd") or cfg.get("candidate_pcd") or "0").strip() in {"1", "yes", "sim", "true"}
-    pcd_label = "Yes" if pcd_yes else "No"
+    # Perfil humano decide PCD; "não informar" NÃO chuta Yes/No — fica com você.
+    from ats_answers import _truthy_pcd
+
+    pcd_state = _truthy_pcd(cfg)
+    if pcd_state not in {"yes", "no"}:
+        LOG.info("InHire: PCD marcado como 'não informar'; pergunta fica com você no Chrome.")
+        _fill_privacy_checkbox(page)
+        return
+    pcd_label = "Yes" if pcd_state == "yes" else "No"
     # PT UI fallbacks
     pcd_query = pcd_label
-    pcd_alt = "Sim" if pcd_yes else "Não"
+    pcd_alt = "Sim" if pcd_state == "yes" else "Não"
 
     opened = _select_react_dropdown(
         page,
@@ -284,6 +291,10 @@ def _fill_diversity_step(page, *, cfg: dict[str, str]) -> None:
             LOG.warning("InHire PCD dropdown failed: %s", exc)
 
     # Privacy agreement on diversity step.
+    _fill_privacy_checkbox(page)
+
+
+def _fill_privacy_checkbox(page) -> None:
     try:
         box = page.locator("#privacyPolicy, input[name='privacyPolicy']")
         if box.count():
@@ -415,9 +426,25 @@ class InHireHandler(BaseATSHandler):
                     LOG.warning("InHire resume upload failed: %s", exc)
                     missing.append("curriculo")
 
-            # Hybrid availability / referral — English Yes/No (nth: first Yes = hybrid, second No = not referred).
-            _click_visible_choice(page, ("Yes", "Sim"), nth=0)
-            _click_visible_choice(page, ("No", "Não", "Nao"), nth=1)
+            # Perguntas customizadas da empresa com opcoes nativas:
+            # diversidade->perfil, empresa->IA+cache (o handler InHire sobrescreve
+            # fill(), entao o kernel nao roda — chamamos a camada aqui direto).
+            has_ai = bool((ctx.ai or {}).get("api_key"))
+            groups_answered = False
+            try:
+                from ats_answers import answer_choice_groups
+
+                extra, _deferred = answer_choice_groups(page, ctx, log_prefix="inhire")
+                groups_answered = bool(extra)
+                filled.extend(extra)
+            except Exception as exc:
+                LOG.debug("InHire choice groups: %s", exc)
+
+            if not has_ai or not groups_answered:
+                # Fallback legado (sem IA disponivel): hybrid Yes / referral No.
+                # Com IA os radios ja foram respondidos com precisao — nao cobrir.
+                _click_visible_choice(page, ("Yes", "Sim"), nth=0)
+                _click_visible_choice(page, ("No", "Não", "Nao"), nth=1)
 
             _fill_diversity_step(page, cfg=cfg)
             filled.append("diversidade")

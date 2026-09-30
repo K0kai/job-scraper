@@ -30,7 +30,7 @@ ConnectFn = Callable[[], sqlite3.Connection]
 # perguntas que são identidade — perfil humano decide, jamais IA
 DIVERSITY_RE = re.compile(
     r"gender|sex\b|sexo|race|ethnic|racial|ra[cç]a|cor\b|"
-    r"disab|defici|pcd|orienta[l]? sexual|lgbt|veteran|ind[ií]gena|self.?identified",
+    r"disab|defici|pcd|orienta\w*\s+sexual|sexual\s+orienta|lgbt|veteran|ind[ií]gena|self.?identified",
     re.I,
 )
 # consentimento legal — nunca responder automaticamente aqui
@@ -163,9 +163,13 @@ def parse_choices_answer(text: str, options: list[str], *, multiple: bool) -> li
             return None
         exact = by_norm.get(normalize(cand))
         if exact is None:
-            fuzzy = pick_select_option(options, cand)
-            if fuzzy:
-                exact = fuzzy
+            # fuzzy conservador: so aceita contencoes claras entre as strings
+            # normalizadas (evita casar "10 years" com "1-3 years" por tokens).
+            cand_norm = normalize(cand)
+            for opt_norm, opt in by_norm.items():
+                if len(cand_norm) >= 4 and (cand_norm in opt_norm or opt_norm in cand_norm):
+                    exact = opt
+                    break
         if exact is not None and exact not in chosen:
             chosen.append(exact)
         if not multiple and chosen:
@@ -250,10 +254,11 @@ def ask_open_cached(
 # Varredura de grupos radio/checkbox no DOM
 # ---------------------------------------------------------------------------
 
-_CHOICE_GROUPS_JS = """() => {
+_CHOICE_GROUPS_JS = """(root) => {
+  const scope = root || document;
   const groups = [];
   const seen = new Map();
-  const nodes = document.querySelectorAll('input[type="radio"], input[type="checkbox"]');
+  const nodes = scope.querySelectorAll('input[type="radio"], input[type="checkbox"]');
   let idx = 0;
   for (const el of nodes) {
     if (el.disabled || el.hidden) continue;
@@ -301,9 +306,16 @@ CLEAN_CHOICE_ATTR_JS = """() => {
 
 
 def collect_choice_groups(scope) -> list[dict]:
-    """Grupos de radio/checkbox (label da opção + legend do grupo). scope = page ou locator."""
+    """Grupos de radio/checkbox (label da opção + legend do grupo). scope = page ou locator.
+
+    Em locator (ex.: modal do Easy Apply), a varredura é RESTITA àquele subtree —
+    senão o wizard veria os radios da página por trás do modal.
+    """
     try:
-        return list(scope.evaluate(_CHOICE_GROUPS_JS) or [])
+        if hasattr(scope, "element_handle"):  # Locator → restringe ao elemento
+            handle = scope.element_handle()
+            return list(scope.evaluate(_CHOICE_GROUPS_JS, handle) or [])
+        return list(scope.evaluate(_CHOICE_GROUPS_JS, None) or [])
     except Exception:
         return []
 
