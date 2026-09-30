@@ -318,7 +318,8 @@ def _answer_diversity_dropdowns(page, cfg: dict[str, str]) -> list[str]:
         category = kind.split(":", 1)[1]
         if category == "other":
             continue
-        # orientacao expecifica: painel so tem yes/no — 'yes' e ambiguo demais
+        # 'yes' generico e ambiguo (as opcoes sao identidades especificas) — so
+        # responde se o painel trouxer orientacao especifica (gay/bisexual/...).
         if "orienta" in question.casefold() and profile_state(cfg, "lgbtq") == "yes":
             LOG.info("InHire orientacao sexual: 'sou LGBTI+' nao indica qual opcao; fica com voce.")
             continue
@@ -365,6 +366,57 @@ def _fill_diversity_step(page, *, cfg: dict[str, str], ctx=None) -> None:
 
     # Privacy agreement on diversity step.
     _fill_privacy_checkbox(page)
+
+
+_DISABLED_STATE_JS = """(reSrc) => {
+  const rex = new RegExp(reSrc, 'i');
+  const btns = [...document.querySelectorAll('button')];
+  for (const b of btns) {
+    const t = (b.innerText || '').trim();
+    if (!t || !rex.test(t)) continue;
+    const r = b.getBoundingClientRect();
+    if (!r.width || !r.height) continue;
+    return { found: true, disabled: !!b.disabled || b.getAttribute('aria-disabled') === 'true' };
+  }
+  return { found: false, disabled: false };
+}"""
+
+_CONTINUE_RE = r"^(continuar registro|continuar|concluir|next|pr[oó]xima|submit|enviar)$"
+
+
+def _continue_disabled(page) -> bool:
+    """True se existe botao de avancar/continuar visivel e DESABILITADO (falta algo)."""
+    try:
+        state = page.evaluate(_DISABLED_STATE_JS, _CONTINUE_RE)
+        return bool(state.get("found") and state.get("disabled"))
+    except Exception:
+        return False
+
+
+def _retry_missing(page, ctx) -> list[str]:
+    """Botao desabilitado → re-olhar radios/checkboxes e dropdowns de diversidade."""
+    found: list[str] = []
+    try:
+        from ats_answers import answer_choice_groups
+
+        extra, _deferred = answer_choice_groups(page, ctx, log_prefix="inhire-retry")
+        found.extend(extra)
+    except Exception as exc:
+        LOG.debug("InHire retry groups: %s", exc)
+    try:
+        found.extend(_answer_diversity_dropdowns(page, ctx.cfg))
+    except Exception as exc:
+        LOG.debug("InHire retry dropdowns: %s", exc)
+    try:
+        modal = _question_modal(page)
+        if modal is not None:
+            from ats_answers import answer_choice_groups
+
+            extra, _deferred = answer_choice_groups(modal, ctx, log_prefix="inhire-retry-modal")
+            found.extend(extra)
+    except Exception as exc:
+        LOG.debug("InHire retry modal: %s", exc)
+    return found
 
 
 def _fill_privacy_checkbox(page) -> None:
@@ -683,6 +735,19 @@ class InHireHandler(BaseATSHandler):
 
             _fill_diversity_step(page, cfg=cfg, ctx=ctx)
             filled.append("diversidade")
+
+            # "Continuar registro" desabilitado = ficou pergunta obrigatoria sem
+            # resposta (ex.: multi-select de grupos). Re-olhe ate 3x o que falta.
+            for pass_no in range(1, 4):
+                if not _continue_disabled(page):
+                    break
+                LOG.info("InHire: botao continuar desabilitado — re-olhando o que falta (passada %s)", pass_no)
+                new_found = _retry_missing(page, ctx)
+                if new_found:
+                    filled.extend(new_found)
+                    _pause(0.8, 1.5)
+                elif pass_no > 1:
+                    break  # duas passadas sem progresso: humano resolve
             return FillResult(ok=not missing, filled=filled, missing=missing)
         except Exception as exc:
             return FillResult(ok=False, filled=filled, missing=missing, error=str(exc))

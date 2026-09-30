@@ -2573,10 +2573,16 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
 <option value="yes" {'selected' if cfg.get('candidate_pcd') in ('yes','1') or (cfg.get('candidate_pcd','no') in ('no','') and cfg.get('inhire_pcd') == '1') else ''}>Sou PCD</option>
 <option value="not_informed" {'selected' if cfg.get('candidate_pcd') == 'not_informed' else ''}>Prefiro não informar</option>
 </select></label>
-<label>LGBTQ+<select name="candidate_lgbtq">
+<label>LGBTQ+ (orientação/identidade)<select name="candidate_lgbtq">
 <option value="not_informed" {'selected' if cfg.get('candidate_lgbtq','not_informed') == 'not_informed' else ''}>Prefiro não informar</option>
-<option value="yes" {'selected' if cfg.get('candidate_lgbtq') == 'yes' else ''}>Sim</option>
-<option value="no" {'selected' if cfg.get('candidate_lgbtq') == 'no' else ''}>Não</option>
+<option value="no" {'selected' if cfg.get('candidate_lgbtq') == 'no' else ''}>Hétero / cis (não)</option>
+<option value="gay" {'selected' if cfg.get('candidate_lgbtq') == 'gay' else ''}>Homossexual / gay</option>
+<option value="lesbian" {'selected' if cfg.get('candidate_lgbtq') == 'lesbian' else ''}>Lésbica</option>
+<option value="bisexual" {'selected' if cfg.get('candidate_lgbtq') == 'bisexual' else ''}>Bissexual</option>
+<option value="pansexual" {'selected' if cfg.get('candidate_lgbtq') == 'pansexual' else ''}>Pansexual</option>
+<option value="asexual" {'selected' if cfg.get('candidate_lgbtq') == 'asexual' else ''}>Assexual</option>
+<option value="other" {'selected' if cfg.get('candidate_lgbtq') == 'other' else ''}>Outra (use a nota)</option>
+<option value="yes" {'selected' if cfg.get('candidate_lgbtq') == 'yes' else ''}>Sou LGBTI+ (genérico)</option>
 </select></label>
 </div>
 <label>Nota livre p/ perguntas de diversidade fora das opções<textarea name="candidate_diversity_note" rows="2">{esc(cfg.get('candidate_diversity_note',''))}</textarea></label>

@@ -129,6 +129,12 @@ _PROFILE_ALIASES: dict[str, dict[str, tuple[str, ...]]] = {
     "lgbtq": {
         "yes": ("lgbt", "lesbian", "gay", "bisexual", "pansexual", "asexual", "yes", "sim"),
         "no": ("heterosexual", "straight", "hetero", "no", "nao", "não"),
+        "gay": ("homosexual", "gay"),
+        "lesbian": ("lesbian", "homosexual"),
+        "bisexual": ("bisexual"),
+        "pansexual": ("pansexual"),
+        "asexual": ("asexual"),
+        "other": ("other", "outro"),
         NOT_INFORMED: ("rather not", "prefer not", "nao informar", "não informar", "decline"),
     },
     "pcd": {
@@ -507,6 +513,39 @@ CLEAN_CHOICE_ATTR_JS = """() => {
   document.querySelectorAll('[data-radar-choice]').forEach((el) => el.removeAttribute('data-radar-choice'));
 }"""
 
+_MARK_OPTION_JS = """(idx) => {
+  const el = document.querySelector(`[data-radar-choice="${idx}"]`);
+  if (!el) return 'missing';
+  if (el.checked) return 'already';
+  // checkbox custom (input oculto por CSS): clicar o LABEL e nao o input.
+  const id = el.id || '';
+  const lab = id ? document.querySelector(`label[for="${CSS.escape(id)}"]`) : el.closest('label');
+  try {
+    if (lab) lab.click(); else el.click();
+  } catch (e) { return 'error'; }
+  // radios React podem atualizar assincrono — checa de novo em microtask
+  return el.checked ? 'ok' : 'pending';
+}"""
+
+
+def _mark_option(scope, index: int) -> bool:
+    """Marca radio/checkbox mesmo com input oculto (clique no label). Nunca lança."""
+    try:
+        result = scope.evaluate(_MARK_OPTION_JS, index)
+    except Exception as exc:
+        LOG.debug("mark(%s) evaluate falhou: %s", index, exc)
+        return False
+    if result in ("already", "ok"):
+        return True
+    if result == "pending":
+        # estado ainda pode estar assincrono — tenta o locator .check force depois
+        try:
+            scope.locator(f'[data-radar-choice="{index}"]').first.check(force=True, timeout=3000)
+            return True
+        except Exception:
+            return True  # label clicado; React pode ter aceitado sem refletir no input
+    return False
+
 
 def collect_choice_groups(scope) -> list[dict]:
     """Grupos de radio/checkbox (label da opção + legend do grupo). scope = page ou locator.
@@ -593,11 +632,10 @@ def answer_choice_groups(scope, ctx, *, log_prefix: str = "form") -> tuple[list[
         for opt_label in chosen:
             for opt in group.get("options") or []:
                 if (opt.get("label") or "") == opt_label:
-                    try:
-                        scope.locator(f'[data-radar-choice="{opt["index"]}"]').first.check(force=True, timeout=4000)
+                    if _mark_option(scope, int(opt["index"])):
                         done += 1
-                    except Exception as exc:
-                        LOG.debug("%s check(%s) falhou: %s", log_prefix, opt_label, exc)
+                    else:
+                        LOG.debug("%s check(%s) falhou", log_prefix, opt_label)
         if done:
             answered.append(f"{question[:80]} → {', '.join(chosen)[:120]}")
         else:
