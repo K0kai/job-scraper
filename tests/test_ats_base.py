@@ -68,14 +68,20 @@ class CanHandleTests(unittest.TestCase):
 
 
 class RegisterTests(unittest.TestCase):
-    def test_registration_and_lookup(self):
+    def setUp(self):
+        self._snapshot = list(ats_base.HANDLERS)
         ats_base.HANDLERS.clear()
+
+    def tearDown(self):
+        ats_base.HANDLERS.clear()
+        ats_base.HANDLERS.extend(self._snapshot)
+
+    def test_registration_and_lookup(self):
         ats_base.register(_Alpha)
         self.assertIs(ats_base.find_handler("https://alpha.example.com/x"), _Alpha)
         self.assertIsNone(ats_base.find_handler("https://nothing.example.org/x"))
 
     def test_duplicate_name_rejected(self):
-        ats_base.HANDLERS.clear()
         ats_base.register(_Alpha)
 
         class Alpha2(ats_base.BaseATSHandler):
@@ -86,7 +92,6 @@ class RegisterTests(unittest.TestCase):
             ats_base.register(Alpha2)
 
     def test_duplicate_host_rejected(self):
-        ats_base.HANDLERS.clear()
         ats_base.register(_Alpha)
 
         class AlphaClone(ats_base.BaseATSHandler):
@@ -97,7 +102,6 @@ class RegisterTests(unittest.TestCase):
             ats_base.register(AlphaClone)
 
     def test_lookup_skips_unregistered(self):
-        ats_base.HANDLERS.clear()
         self.assertIsNone(ats_base.find_handler("https://alpha.example.com/x"))
 
 

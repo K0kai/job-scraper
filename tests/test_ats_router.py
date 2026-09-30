@@ -55,10 +55,12 @@ CTX = dict(
 
 class ReanchorTests(unittest.TestCase):
     def setUp(self):
+        self._snapshot = list(ats_base.HANDLERS)
         ats_base.HANDLERS.clear()
 
     def tearDown(self):
         ats_base.HANDLERS.clear()
+        ats_base.HANDLERS.extend(self._snapshot)
 
     def test_no_handler_returns_no_handler_outcome(self):
         page = FakePage("https://desconhecido.org/job")
@@ -84,10 +86,12 @@ class ReanchorTests(unittest.TestCase):
 
 class AutoSubmitTests(unittest.TestCase):
     def setUp(self):
+        self._snapshot = list(ats_base.HANDLERS)
         ats_base.HANDLERS.clear()
 
     def tearDown(self):
         ats_base.HANDLERS.clear()
+        ats_base.HANDLERS.extend(self._snapshot)
 
     def test_capable_no_obstacles_submits(self):
         cls = make_handler_cls("fast", ("fast.example.com",), capable=True,
@@ -131,10 +135,12 @@ class AutoSubmitTests(unittest.TestCase):
 
 class FailureTests(unittest.TestCase):
     def setUp(self):
+        self._snapshot = list(ats_base.HANDLERS)
         ats_base.HANDLERS.clear()
 
     def tearDown(self):
         ats_base.HANDLERS.clear()
+        ats_base.HANDLERS.extend(self._snapshot)
 
     def test_wait_ready_false_fails(self):
         cls = make_handler_cls("never", ("never.example.com",))
