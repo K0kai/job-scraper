@@ -14,6 +14,14 @@ import random
 import re
 import time
 
+from ats_answers import (
+    DIVERSITY_RE,
+    _PROFILE_ALIASES,
+    _truthy_pcd,
+    answer_choice_groups,
+    classify_group,
+    profile_for_diversity,
+)
 from ats_base import ApplyContext, FillResult, SubmitResult
 from browser_engine import (
     click_scanned_button,
@@ -184,6 +192,16 @@ def _apply_field(page, field: dict, rule: dict | None, ctx: ApplyContext) -> tup
     sel = field_selector(field)
     label = field.get("label") or field.get("key") or ""
     if rule is None:
+        # pergunta de diversidade em <select> nativo → perfil do painel (nunca IA)
+        if field.get("tag") == "select" and DIVERSITY_RE.search(label):
+            category = classify_group(label).split(":", 1)[1]
+            aliases = profile_for_diversity(ctx.cfg, category) or []
+            if category == "pcd":
+                aliases = _PROFILE_ALIASES["pcd"].get(_truthy_pcd(ctx.cfg)) or []
+            for alias in aliases:
+                if safe_select(page, sel, field.get("options") or [], alias):
+                    return (f"diversidade:{category}", True)
+            return None  # sem perfil/opção: deixa para o humano, nao é erro
         if field.get("required") and field.get("tag") in {"input", "textarea", "select"}:
             return (label, False)
         return None
@@ -263,6 +281,13 @@ def fill_page(page, ctx: ApplyContext, handler=None) -> FillResult:
                 filled.extend(handler.post_fill(page, ctx) or [])
             except Exception as exc:
                 LOG.debug("post_fill falhou: %s", exc)
+        # perguntas da empresa c/ opcoes (radio/checkbox): diversidade→perfil,
+        # demais→IA com cache global; insegura → fica com o humano.
+        try:
+            answered, _deferred = answer_choice_groups(page, ctx, log_prefix="kernel")
+            filled.extend(answered)
+        except Exception as exc:
+            LOG.debug("grupos de opcoes falharam: %s", exc)
         return FillResult(ok=not missing, filled=filled, missing=missing)
     except Exception as exc:
         return FillResult(

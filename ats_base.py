@@ -27,6 +27,9 @@ class ApplyContext:
     resume_path: str
     cover_letter: str
     salary: str = ""
+    #: contexto p/ perguntas de empresa via IA (job, resume_summary, resume_json,
+    #: facts, provider, model, api_key, connect_fn, now_iso). Vazio = sem IA.
+    ai: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

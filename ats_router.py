@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import time
+from typing import Any
 from urllib.parse import urlparse
 
 from ats_base import ApplyContext, BaseATSHandler, FillResult
@@ -93,8 +94,13 @@ def run_ats_flow(
     cover_letter: str,
     salary: str = "",
     human_wait: int = 15,
+    ai: dict[str, Any] | None = None,
 ) -> tuple[str, str]:
-    """Executa o fluxo de um ATS externo. Retorna ``(outcome, detail)``."""
+    """Executa o fluxo de um ATS externo. Retorna ``(outcome, detail)``.
+
+    ``ai``: contexto p/ perguntas de empresa via IA (job, resume_summary,
+    resume_json, facts, provider, model, api_key, connect_fn, now_iso).
+    """
     _ensure_handlers_loaded()
     try:
         current_url = page.url or ""
@@ -119,6 +125,7 @@ def run_ats_flow(
         resume_path=resume_path,
         cover_letter=cover_letter,
         salary=salary,
+        ai=ai or {},
     )
 
     try:

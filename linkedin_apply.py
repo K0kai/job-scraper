@@ -432,6 +432,7 @@ def _handle_external_ats(
     human_wait: int,
     finish_ok,
     block,
+    ai: dict | None = None,
 ) -> tuple[bool, str]:
     """Deixa o LinkedIn e espera a URL de destino; o router decide o handler."""
     from ats_router import (
@@ -482,6 +483,7 @@ def _handle_external_ats(
         cover_letter=cover_letter,
         salary=salary,
         human_wait=human_wait,
+        ai=ai,
     )
 
     try:
@@ -578,8 +580,27 @@ def _fill_modal_step(
     api_key: str,
     pending_answers: list[tuple[str, str]],
     open_count: list[int],
+    ai_ctx: dict | None = None,
+    now_iso: str = "",
+    connect_fn=None,
 ) -> str | None:
     """Fill one Easy Apply step. Returns error detail or None on success."""
+    # perguntas com opcoes (radio/checkbox) do wizard: diversidade->perfil,
+    # empresa->IA com cache global; insegura fica com o humano.
+    if ai_ctx is not None:
+        try:
+            from ats_answers import answer_choice_groups
+            from ats_base import ApplyContext
+
+            step_ctx = ApplyContext(
+                cfg=cfg, rules=rules, resume_path=resume_path,
+                cover_letter=cover_letter, ai=ai_ctx,
+            )
+            answered, _deferred = answer_choice_groups(modal, step_ctx, log_prefix="easy-apply")
+            pending_answers.extend(("opcao respondida", a[:500]) for a in answered)
+        except Exception as exc:
+            LOG.debug("grupos de opcoes no modal falharam: %s", exc)
+
     controls = _collect_controls(modal)
     for control in controls:
         label = control.get("label") or control.get("name") or ""
@@ -601,15 +622,24 @@ def _fill_modal_step(
             if open_count[0] > 6:
                 return "Muitas perguntas abertas; revise manualmente no Chrome."
             try:
-                answer = generate_open_answer(
+                from ats_answers import ask_open_cached
+
+                answer = ask_open_cached(
                     question=label,
-                    job=job,
-                    resume_summary=resume_summary,
-                    resume_json=resume_json,
-                    facts=facts,
+                    generate=lambda: generate_open_answer(
+                        question=label,
+                        job=job,
+                        resume_summary=resume_summary,
+                        resume_json=resume_json,
+                        facts=facts,
+                        provider=provider,
+                        model=model,
+                        api_key=api_key,
+                    ),
+                    connect_fn=connect_fn,
                     provider=provider,
                     model=model,
-                    api_key=api_key,
+                    now_iso=now_iso,
                 )
             except AiUnavailableError as exc:
                 return f"Pergunta aberta; IA indisponível — preencha no Chrome. {exc}"
@@ -826,6 +856,19 @@ def apply_via_linkedin(
     with connect_fn() as db:
         rules = [dict(row) for row in list_rules(db)]
     facts = cfg.get("candidate_facts_pt" if job.get("language") == "pt" else "candidate_facts_en", "")
+    # contexto p/ IA responder perguntas de empresa (radio/checkbox e abertas)
+    # reaproveitando a ANALISE do curriculo ja persistida + cache global.
+    ai_ctx: dict = {
+        "job": job,
+        "resume_summary": resume_summary,
+        "resume_json": resume_json,
+        "facts": facts,
+        "provider": provider,
+        "model": model,
+        "api_key": api_key,
+        "connect_fn": connect_fn,
+        "now_iso": now_iso,
+    }
     pending_answers: list[tuple[str, str]] = []
     open_count = [0]
     context = None
@@ -861,6 +904,7 @@ def apply_via_linkedin(
                     human_wait=human_wait,
                     finish_ok=finish_ok,
                     block=block,
+                    ai=ai_ctx,
                 )
 
             # Go straight to the LinkedIn job URL.
@@ -946,6 +990,7 @@ def apply_via_linkedin(
                     human_wait=human_wait,
                     finish_ok=finish_ok,
                     block=block,
+                    ai=ai_ctx,
                 )
 
             easy_btn.scroll_into_view_if_needed(timeout=3000)
@@ -965,6 +1010,7 @@ def apply_via_linkedin(
                         human_wait=human_wait,
                         finish_ok=finish_ok,
                         block=block,
+                        ai=ai_ctx,
                     )
             except Exception:
                 pass
@@ -995,6 +1041,7 @@ def apply_via_linkedin(
                                     human_wait=human_wait,
                                     finish_ok=finish_ok,
                                     block=block,
+                                    ai=ai_ctx,
                                 )
                         except Exception:
                             continue

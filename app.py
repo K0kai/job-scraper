@@ -275,6 +275,19 @@ def initialize() -> None:
           model TEXT NOT NULL DEFAULT '',
           created_at TEXT NOT NULL
         )""")
+        # Cache GLOBAL de respostas de IA por pergunta normalizada ('open' ou 'choices').
+        db.execute("""CREATE TABLE IF NOT EXISTS ai_answer_cache (
+          id INTEGER PRIMARY KEY,
+          question_norm TEXT NOT NULL UNIQUE,
+          question_raw TEXT NOT NULL,
+          kind TEXT NOT NULL DEFAULT 'open',
+          answer TEXT NOT NULL,
+          provider TEXT NOT NULL DEFAULT '',
+          model TEXT NOT NULL DEFAULT '',
+          hits INTEGER NOT NULL DEFAULT 0,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        )""")
         decision_cols = {row["name"] for row in db.execute("PRAGMA table_info(ai_decisions)")}
         if "resume_language" not in decision_cols:
             db.execute("ALTER TABLE ai_decisions ADD COLUMN resume_language TEXT NOT NULL DEFAULT ''")

@@ -99,22 +99,12 @@ def lookslike_open_question(label: str, tag: str = "textarea") -> bool:
     return any(hint in hay for hint in OPEN_QUESTION_HINTS)
 
 
-def generate_open_answer(
-    *,
-    question: str,
-    job: dict,
-    resume_summary: str,
-    resume_json: str,
-    facts: str,
-    provider: str,
-    model: str,
-    api_key: str,
+def build_open_question_prompt(
+    *, question: str, job: dict, resume_summary: str, resume_json: str, facts: str
 ) -> str:
-    if not api_key:
-        raise AiUnavailableError("IA indisponível: chave não configurada.")
     language = job.get("language") or "en"
     language_name = "Portuguese" if language == "pt" else "English"
-    prompt = f"""Answer this job-application screening question in {language_name}.
+    return f"""Answer this job-application screening question in {language_name}.
 Use ONLY the resume analysis and candidate facts. Never invent projects, employers, metrics, or skills.
 If the facts are insufficient, reply with exactly: INSUFFICIENT_FACTS
 Return only the answer text.
@@ -126,36 +116,28 @@ Resume analysis JSON: {resume_json[:8000] or '[none]'}
 Job title: {job.get('title')}
 Company: {job.get('company')}
 """
-    provider = provider.casefold().strip()
-    try:
-        if provider == "openai":
-            endpoint = "https://api.openai.com/v1/responses"
-            payload = json.dumps({"model": model, "input": prompt, "store": False, "max_output_tokens": 450}).encode("utf-8")
-            headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-        elif provider == "gemini":
-            endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{quote_plus(model)}:generateContent?key={quote_plus(api_key)}"
-            payload = json.dumps({"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"maxOutputTokens": 450, "temperature": 0.3}}).encode("utf-8")
-            headers = {"Content-Type": "application/json"}
-        else:
-            raise ValueError("Provedor de IA inválido.")
-        request = Request(endpoint, data=payload, headers=headers, method="POST")
-        with urlopen(request, timeout=60) as response:
-            result = json.loads(response.read().decode("utf-8"))
-    except HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")[:300]
-        if exc.code in {401, 403, 429} or "quota" in body.casefold():
-            raise AiUnavailableError(f"IA indisponível (HTTP {exc.code}).") from exc
-        raise
-    except Exception as exc:
-        msg = str(exc).casefold()
-        if "quota" in msg or "api key" in msg or "401" in msg or "429" in msg:
-            raise AiUnavailableError(str(exc)) from exc
-        raise
 
-    if provider == "openai":
-        answer = "\n".join(part.get("text", "") for item in result.get("output", []) for part in item.get("content", []) if part.get("type") == "output_text").strip()
-    else:
-        answer = "\n".join(part.get("text", "") for item in result.get("candidates", []) for part in item.get("content", {}).get("parts", [])).strip()
+
+def generate_open_answer(
+    *,
+    question: str,
+    job: dict,
+    resume_summary: str,
+    resume_json: str,
+    facts: str,
+    provider: str,
+    model: str,
+    api_key: str,
+) -> str:
+    from ai_client import call_ai_text
+
+    prompt = build_open_question_prompt(
+        question=question, job=job, resume_summary=resume_summary,
+        resume_json=resume_json, facts=facts,
+    )
+    answer = call_ai_text(
+        prompt=prompt, provider=provider, model=model, api_key=api_key, temperature=0.3
+    )
     if not answer or answer.strip() == "INSUFFICIENT_FACTS":
         raise ValueError("IA sem base suficiente para responder a pergunta aberta.")
     return answer[:1200]
