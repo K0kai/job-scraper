@@ -735,7 +735,9 @@ def process_auto_job(job_id: int) -> str:
             if ok:
                 dry = "dry-run" in detail.casefold()
                 human_sent = detail.casefold().startswith(("assisted:", "auto:"))
-                job_status = "applied" if human_sent else ("prepared" if dry else "applied")
+                # Sai de 'worth' só com sucesso real; dry-run/timeout permanece lá
+                # para nova tentativa (nota atualizada com o que aconteceu).
+                job_status = "applied" if human_sent else ("worth" if dry else "applied")
                 with connect() as db:
                     if job_status == "applied":
                         db.execute(
@@ -954,7 +956,8 @@ def process_worth_easy_apply(job_id: int) -> str:
     if ok:
         dry = "dry-run" in detail.casefold()
         human_sent = detail.casefold().startswith(("assisted:", "auto:"))
-        job_status = "applied" if human_sent else ("prepared" if dry else "applied")
+        # Mesma regra do fluxo automático: só sucesso real tira a vaga do worth.
+        job_status = "applied" if human_sent else ("worth" if dry else "applied")
         with connect() as db:
             if job_status == "applied":
                 db.execute(
@@ -1011,12 +1014,18 @@ def enqueue_worth_easy_apply(job_id: int) -> str:
     if job.get("status") not in {"worth", "prepared", "blocked"}:
         return f"Só é possível Easy Apply a partir de Vale a pena olhar (status atual: {job.get('status')})."
     if not is_assisted_apply_job(job):
-        return "Esta vaga não parece LinkedIn/InHire."
+        return "Esta vaga não parece LinkedIn nem ATS suportado (InHire, Greenhouse, Lever, Gupy)."
     qid = queue.enqueue(KIND_LINKEDIN, {"job_id": job_id}, dedupe_key=f"linkedin:{job_id}")
     with connect() as db:
+        # A vaga PERMANECE em 'worth' enquanto está na fila/processando — sair de
+        # lá só com resultado real (enviada). Se o worker morrer, ela não sumiu.
         db.execute(
-            "UPDATE jobs SET status='review', notes=? WHERE id=? AND status IN ('worth','prepared','blocked')",
-            (f"Easy Apply / InHire na fila (job #{qid}). Fique atento à janela do Chrome.", job_id),
+            "UPDATE jobs SET notes=? WHERE id=? AND status IN ('worth','prepared','blocked')",
+            (
+                f"Na fila do Easy Apply (fila #{qid}) — a vaga continua em Vale a pena olhar "
+                "ate sair o resultado. Fique atento à janela do Chrome.",
+                job_id,
+            ),
         )
     log_event("info", "linkedin", f"Vaga #{job_id} enfileirada para Easy Apply/InHire (fila #{qid}).")
     return f"Candidatura assistida enfileirada (fila #{qid}). No Chrome: revise, captcha e Enviar são com você."

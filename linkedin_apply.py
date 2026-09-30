@@ -10,6 +10,7 @@ import re
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlparse
 
 from form_rules import find_rule_for_label, list_rules, pick_select_option, resolve_rule_value
 from resume_pipeline import AiUnavailableError
@@ -47,20 +48,39 @@ SUCCESS_RE = re.compile(
     r"aplicação\s+enviada|submitted",
     re.I,
 )
-CHECKPOINT_RE = re.compile(
-    r"checkpoint|captcha|unusual\s+activity|verify\s+it.?s\s+you|"
-    r"security\s+verification|challenge|suspeita|verifica(r|ção)",
+# Hints de logout só em SEGMENTOS de path — nunca substring no URL inteiro
+# (bug: "challenge_id=77" em tracking param era lido como checkpoint/login).
+LOGGED_OUT_PATH_TOKENS = ("login", "authwall", "uas", "checkpoint", "challenge", "session_redirect")
+CHECKPOINT_PATH_TOKENS = ("checkpoint", "challenge", "captcha")
+# Widgets reais de captcha — evidência estrutural única na página.
+CAPTCHA_EVIDENCE_MARKERS = (
+    "g-recaptcha",
+    "recaptcha/api.js",
+    "recaptcha.net",
+    "h-captcha",
+    "hcaptcha.com",
+    "challenges.cloudflare.com/turnstile",
+    "cf-turnstile",
+)
+# Frase de verificação precisa vir JUNTO de um formulário de verificação
+# (evidência estrutural dupla); sozinha em copy de vaga é falso positivo.
+VERIFY_PHRASE_RE = re.compile(
+    r"unusual\s+activity|verify\s+it.?s\s+you|security\s+verification|"
+    r"verifica(r|ção)\s+(de\s+)?(sua\s+)?(identidade|conta|seguran[aç]a)",
     re.I,
 )
-LOGIN_HINTS = (
-    "authwall",
-    "/login",
-    "sign-in",
-    "/uas/",
-    "checkpoint",
-    "challenge",
-    "session_redirect",
-)
+
+
+def _path_tokens(url: str) -> list[str]:
+    try:
+        parts = urlparse(url or "").path.casefold().split("/")
+    except Exception:
+        return []
+    return [p for p in parts if p]
+
+
+def _url_has_path_token(url: str, tokens: tuple[str, ...]) -> bool:
+    return any(tok in _path_tokens(url) for tok in tokens)
 
 # Conservative defaults — override via settings, never raise above hard ceilings.
 HARD_MAX_PER_DAY = 8
@@ -127,7 +147,7 @@ def _page_looks_logged_out(page) -> bool:
         href = (page.url or "").casefold()
     except Exception:
         href = ""
-    if any(token in href for token in LOGIN_HINTS):
+    if _url_has_path_token(href, LOGGED_OUT_PATH_TOKENS):
         return True
 
     try:
@@ -144,7 +164,7 @@ def _page_looks_logged_out(page) -> bool:
         pass
 
     body = _page_text_snip(page, 8000).casefold()
-    if CHECKPOINT_RE.search(body) and "sign in" not in body and "entrar" not in body:
+    if _page_has_checkpoint(page) and "sign in" not in body and "entrar" not in body:
         return False
 
     guest_signals = (
@@ -170,13 +190,30 @@ def _page_looks_logged_out(page) -> bool:
 
 
 def _page_has_checkpoint(page) -> bool:
+    """Só com evidência estrutural: rota de verificação OU widget de captcha.
+
+    Antes bastava a palavra 'challenge'/'verificação' no texto (descrições de
+    vaga comuns) e a página normal travava esperando um captcha inexistente.
+    """
     try:
-        href = (page.url or "").casefold()
+        href = page.url or ""
     except Exception:
         href = ""
-    if any(t in href for t in ("checkpoint", "challenge", "captcha")):
+    if _url_has_path_token(href, CHECKPOINT_PATH_TOKENS):
         return True
-    return bool(CHECKPOINT_RE.search(_page_text_snip(page, 5000)))
+    try:
+        html = (page.content() or "")[:400000].casefold()
+    except Exception:
+        html = ""
+    if any(marker in html for marker in CAPTCHA_EVIDENCE_MARKERS):
+        return True
+    # Frase de verificação SÓ vale junto de form de verificação (dupla evidência).
+    body = _page_text_snip(page, 5000)
+    if VERIFY_PHRASE_RE.search(body) and any(
+        t in html for t in ("checkpoint", "verification", "authwall")
+    ):
+        return True
+    return False
 
 
 def _wait_for_human_checkpoint(page, *, minutes: int) -> bool:
