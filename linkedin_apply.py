@@ -522,19 +522,51 @@ def _handle_external_ats(
     return block(detail)
 
 
-def _modal(page):
-    for sel in (
-        '[role="dialog"]',
-        ".jobs-easy-apply-modal",
-        "div.artdeco-modal",
-    ):
-        loc = page.locator(sel).first
+_MODAL_SELECTORS = (
+    '[role="dialog"]',
+    ".jobs-easy-apply-modal",
+    "div.artdeco-modal",
+)
+
+
+def _visible_modal(page, *, limit: int = 6):
+    """Primeiro diálogo/overlay REALMENTE visível, não apenas o 1º match.
+
+    O LinkedIn mantém dialogs ocultos montados no DOM (typeahead, notificações)
+    que aparecem ANTES do modal da candidatura: `.first` congelava num desses e
+    o wait expirava com o modal aberto na tela (reproduzido no shim do pydoll).
+    Nota: ':visible' não existe no pydoll — daí a varredura por nth().
+    """
+    for sel in _MODAL_SELECTORS:
         try:
-            if loc.count() and loc.is_visible(timeout=500):
-                return loc
+            loc = page.locator(sel)
+            count = min(int(loc.count()), limit)
         except Exception:
             continue
-    return page.locator('[role="dialog"]').first
+        for i in range(count):
+            cand = loc.nth(i)
+            try:
+                if cand.is_visible(timeout=300):
+                    return cand
+            except Exception:
+                continue
+    return None
+
+
+def _modal(page, *, timeout_ms: float = 10000):
+    """Polling que REAVALIA o DOM até algum modal ficar visível; None = não abriu.
+
+    Diferente do antigo `.first` congelado: o modal do Easy Apply monta depois do
+    clique; varrer de novo a cada round é o que pega o dialog certo.
+    """
+    deadline = time.monotonic() + max(0.0, timeout_ms) / 1000.0
+    while True:
+        found = _visible_modal(page)
+        if found is not None:
+            return found
+        if time.monotonic() >= deadline:
+            return None
+        _human_pause(0.25, 0.5)
 
 
 def _collect_controls(modal) -> list[dict]:
@@ -1045,9 +1077,7 @@ def apply_via_linkedin(
                         return block("Checkpoint durante o wizard; parado sem enviar.")
 
                 modal = _modal(page)
-                try:
-                    modal.wait_for(state="visible", timeout=10000)
-                except Exception:
+                if modal is None:
                     for p in context.pages:
                         try:
                             if find_handler(p.url or "") is not None:
@@ -1098,8 +1128,11 @@ def apply_via_linkedin(
                         return block(cnote)
                     if cstate == "solved":
                         page = cpage
+                        retry_modal = _modal(page, timeout_ms=4000)
+                        if retry_modal is None:
+                            retry_modal = _visible_modal(page) or page
                         err2 = _fill_modal_step(
-                            page=page, modal=_modal(page), rules=rules, cfg=cfg, job=job,
+                            page=page, modal=retry_modal, rules=rules, cfg=cfg, job=job,
                             cover_letter=cover_letter, resume_path=resume_path,
                             resume_summary=resume_summary, resume_json=resume_json,
                             facts=facts, provider=provider, model=model, api_key=api_key,
