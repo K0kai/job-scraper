@@ -10,7 +10,7 @@ import re
 import time
 
 from ats_base import BaseATSHandler, FillResult, register
-from form_rules import detect_salary_currency, format_cpf, salary_for
+from form_rules import detect_contract_regime, detect_salary_currency, format_cpf, job_context_text, salary_for
 
 LOG = logging.getLogger("job-scraper")
 
@@ -67,9 +67,12 @@ def _salary_inhire(page, cfg: dict[str, str], ctx) -> str:
     except Exception:
         hint = ""
     currency = detect_salary_currency(hint, preferred=cfg.get("salary_currency_preference", ""))
-    value = salary_for(cfg, currency)
+    # Regime CLT×PJ detectado na vaga/página vence a preferência do painel.
+    job = (ctx.ai or {}).get("job") if ctx.ai else None
+    regime = detect_contract_regime(hint, job_context_text(job))
+    value = salary_for(cfg, currency, regime=regime)
     if not value and currency != "BRL":
-        value = salary_for(cfg, "BRL")
+        value = salary_for(cfg, "BRL", regime=regime)
     if not value:  # legado: algum campo livre ainda alimenta ctx.salary
         value = (ctx.salary or cfg.get("linkedin_salary_expectation") or "").strip()
     return value
@@ -783,7 +786,11 @@ class InHireHandler(BaseATSHandler):
                     filled.extend(new_found)
                     _pause(0.8, 1.5)
                 elif pass_no > 1:
-                    break  # duas passadas sem progresso: humano resolve
+                    break  # duas passadas sem progresso
+            # ainda travado = falta resposta obrigatoria que nao achamos: o
+            # copiloto de IA assume (override total) em vez de ir pro humano.
+            if _continue_disabled(page):
+                missing.append("continuar-registro")
             return FillResult(ok=not missing, filled=filled, missing=missing)
         except Exception as exc:
             return FillResult(ok=False, filled=filled, missing=missing, error=str(exc))

@@ -28,7 +28,7 @@ from browser_engine import (
     scan_buttons,
     wait_for_matching_button,
 )
-from form_rules import find_rule_for_label, pick_select_option, prepare_text_value, resolve_rule_value
+from form_rules import find_rule_for_label, job_context_text, pick_select_option, prepare_text_value, resolve_rule_value
 
 LOG = logging.getLogger("job-scraper")
 
@@ -214,6 +214,7 @@ def _apply_field(page, field: dict, rule: dict | None, ctx: ApplyContext) -> tup
     value = resolve_rule_value(
         rule, ctx.cfg, cover_letter=ctx.cover_letter, resume_path=ctx.resume_path,
         field_hint=field_hint,
+        job_text=job_context_text((ctx.ai or {}).get("job")),
     )
     if value is None:
         return None

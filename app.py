@@ -2017,8 +2017,16 @@ def job_rows_html(jobs, collecting: bool) -> str:
         lang_label = {"pt": "Português", "en": "English", "unknown": "Incerto"}.get(job["language"], job["language"])
         confidence = f" · {job['language_confidence']:.0%}" if job["language_confidence"] else ""
         letter_ui = f'<details><summary>{"Carta criada" if job["cover_letter"] else "Carta não criada"}</summary><div class="description">{esc(job["cover_letter"] or "A carta será gerada automaticamente na candidatura.")}</div></details>'
-        notes = f'<details><summary>Notas</summary><div class="description">{esc(job["notes"] or "—")}</div></details>' if job["notes"] else ""
-        rows.append(f'''<tr><td><a class="job-title" href="{esc(job['url'])}" target="_blank" rel="noreferrer">{esc(job['title'])}</a><small>{esc(job['company'])}</small></td><td>{esc(job['location'])}</td><td><span class="source">{esc(job['source'])}</span></td><td><span title="Confiança do detector: {confidence}">{esc(lang_label + confidence)}</span></td><td>{esc(STATUSES.get(job['status'], job['status']))}</td><td>{letter_ui}{notes}<details><summary>Descrição</summary><div class="description">{esc(description[:1800])}</div></details></td><td><small>{esc(format_brasilia_date(job['posted_at'] or job['first_seen_at']))}</small></td></tr>''')
+        if "COPILOT_UNAUTOMATED:" in (job["notes"] or ""):
+            notes = (
+                '<span style="background:#3a2f00;border:1px solid #e8c33f;color:#ffd54a;'
+                'font-weight:700;padding:3px 8px;border-radius:6px">⚠ fluxo não automatizado pela IA'
+                "</span>"
+                f'<details><summary>Detalhes</summary><div class="description">{esc(job["notes"])}</div></details>'
+            )
+        else:
+            notes = f'<details><summary>Notas</summary><div class="description">{esc(job["notes"] or "—")}</div></details>' if job["notes"] else ""
+        rows.append(f'''<tr><td><a class="job-title" href="{esc(job['url'])}" target="_blank" rel="noreferrer">{esc(job['title'])}</a><small>{esc(job['company'])}</small></td><td>{esc(job['location'])}</td><td><span class="source" title="{esc(job['source'])}">{esc(job['source'])}</span></td><td><span title="Confiança do detector: {confidence}">{esc(lang_label + confidence)}</span></td><td>{esc(STATUSES.get(job['status'], job['status']))}</td><td>{letter_ui}{notes}<details><summary>Descrição</summary><div class="description">{esc(description[:1800])}</div></details></td><td><small>{esc(format_brasilia_date(job['posted_at'] or job['first_seen_at']))}</small></td></tr>''')
     if rows:
         return "".join(rows)
     if collecting:
@@ -2132,13 +2140,22 @@ def _worth_match_expr() -> str:
 
 
 def _notes_html(notes: str) -> str:
-    """Nota do card 'Vale a pena olhar'; destaque vermelho p/ handler ATS ausente."""
-    if "NO_HANDLER:" in (notes or ""):
+    """Nota do card 'Vale a pena olhar'; vermelho p/ handler ausente, AMARELO
+    destacado p/ fluxo nao automatizado pelo copiloto de IA."""
+    text = notes or ""
+    if "COPILOT_UNAUTOMATED:" in text:
+        return (
+            '<p class="hint" style="background:#3a2f00;border:1px solid #e8c33f;'
+            'color:#ffd54a;font-weight:700;padding:10px 12px;border-radius:8px">'
+            "⚠ " + esc(text).replace("COPILOT_UNAUTOMATED: ", "Não foi possível automatizar o fluxo. ")
+            + "</p>"
+        )
+    if "NO_HANDLER:" in text:
         return (
             '<p class="hint" style="color:#b3261e;font-weight:600">'
-            f"{esc(notes)}</p>"
+            f"{esc(text)}</p>"
         )
-    return f'<p class="hint">{esc(notes or "")}</p>'
+    return f'<p class="hint">{esc(text)}</p>'
 
 
 def worth_html(*, page: int = 1, page_size: int = WORTH_PAGE_SIZE, min_match: int = 0) -> str:
@@ -2582,8 +2599,9 @@ tr:last-child td{border-bottom:0}
 td small{display:block;color:var(--muted2);margin-top:3px}
 .job-title{font-weight:700;color:var(--white);text-decoration:none}
 .job-title:hover{color:var(--accent2)}
-.source{background:var(--panel2);border:1px solid var(--line);color:var(--muted);padding:2px 8px;
-border-radius:99px;font-size:11px}
+.source{background:var(--panel2);border:1px solid var(--line);color:var(--muted);padding:2px 10px;
+border-radius:99px;font-size:11px;display:inline-block;max-width:140px;overflow:hidden;
+text-overflow:ellipsis;white-space:nowrap;vertical-align:middle;line-height:1.6}
 select{min-width:150px;margin:0;padding:7px}
 summary{cursor:pointer;color:var(--muted);font-size:13px}
 .description{max-width:360px;max-height:220px;overflow:auto;padding:8px 0;font-size:12.5px;color:var(--muted)}

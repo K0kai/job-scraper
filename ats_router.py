@@ -24,6 +24,8 @@ OUTCOME_ASSISTED = "assisted"
 OUTCOME_TIMEOUT = "timeout"
 OUTCOME_FAILED = "failed"
 OUTCOME_NO_HANDLER = "no_handler"
+#: copiloto de IA assumiu, não conseguiu, fechou a página — nota AMARELA no painel
+OUTCOME_UNAUTOMATED = "unautomated"
 
 #: imports de efeito colateral (registro via @register) — um por site suportado
 _HANDLER_MODULES: tuple[str, ...] = (
@@ -63,6 +65,23 @@ def _host_of(url: str) -> str:
         return (urlparse(url or "").netloc or url or "")[:120]
     except Exception:
         return url or "?"
+
+
+def copilot_rescue(page, context, cfg: dict, ai: dict, *, reason: str) -> tuple[str, str, object]:
+    """Chama o copiloto de IA (override total). Nunca levanta exceção — se o
+    módulo falhar, cai para UNAVAILABLE e o fluxo segue o comportamento antigo."""
+    try:
+        from ats_copilot import ABORTED, SOLVED, copilot_takeover
+
+        state, detail, active = copilot_takeover(page, context, reason=reason, cfg=cfg, ai=ai)
+        if state == SOLVED:
+            return "solved", detail, active
+        if state == ABORTED:
+            return "aborted", detail, None
+        return "unavailable", detail, page
+    except Exception as exc:
+        LOG.warning("copiloto falhou (%s); seguindo sem ele.", exc)
+        return "unavailable", str(exc), page
 
 
 def _reanchor(page, context, handler_cls: type[BaseATSHandler]):
@@ -110,6 +129,16 @@ def run_ats_flow(
     handler_cls = find_handler(current_url)
     if handler_cls is None:
         host = _host_of(current_url)
+        # site sem driver: o copiloto assume com override total antes de desistir
+        state, note, cpage = copilot_rescue(page, context, cfg, ai or {},
+                                            reason=f"pagina de candidatura sem driver ATS instalado ({host})")
+        if state == "solved" and cpage is not None:
+            outcome = wait_for_human(cpage, minutes=human_wait)
+            if outcome == "submitted":
+                return OUTCOME_ASSISTED, f"copiloto destravou {host}; voce enviou (assistido)."
+            return OUTCOME_TIMEOUT, f"copiloto destravou {host}; sem confirmacao de envio."
+        if state == "aborted":
+            return OUTCOME_UNAUTOMATED, note
         detail = (
             f"NO_HANDLER: apply externo em {host} — nenhum driver ATS instalado. "
             "Preencha/envie manualmente se quiser."
@@ -146,6 +175,18 @@ def run_ats_flow(
         if fill_res.error:
             bits.append(str(fill_res.error))
         fill_note = " (preenchimento incompleto — " + "; ".join(bits) + ")"
+        # Travou: o copiloto assume com override total antes de chamar o humano.
+        state, note, cpage = copilot_rescue(page, context, cfg, ai or {},
+                                           reason="formulario travado — " + fill_note.strip(" ()"))
+        if state == "aborted":
+            return OUTCOME_UNAUTOMATED, note
+        if state == "solved" and cpage is not None:
+            # IA destravou (clicou Next, abriu o proximo passo). NAO re-executamos
+            # instance.fill — em sites que ja avancaram (ex.: InHire) isso daria
+            # duplo-avanco. Assumimos o passo liberado e seguimos a politica normal.
+            page = cpage
+            fill_res = FillResult(ok=True, filled=list(fill_res.filled), missing=[])
+            fill_note = " (copiloto destravou)"
 
     obstacles = instance.detect_obstacles(page)
     if not obstacles and handler_cls.auto_submit_capable and fill_res.ok:
@@ -216,6 +257,8 @@ __all__ = [
     "OUTCOME_NO_HANDLER",
     "OUTCOME_SUBMITTED",
     "OUTCOME_TIMEOUT",
+    "OUTCOME_UNAUTOMATED",
+    "copilot_rescue",
     "find_handler",
     "run_ats_flow",
 ]

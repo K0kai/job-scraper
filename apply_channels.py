@@ -9,7 +9,7 @@ import sqlite3
 from email.message import EmailMessage
 from typing import Callable
 
-from form_rules import find_rule_for_label, list_rules, pick_select_option, prepare_text_value, resolve_rule_value
+from form_rules import find_rule_for_label, job_context_text, list_rules, pick_select_option, prepare_text_value, resolve_rule_value
 from resume_pipeline import AiUnavailableError, get_resume
 
 LOG = logging.getLogger("job-scraper")
@@ -20,6 +20,26 @@ OPEN_QUESTION_HINTS = (
     "conte", "fale sobre", "project", "projeto", "experience with", "experiencia com",
     "what makes", "additional", "essay", "cover your",
 )
+
+#: varre controles rotulados do formulário (1 evaluate) — usado por apply_via_browser
+_BROWSER_CONTROLS_JS = """() => {
+  const out = [];
+  const nodes = document.querySelectorAll('input, textarea, select');
+  for (const el of nodes) {
+    if (el.type === 'hidden' || el.type === 'submit' || el.type === 'button' || el.disabled) continue;
+    const id = el.id || '';
+    let label = '';
+    if (id) {
+      const lab = document.querySelector(`label[for="${CSS.escape(id)}"]`);
+      if (lab) label = lab.innerText || '';
+    }
+    if (!label && el.closest('label')) label = el.closest('label').innerText || '';
+    if (!label) label = [el.name, el.placeholder, el.getAttribute('aria-label'), el.id].filter(Boolean).join(' ');
+    const options = el.tagName === 'SELECT' ? Array.from(el.options).map(o => o.text) : [];
+    out.push({ tag: el.tagName.toLowerCase(), type: (el.type || '').toLowerCase(), name: el.name || '', label, placeholder: el.placeholder || '', options });
+  }
+  return out;
+}"""
 
 
 def extract_emails(text: str) -> list[str]:
@@ -267,11 +287,87 @@ def apply_via_browser(
         )
         return False, detail
 
+    def _fill_pass(active_page) -> str | None:
+        """Uma passada de regras no formulário. None = pronto para enviar;
+        string = motivo do travamento (vai para o copiloto de IA)."""
+        nonlocal open_count
+        controls = active_page.evaluate(_BROWSER_CONTROLS_JS) or []
+        if not controls:
+            return "Nenhum formulário público detectado."
+
+        for control in controls:
+            label = control.get("label") or control.get("name") or ""
+            tag = control.get("tag")
+            ctype = control.get("type")
+            rule = find_rule_for_label(label, rules)
+            selector_bits = []
+            if control.get("name"):
+                selector_bits.append(f'[name="{control["name"]}"]')
+            locator = active_page.locator(",".join(selector_bits)).first if selector_bits else None
+
+            if rule and str(rule["mode"]) == "skip":
+                continue
+
+            if rule is None and lookslike_open_question(label, tag if tag == "textarea" else "input"):
+                open_count += 1
+                if open_count > 5:
+                    return "Muitas perguntas abertas; vaga pulada."
+                try:
+                    answer = generate_open_answer(
+                        question=label,
+                        job=job,
+                        resume_summary=resume_summary,
+                        resume_json=resume_json,
+                        facts=facts,
+                        provider=provider,
+                        model=model,
+                        api_key=api_key,
+                    )
+                except AiUnavailableError as exc:
+                    return f"Pergunta aberta detectada; IA indisponível — vaga pulada. {exc}"
+                except Exception as exc:
+                    return f"Não foi possível responder pergunta aberta; vaga pulada. {exc}"
+                pending_answers.append((label[:500], answer))
+                if locator:
+                    locator.fill(answer)
+                continue
+
+            if rule is None:
+                # required unknown field: skip optional anonymous inputs
+                continue
+
+            field_hint = " ".join(str(control.get(k) or "") for k in ("label", "placeholder", "name"))
+            value = resolve_rule_value(rule, cfg, cover_letter=cover_letter, resume_path=resume_path, field_hint=field_hint, job_text=job_context_text(job))
+            if value is None or value == "":
+                if str(rule["mode"]) in {"select", "salary", "file"} or (tag == "textarea"):
+                    return f"Campo obrigatório sem valor configurado: {rule['key']}"
+                continue
+            if str(value).strip().casefold() in {"ask", "both", "nao_informado", "not_informed"}:
+                continue  # decisao reservada ao humano (ex.: Contractor × Employee)
+            value = prepare_text_value(rule, str(value), field_hint)
+
+            if not locator:
+                continue
+            mode = str(rule["mode"])
+            if mode == "file" or ctype == "file":
+                locator.set_input_files(resume_path)
+            elif tag == "select" or mode == "select":
+                options = control.get("options") or []
+                preferred = str(rule.get("value") or "").strip() or str(value)
+                chosen = pick_select_option(list(options), preferred)
+                if not chosen:
+                    return f"Nenhuma opção de select compatível para {rule['key']} (valor: {value})"
+                locator.select_option(label=chosen)
+            else:
+                locator.fill(value)
+        return None
+
     with sync_playwright() as playwright:
         from browser_engine import chrome_launch_args
 
         browser = playwright.chromium.launch(headless=True, args=chrome_launch_args())
-        page = browser.new_page()
+        context = browser.new_context()
+        page = context.new_page()
         try:
             page.goto(job["url"], wait_until="domcontentloaded", timeout=45000)
             content = page.content().casefold()
@@ -279,114 +375,48 @@ def apply_via_browser(
                 browser.close()
                 return block("Página exige login ou CAPTCHA; envio automático pulado.")
 
-            # Collect labeled controls
-            controls = page.evaluate(
-                """() => {
-                  const out = [];
-                  const nodes = document.querySelectorAll('input, textarea, select');
-                  for (const el of nodes) {
-                    if (el.type === 'hidden' || el.type === 'submit' || el.type === 'button' || el.disabled) continue;
-                    const id = el.id || '';
-                    let label = '';
-                    if (id) {
-                      const lab = document.querySelector(`label[for="${CSS.escape(id)}"]`);
-                      if (lab) label = lab.innerText || '';
-                    }
-                    if (!label && el.closest('label')) label = el.closest('label').innerText || '';
-                    if (!label) label = [el.name, el.placeholder, el.getAttribute('aria-label'), el.id].filter(Boolean).join(' ');
-                    const options = el.tagName === 'SELECT' ? Array.from(el.options).map(o => o.text) : [];
-                    out.push({ tag: el.tagName.toLowerCase(), type: (el.type || '').toLowerCase(), name: el.name || '', label, placeholder: el.placeholder || '', options });
-                  }
-                  return out;
-                }"""
-            )
-            if not controls:
+            ai_ctx = {
+                "job": job, "resume_summary": resume_summary, "resume_json": resume_json,
+                "facts": facts, "provider": provider, "model": model, "api_key": api_key,
+                "connect_fn": connect_fn, "now_iso": now_iso,
+            }
+            active = page
+            stuck = _fill_pass(active)
+
+            if stuck is not None:
+                # Travou: o copiloto assume com override total antes de desistir.
+                from ats_copilot import COPILOT_FAIL_PREFIX
+                from ats_router import copilot_rescue
+
+                state, note, cpage = copilot_rescue(active, context, cfg, ai_ctx,
+                                                    reason="formulário de candidatura travado — " + stuck)
+                if state == "aborted":
+                    browser.close()
+                    return block(note)  # nota AMARELA no painel
+                if state == "solved":
+                    active = cpage or active
+                    stuck = _fill_pass(active)
+                    if stuck is not None:
+                        browser.close()
+                        return block(f"{COPILOT_FAIL_PREFIX} destravou, mas o formulário travou de novo — {stuck}")
+
+            if stuck is not None:
+                # sem copiloto (IA indisponível): comportamento antigo
                 browser.close()
-                return block("Nenhum formulário público detectado.")
-
-            for control in controls:
-                label = control.get("label") or control.get("name") or ""
-                tag = control.get("tag")
-                ctype = control.get("type")
-                rule = find_rule_for_label(label, rules)
-                selector_bits = []
-                if control.get("name"):
-                    selector_bits.append(f'[name="{control["name"]}"]')
-                locator = page.locator(",".join(selector_bits)).first if selector_bits else None
-
-                if rule and str(rule["mode"]) == "skip":
-                    continue
-
-                if rule is None and lookslike_open_question(label, tag if tag == "textarea" else "input"):
-                    open_count += 1
-                    if open_count > 5:
-                        browser.close()
-                        return block("Muitas perguntas abertas; vaga pulada.")
-                    try:
-                        answer = generate_open_answer(
-                            question=label,
-                            job=job,
-                            resume_summary=resume_summary,
-                            resume_json=resume_json,
-                            facts=facts,
-                            provider=provider,
-                            model=model,
-                            api_key=api_key,
-                        )
-                    except AiUnavailableError as exc:
-                        browser.close()
-                        return block(f"Pergunta aberta detectada; IA indisponível — vaga pulada. {exc}")
-                    except Exception as exc:
-                        browser.close()
-                        return block(f"Não foi possível responder pergunta aberta; vaga pulada. {exc}")
-                    pending_answers.append((label[:500], answer))
-                    if locator:
-                        locator.fill(answer)
-                    continue
-
-                if rule is None:
-                    # required unknown field: skip optional anonymous inputs
-                    continue
-
-                field_hint = " ".join(str(control.get(k) or "") for k in ("label", "placeholder", "name"))
-                value = resolve_rule_value(rule, cfg, cover_letter=cover_letter, resume_path=resume_path, field_hint=field_hint)
-                if value is None or value == "":
-                    if str(rule["mode"]) in {"select", "salary", "file"} or (tag == "textarea"):
-                        browser.close()
-                        return block(f"Campo obrigatório sem valor configurado: {rule['key']}")
-                    continue
-                if str(value).strip().casefold() in {"ask", "both", "nao_informado", "not_informed"}:
-                    continue  # decisao reservada ao humano (ex.: Contractor × Employee)
-                value = prepare_text_value(rule, str(value), field_hint)
-
-                if not locator:
-                    continue
-                mode = str(rule["mode"])
-                if mode == "file" or ctype == "file":
-                    locator.set_input_files(resume_path)
-                elif tag == "select" or mode == "select":
-                    options = control.get("options") or []
-                    preferred = str(rule.get("value") or "").strip() or str(value)
-                    chosen = pick_select_option(list(options), preferred)
-                    if not chosen:
-                        browser.close()
-                        return block(f"Nenhuma opção de select compatível para {rule['key']} (valor: {value})")
-                    locator.select_option(label=chosen)
-                else:
-                    locator.fill(value)
+                return block(stuck)
 
             # Try submit
             submitted = False
             for text in ("Submit", "Apply", "Enviar", "Candidatar", "Send application", "Apply now"):
-                btn = page.get_by_role("button", name=re.compile(text, re.I))
+                btn = active.get_by_role("button", name=re.compile(text, re.I))
                 if btn.count():
                     btn.first.click(timeout=5000)
                     submitted = True
                     break
             if not submitted:
-                page.locator('input[type="submit"]').first.click(timeout=3000)
+                active.locator('input[type="submit"]').first.click(timeout=3000)
                 submitted = True
-            page.wait_for_timeout(1500)
+            active.wait_for_timeout(1500)
             browser.close()
         except Exception as exc:
             try:

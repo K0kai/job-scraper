@@ -77,6 +77,7 @@ class FillOutcomeTests(unittest.TestCase):
              mock.patch("ats_inhire._click_visible_choice", return_value=True), \
              mock.patch("ats_inhire._fill_diversity_step"), \
              mock.patch("ats_inhire._prefer_english_ui"), \
+             mock.patch("ats_inhire._continue_disabled", return_value=False), \
              mock.patch("ats_inhire._pause"):
             ctx = ats_base.ApplyContext(
                 cfg={"candidate_name": "Ana", "candidate_email": "a@x.com",

@@ -79,9 +79,10 @@ def save_rules_from_form(db: sqlite3.Connection, form: dict[str, str]) -> None:
         order += 10
 
 
-def resolve_rule_value(rule: sqlite3.Row | dict, cfg: dict[str, str], *, cover_letter: str = "", resume_path: str = "", field_hint: str = "") -> str | None:
-    """Valor a aplicar. `field_hint` = label+placeholder+name do campo na página
-    (usado pelo modo `salary` para inferir a moeda esperada)."""
+def resolve_rule_value(rule: sqlite3.Row | dict, cfg: dict[str, str], *, cover_letter: str = "", resume_path: str = "", field_hint: str = "", job_text: str = "") -> str | None:
+    """Valor a aplicar. `field_hint` = label+placeholder+name do campo na página;
+    `job_text` = texto da vaga/página. O modo `salary` usa `field_hint` para a
+    moeda e `job_text` para detectar CLT×PJ (detecção vence a preferência do painel)."""
     mode = str(rule["mode"])
     if mode == "skip":
         return None
@@ -91,9 +92,10 @@ def resolve_rule_value(rule: sqlite3.Row | dict, cfg: dict[str, str], *, cover_l
         return resume_path
     if mode == "salary":
         currency = detect_salary_currency(field_hint, preferred=cfg.get("salary_currency_preference", ""))
-        value = salary_for(cfg, currency)
+        regime = detect_contract_regime(field_hint, job_text)
+        value = salary_for(cfg, currency, regime=regime)
         if not value and currency == "USD":  # so temos BRL configurado
-            value = salary_for(cfg, "BRL")
+            value = salary_for(cfg, "BRL", regime=regime)
         return value or str(rule["value"] or "")
     value_from = str(rule["value_from"] or "").strip()
     if value_from:
@@ -190,10 +192,55 @@ def _prefers_contractor(cfg: dict[str, str]) -> bool:
     return pref in {"contractor", "pj", "autonomo", "autônomo", "prestador", "freelance"}
 
 
-def salary_for(cfg: dict[str, str], currency: str) -> str:
-    """Pretensão do painel na moeda pedida. BRL = base CLT; se a preferência de
-    contratação for PJ, aplica o multiplicador (SÓ faz sentido em reais/Brasil).
-    USD ignora o multiplicador. Vazio = não configurado."""
+#: sinais de regime de contratação na vaga/página — detecção vence a preferência.
+_PJ_SIGNALS = (
+    r"\bpj\b", r"pessoa jur[ií]dica", r"contractor", r"contract(or|ing)\b",
+    r"self[- ]?employ", r"independent contractor", r"\bb2b\b", r"1099",
+    r"freelanc", r"prestador de servi", r"aut[oô]nomo", r"como pessoa jur",
+)
+_CLT_SIGNALS = (
+    r"\bclt\b", r"celetista", r"carteira assinada", r"\bemployee\b", r"empregad",
+    r"efetivo", r"contrata[cç][aã]o\s+(clt|efetiv|com carteira)", r"\bw-?2\b",
+    r"full[- ]time employee", r"regime clt", r"clt\b",
+)
+
+
+def detect_contract_regime(*texts: str) -> str | None:
+    """'PJ' | 'CLT' | None a partir do texto da vaga/página (majoria de sinais).
+
+    None = indefinido — quem decide é a preferência do painel. Empate = None.
+    """
+    hay = " ".join(t for t in texts if t).casefold()
+    if not hay.strip():
+        return None
+    pj = sum(1 for pat in _PJ_SIGNALS if re.search(pat, hay))
+    clt = sum(1 for pat in _CLT_SIGNALS if re.search(pat, hay))
+    if pj > clt:
+        return "PJ"
+    if clt > pj:
+        return "CLT"
+    return None
+
+
+def job_context_text(job: dict | None, page_text: str = "") -> str:
+    """Título+companhia+descrição da vaga (+texto da página) p/ detecção de regime."""
+    job = job or {}
+    parts = [
+        str(job.get("title") or ""),
+        str(job.get("location") or ""),
+        str(job.get("description") or "")[:4000],
+        page_text[:2000],
+    ]
+    return " ".join(p for p in parts if p)
+
+
+def salary_for(cfg: dict[str, str], currency: str, *, regime: str | None = None) -> str:
+    """Pretensão do painel na moeda pedida. BRL = base CLT.
+
+    `regime` (detecção da vaga) vence a preferência do painel: 'PJ' aplica o
+    multiplicador, 'CLT' não aplica. `regime=None` cai na preferência do painel.
+    USD ignora o multiplicador. Vazio = não configurado.
+    """
     if currency == "USD":
         raw = (cfg.get("salary_expectation_usd") or "").strip()
         return format_usd(raw) if raw else ""
@@ -203,7 +250,8 @@ def salary_for(cfg: dict[str, str], currency: str) -> str:
     base = _parse_amount(raw)
     if base is None or base <= 0:
         return format_brl(raw)
-    if _prefers_contractor(cfg):
+    contractor = (regime == "PJ") if regime else _prefers_contractor(cfg)
+    if contractor:
         base = base * _pj_multiplier(cfg)
     return format_brl(str(base))
 

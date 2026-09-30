@@ -12,7 +12,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
-from form_rules import find_rule_for_label, list_rules, pick_select_option, prepare_text_value, resolve_rule_value
+from form_rules import find_rule_for_label, job_context_text, list_rules, pick_select_option, prepare_text_value, resolve_rule_value
 from resume_pipeline import AiUnavailableError
 
 from apply_channels import (
@@ -391,10 +391,10 @@ def _find_external_apply_button(page):
     return None
 
 
-def _salary_from_rules(rules: list[dict], cfg: dict[str, str]) -> str:
+def _salary_from_rules(rules: list[dict], cfg: dict[str, str], job_text: str = "") -> str:
     for rule in rules:
         if str(rule.get("key") or "").casefold() == "salary":
-            value = resolve_rule_value(rule, cfg) or ""
+            value = resolve_rule_value(rule, cfg, field_hint=job_text, job_text=job_text) or ""
             return str(value).strip()
     return ""
 
@@ -483,7 +483,7 @@ def _handle_external_ats(
             except Exception:
                 continue
 
-    salary = _salary_from_rules(rules, cfg)
+    salary = _salary_from_rules(rules, cfg, job_context_text(job))
     outcome, detail = run_ats_flow(
         page,
         context,
@@ -671,7 +671,7 @@ def _fill_modal_step(
         field_hint = " ".join(
             str(control.get(k) or "") for k in ("label", "placeholder", "name", "id")
         )
-        value = resolve_rule_value(rule, cfg, cover_letter=cover_letter, resume_path=resume_path, field_hint=field_hint)
+        value = resolve_rule_value(rule, cfg, cover_letter=cover_letter, resume_path=resume_path, field_hint=field_hint, job_text=job_context_text(job))
         if value is None or value == "":
             if str(rule["mode"]) in {"select", "salary", "file"}:
                 return f"Campo sem valor configurado: {rule['key']} — preencha no Chrome."
@@ -1089,19 +1089,39 @@ def apply_via_linkedin(
                     connect_fn=connect_fn,
                 )
                 if err:
-                    # Still leave browser open briefly so you can finish by hand.
-                    LOG.warning("Fill incomplete (%s) — aguardando você no Chrome.", err)
-                    outcome = _wait_for_human_submit(page, minutes=human_wait)
-                    try:
-                        context.close()
-                    except Exception:
-                        pass
-                    if outcome == "submitted":
-                        return finish_ok(
-                            "assisted: você enviou após preenchimento parcial.",
-                            status_detail="Easy Apply enviado por você (assistido, fill parcial).",
+                    # Travou no modal Easy Apply: o copiloto assume com override total.
+                    from ats_router import copilot_rescue
+
+                    cstate, cnote, cpage = copilot_rescue(page, context, cfg, ai_ctx,
+                                                          reason="modal Easy Apply travado — " + str(err))
+                    if cstate == "aborted":
+                        return block(cnote)
+                    if cstate == "solved":
+                        page = cpage
+                        err2 = _fill_modal_step(
+                            page=page, modal=_modal(page), rules=rules, cfg=cfg, job=job,
+                            cover_letter=cover_letter, resume_path=resume_path,
+                            resume_summary=resume_summary, resume_json=resume_json,
+                            facts=facts, provider=provider, model=model, api_key=api_key,
+                            pending_answers=pending_answers, open_count=open_count,
+                            ai_ctx=ai_ctx, now_iso=now_iso, connect_fn=connect_fn,
                         )
-                    return block(f"{err} (Chrome ficou aberto para correção; sem envio automático.)")
+                        if not err2:
+                            err = None
+                    if err:
+                        # Copiloto nao resolveu (ou nao havia IA): browser aberto p/ humano.
+                        LOG.warning("Fill incomplete (%s) — aguardando você no Chrome.", err)
+                        outcome = _wait_for_human_submit(page, minutes=human_wait)
+                        try:
+                            context.close()
+                        except Exception:
+                            pass
+                        if outcome == "submitted":
+                            return finish_ok(
+                                "assisted: você enviou após preenchimento parcial.",
+                                status_detail="Easy Apply enviado por você (assistido, fill parcial).",
+                            )
+                        return block(f"{err} (Chrome ficou aberto para correção; sem envio automático.)")
 
                 _human_pause(0.7, 1.6)
 
