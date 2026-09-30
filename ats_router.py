@@ -25,7 +25,12 @@ OUTCOME_FAILED = "failed"
 OUTCOME_NO_HANDLER = "no_handler"
 
 #: imports de efeito colateral (registro via @register) — um por site suportado
-_HANDLER_MODULES: tuple[str, ...] = ()
+_HANDLER_MODULES: tuple[str, ...] = (
+    "ats_inhire",
+    "ats_greenhouse",
+    "ats_lever",
+    "ats_gupy",
+)
 
 _RELOAD_STATE = False
 
