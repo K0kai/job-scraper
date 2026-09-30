@@ -28,7 +28,7 @@ from browser_engine import (
     scan_buttons,
     wait_for_matching_button,
 )
-from form_rules import find_rule_for_label, pick_select_option, resolve_rule_value
+from form_rules import find_rule_for_label, pick_select_option, prepare_text_value, resolve_rule_value
 
 LOG = logging.getLogger("job-scraper")
 
@@ -93,6 +93,7 @@ _FIELDS_JS = """() => {
       type,
       name: el.name || '',
       id,
+      placeholder: el.placeholder || '',
       options,
       required: !!el.required,
     });
@@ -207,8 +208,17 @@ def _apply_field(page, field: dict, rule: dict | None, ctx: ApplyContext) -> tup
     mode = str(rule.get("mode") or "text")
     if mode == "skip":
         return None
-    value = resolve_rule_value(rule, ctx.cfg, cover_letter=ctx.cover_letter, resume_path=ctx.resume_path)
+    field_hint = " ".join(
+        str(field.get(k) or "") for k in ("label", "placeholder", "name", "id")
+    )
+    value = resolve_rule_value(
+        rule, ctx.cfg, cover_letter=ctx.cover_letter, resume_path=ctx.resume_path,
+        field_hint=field_hint,
+    )
     if value is None:
+        return None
+    # "ask"/"both" do painel = decisao humana (ex.: Contractor × Employee)
+    if str(value).strip().casefold() in {"ask", "both", "nao_informado", "not_informed"}:
         return None
     if not str(value).strip():
         return (str(rule.get("key") or label), False)
@@ -221,6 +231,18 @@ def _apply_field(page, field: dict, rule: dict | None, ctx: ApplyContext) -> tup
         except Exception as exc:
             LOG.debug("upload falhou (%s): %s", sel, exc)
             return (key, False)
+    value = prepare_text_value(rule, str(value), field_hint)
+    if mode == "salary":
+        # input de texto: digita no formato da moeda inferida. select nativo
+        # (faixas): tenta casar; sem opcao compativel → humano decide.
+        if field.get("tag") == "select":
+            preferred = str(rule.get("value") or "").strip() or str(value)
+            if safe_select(page, sel, field.get("options") or [], preferred):
+                return (key, True)
+            return (key, False)
+        if safe_fill(page, sel, str(value)):
+            return (key, True)
+        return (key, False)
     if field.get("tag") == "select" or mode == "select":
         preferred = str(value)
         if mode == "select" and rule.get("value"):

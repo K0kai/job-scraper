@@ -12,7 +12,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
-from form_rules import find_rule_for_label, list_rules, pick_select_option, resolve_rule_value
+from form_rules import find_rule_for_label, list_rules, pick_select_option, prepare_text_value, resolve_rule_value
 from resume_pipeline import AiUnavailableError
 
 from apply_channels import (
@@ -564,6 +564,7 @@ def _collect_controls(modal) -> list[dict]:
               type,
               name: el.name || '',
               id,
+              placeholder: el.placeholder || '',
               label: (label || '').slice(0, 400),
               options,
             });
@@ -667,11 +668,17 @@ def _fill_modal_step(
         if rule is None:
             continue
 
-        value = resolve_rule_value(rule, cfg, cover_letter=cover_letter, resume_path=resume_path)
+        field_hint = " ".join(
+            str(control.get(k) or "") for k in ("label", "placeholder", "name", "id")
+        )
+        value = resolve_rule_value(rule, cfg, cover_letter=cover_letter, resume_path=resume_path, field_hint=field_hint)
         if value is None or value == "":
-            if str(rule["mode"]) in {"select", "file"}:
+            if str(rule["mode"]) in {"select", "salary", "file"}:
                 return f"Campo sem valor configurado: {rule['key']} — preencha no Chrome."
             continue
+        if str(value).strip().casefold() in {"ask", "both", "nao_informado", "not_informed"}:
+            continue  # decisao reservada ao humano no painel
+        value = prepare_text_value(rule, value, field_hint)
         if not locator:
             continue
 
@@ -682,7 +689,10 @@ def _fill_modal_step(
                 _human_pause(0.5, 1.2)
             elif tag == "select" or mode == "select":
                 options = control.get("options") or []
-                chosen = pick_select_option(list(options), value)
+                # faixa de select: texto digitado na regra vence; senao casa o
+                # valor resolvido ("R$ 6.000" ⊂ "R$ 5.000 - R$ 7.000").
+                preferred = str(rule.get("value") or "").strip() or str(value)
+                chosen = pick_select_option(list(options), preferred)
                 if not chosen:
                     return f"Select sem opção compatível para {rule['key']} (valor: {value})"
                 locator.select_option(label=chosen)

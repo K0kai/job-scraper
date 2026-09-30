@@ -10,6 +10,7 @@ import re
 import time
 
 from ats_base import BaseATSHandler, FillResult, register
+from form_rules import detect_salary_currency, format_cpf, salary_for
 
 LOG = logging.getLogger("job-scraper")
 
@@ -47,6 +48,31 @@ def _local_phone_digits(cfg: dict[str, str]) -> str:
     if digits.startswith("0") and len(digits) > 10:
         digits = digits.lstrip("0")
     return digits
+
+
+def _salary_inhire(page, cfg: dict[str, str], ctx) -> str:
+    """Pretensão para o campo de salário do InHire.
+
+    A moeda é inferida do placeholder real do campo (R$ 0.000,00 → BRL,
+    '$' → USD); sem campo/mostrador, 'auto' cai no preferido do painel. O BRL
+    já sai multiplicado quando a contratação preferida é PJ (ver salary_for).
+    """
+    hint = ""
+    try:
+        loc = page.locator("#salaryExpectation, input[name='salaryExpectation']").first
+        if loc.count():
+            hint = " ".join(
+                str(loc.get_attribute(k) or "") for k in ("placeholder", "name")
+            )
+    except Exception:
+        hint = ""
+    currency = detect_salary_currency(hint, preferred=cfg.get("salary_currency_preference", ""))
+    value = salary_for(cfg, currency)
+    if not value and currency != "BRL":
+        value = salary_for(cfg, "BRL")
+    if not value:  # legado: algum campo livre ainda alimenta ctx.salary
+        value = (ctx.salary or cfg.get("linkedin_salary_expectation") or "").strip()
+    return value
 
 
 def _prefer_english_ui(page) -> None:
@@ -656,10 +682,20 @@ class InHireHandler(BaseATSHandler):
             city = (cfg.get("candidate_city") or "").strip() or "Belo Horizonte"
             city = city.split(",")[0].strip()
             linkedin = _linkedin_profile_value(cfg)
-            salary = (cfg.get("linkedin_salary_expectation") or cfg.get("salary_expectation") or ctx.salary or "").strip()
+            cpf = format_cpf(cfg.get("candidate_cpf") or "")
+
+            # Pretensão: moeda inferida do placeholder real do campo (R$ → BRL,
+            # $ → USD). BRL ja vem com o multiplicador PJ aplicado por salary_for.
+            salary = _salary_inhire(page, cfg, ctx)
 
             _fill_if_present(page, "#name, input[name='name']", name)
             filled.append("nome")
+            # CPF — so se configurado; o campo mascarado aceita '123.456.789-01'.
+            if cpf:
+                _fill_if_present(
+                    page, "input[name='document.value'], #cpf, input[name='cpf'], input[placeholder*='000.000']", cpf
+                )
+                filled.append("cpf")
             _fill_if_present(page, "#email, input[name='email']", email)
             filled.append("email")
 

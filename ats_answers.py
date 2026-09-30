@@ -37,6 +37,17 @@ DIVERSITY_RE = re.compile(
 #: identidade em area de texto que pede NUMERO/codigo (ex.: CID do laudo) —
 #: nunca template canonico; so nota livre do painel ou humano
 NUMBERISH_RE = re.compile(r"number|n[uú]mero|c[oó]digo|code|qual o", re.I)
+#: radio/select de tipo de contratacao (Contractor/Employee, PJ/CLT) — decisao do
+#: candidato no painel, nunca IA e nunca chute
+CONTRACT_RE = re.compile(
+    r"\bcontract\s*type\b|type of contract|contract type|employment type|"
+    r"tipo de contrata|modelo de contrata|regime de contrata|\bcontrata[cç][aã]o\b",
+    re.I,
+)
+_CONTRACT_TOKENS = {
+    "employee": ("employee", "empregado", "clt", "efetivo", "celetista", "full time"),
+    "contractor": ("contractor", "contract", "pj", "autonomo", "prestador", "freelance", "independent"),
+}
 # consentimento legal — nunca responder automaticamente aqui
 CONSENT_RE = re.compile(
     r"\bagree\b|consent|terms|privacy|autorizo|concordo|pol[ií]tica de privacidade",
@@ -273,6 +284,17 @@ def _truthy_pcd(cfg: dict[str, str]) -> str:
     if raw in {"0", "no", "nao", "não", "false"}:
         return "no"
     return raw or NOT_INFORMED
+
+
+def contract_choice_for(cfg: dict[str, str], options: list[str]) -> str | None:
+    """Opcao Contractor/Employee conforme preferencia do painel. 'ask'/vazio → None (humano)."""
+    pref = (cfg.get("candidate_contract_type") or "").strip().casefold()
+    if pref in {"", "ask", "both", "nao_informado", "not_informed"}:
+        return None
+    tokens = _CONTRACT_TOKENS.get(pref)
+    if not tokens:  # valor livre: casa por substring direto
+        tokens = (pref,)
+    return _match_option(options, tokens)
 
 
 def build_choices_prompt(
@@ -578,9 +600,17 @@ def answer_choice_groups(scope, ctx, *, log_prefix: str = "form") -> tuple[list[
         if kind == "consent":
             continue  # obrigaçao do handler, nao decisao de IA
         chosen: list[str] | None = None
+        # tipo de contratação: decisao do painel (Contractor/Employee). Entra na
+        # cadeia antes da IA — sem preferencia definida fica com o humano.
+        is_contract = not group.get("multiple") and CONTRACT_RE.search(
+            f"{question} {' '.join(options)}"
+        )
         # "pertence a um dos grupos?" casa RACA+PCD+LGBTI+ na MESMA pergunta —
         # o texto nao necessariamente cai em DIVERSITY_RE, entao vem primeiro.
-        if group.get("multiple") and (
+        if is_contract:
+            got = contract_choice_for(ctx.cfg, options)
+            chosen = [got] if got else None
+        elif group.get("multiple") and (
             GROUPS_Q_RE.search(question)
             or GROUPS_Q_RE.search(" ".join(options))
         ):

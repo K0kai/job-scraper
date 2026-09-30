@@ -9,7 +9,7 @@ import sqlite3
 from email.message import EmailMessage
 from typing import Callable
 
-from form_rules import find_rule_for_label, list_rules, pick_select_option, resolve_rule_value
+from form_rules import find_rule_for_label, list_rules, pick_select_option, prepare_text_value, resolve_rule_value
 from resume_pipeline import AiUnavailableError, get_resume
 
 LOG = logging.getLogger("job-scraper")
@@ -295,7 +295,7 @@ def apply_via_browser(
                     if (!label && el.closest('label')) label = el.closest('label').innerText || '';
                     if (!label) label = [el.name, el.placeholder, el.getAttribute('aria-label'), el.id].filter(Boolean).join(' ');
                     const options = el.tagName === 'SELECT' ? Array.from(el.options).map(o => o.text) : [];
-                    out.push({ tag: el.tagName.toLowerCase(), type: (el.type || '').toLowerCase(), name: el.name || '', label, options });
+                    out.push({ tag: el.tagName.toLowerCase(), type: (el.type || '').toLowerCase(), name: el.name || '', label, placeholder: el.placeholder || '', options });
                   }
                   return out;
                 }"""
@@ -348,12 +348,16 @@ def apply_via_browser(
                     # required unknown field: skip optional anonymous inputs
                     continue
 
-                value = resolve_rule_value(rule, cfg, cover_letter=cover_letter, resume_path=resume_path)
+                field_hint = " ".join(str(control.get(k) or "") for k in ("label", "placeholder", "name"))
+                value = resolve_rule_value(rule, cfg, cover_letter=cover_letter, resume_path=resume_path, field_hint=field_hint)
                 if value is None or value == "":
-                    if str(rule["mode"]) in {"select", "file"} or (tag == "textarea"):
+                    if str(rule["mode"]) in {"select", "salary", "file"} or (tag == "textarea"):
                         browser.close()
                         return block(f"Campo obrigatório sem valor configurado: {rule['key']}")
                     continue
+                if str(value).strip().casefold() in {"ask", "both", "nao_informado", "not_informed"}:
+                    continue  # decisao reservada ao humano (ex.: Contractor × Employee)
+                value = prepare_text_value(rule, str(value), field_hint)
 
                 if not locator:
                     continue
@@ -362,7 +366,8 @@ def apply_via_browser(
                     locator.set_input_files(resume_path)
                 elif tag == "select" or mode == "select":
                     options = control.get("options") or []
-                    chosen = pick_select_option(list(options), value)
+                    preferred = str(rule.get("value") or "").strip() or str(value)
+                    chosen = pick_select_option(list(options), preferred)
                     if not chosen:
                         browser.close()
                         return block(f"Nenhuma opção de select compatível para {rule['key']} (valor: {value})")
