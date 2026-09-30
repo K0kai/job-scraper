@@ -2199,18 +2199,26 @@ def worth_html(*, page: int = 1, page_size: int = WORTH_PAGE_SIZE, min_match: in
             f'{"Todos" if n == 0 else f"{n}+"}</button>'
             for n in (0, 70, 80, 90)
         )
+        + '<span class="worth-ignore-all-wrap" style="margin-left:auto">'
+        '<button type="button" class="subtle" id="worth-ignore-all">Ignorar todas</button>'
+        '<span id="worth-ignore-all-confirm" hidden style="display:none;align-items:center;gap:8px;flex-wrap:wrap">'
+        '<span class="hint" style="margin:0;color:#ffd54a">Tem certeza? Isso ignora todas as vagas em Vale a pena olhar.</span>'
+        '<button type="button" class="stop" id="worth-ignore-all-yes">Confirmar</button>'
+        '<button type="button" class="subtle" id="worth-ignore-all-no">Cancelar</button>'
+        "</span></span>"
         + "</div>"
     )
 
     if total == 0:
         empty = (
+            '<div data-worth-current="1">'
             '<p class="hint">Nenhuma vaga neste filtro. '
             + (
                 "Ajuste o match mínimo ou limpe o filtro."
                 if min_match > 0
                 else "Quando houver bom match mas LinkedIn, falha de formulário/e-mail, a vaga aparece aqui."
             )
-            + "</p>"
+            + "</p></div>"
         )
         return filter_bar + empty
 
@@ -2264,7 +2272,7 @@ def worth_html(*, page: int = 1, page_size: int = WORTH_PAGE_SIZE, min_match: in
             f'<details><summary>{"Carta pronta para copiar" if letter else "Sem carta"}</summary><div class="description">{esc(letter or "—")}</div></details>'
             f'<div class="actions">'
             f"{easy_btn}"
-            f'<form method="post" action="/job-status" style="display:inline">'
+            f'<form method="post" action="/job-status" class="js-process-form" style="display:inline">'
             f'<input type="hidden" name="id" value="{int(job["id"])}">'
             f'<button class="subtle" name="status" value="applied" type="submit">Marcar como aplicada</button>'
             f'<button class="subtle" name="status" value="ignored" type="submit">Ignorar</button>'
@@ -2275,7 +2283,7 @@ def worth_html(*, page: int = 1, page_size: int = WORTH_PAGE_SIZE, min_match: in
     end = offset + len(rows)
     filter_note = f" · match ≥ {min_match}" if min_match > 0 else ""
     pager_bits = [
-        f'<div class="worth-pager" data-worth-pages="{pages}">'
+        f'<div class="worth-pager" data-worth-pages="{pages}" data-worth-current="{page}">'
         f'<span class="hint">Mostrando {start}–{end} de {total}{filter_note}</span>'
         '<div class="actions" style="margin-top:0">'
     ]
@@ -2330,7 +2338,17 @@ def live_payload(*, worth_page: int = 1, worth_min_match: int = 0) -> dict:
     history = history_html(runs)
     logs = logs_html()
     queue = queue_html()
+    worth_min_match = max(0, min(100, int(worth_min_match or 0)))
+    worth_page = max(1, int(worth_page or 1))
+    # Clamp page so "ignorar" na última página não pede um OFFSET vazio.
     worth = worth_html(page=worth_page, min_match=worth_min_match)
+    # worth_html já clampou page no HTML (data-worth-current); espelha no payload.
+    try:
+        m = re.search(r'data-worth-current="(\d+)"', worth or "")
+        if m:
+            worth_page = max(1, int(m.group(1)))
+    except Exception:
+        pass
     linkedin_filter = linkedin_filter_panel_html()
     next_in = next_run_countdown_seconds(status.get("next_run_at"))
     return {
@@ -2352,8 +2370,8 @@ def live_payload(*, worth_page: int = 1, worth_min_match: int = 0) -> dict:
         "queue_hash": _live_hash(queue),
         "worth_html": worth,
         "worth_hash": _live_hash(worth),
-        "worth_page": max(1, int(worth_page or 1)),
-        "worth_min_match": max(0, min(100, int(worth_min_match or 0))),
+        "worth_page": worth_page,
+        "worth_min_match": worth_min_match,
         "resume_status": resume_status_payload(),
         "linkedin_filter_html": linkedin_filter,
         "linkedin_filter_hash": _live_hash(linkedin_filter),
@@ -2789,6 +2807,18 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
   var worthPage = 1;
   var worthMinMatch = 0;
   var worthForceUpdate = false;
+  try {{
+    var savedPage = parseInt(localStorage.getItem("radar-worth-page"), 10);
+    if (savedPage > 0) worthPage = savedPage;
+    var savedMin = parseInt(localStorage.getItem("radar-worth-min-match"), 10);
+    if (!isNaN(savedMin)) worthMinMatch = Math.max(0, Math.min(100, savedMin));
+  }} catch (e) {{}}
+  function persistWorthState() {{
+    try {{
+      localStorage.setItem("radar-worth-page", String(worthPage));
+      localStorage.setItem("radar-worth-min-match", String(worthMinMatch));
+    }} catch (e) {{}}
+  }}
   function panelBusy(el) {{
     if (!el) return false;
     try {{
@@ -2832,6 +2862,40 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
     if (worthEl) worthEl.removeAttribute("data-hash");
     refresh();
   }}
+  function setWorthIgnoreConfirm(open) {{
+    var btn = document.getElementById("worth-ignore-all");
+    var box = document.getElementById("worth-ignore-all-confirm");
+    if (!btn || !box) return;
+    if (open) {{
+      btn.hidden = true;
+      box.hidden = false;
+      box.style.display = "inline-flex";
+    }} else {{
+      btn.hidden = false;
+      box.hidden = true;
+      box.style.display = "none";
+    }}
+  }}
+  function ignoreAllWorth() {{
+    fetch("/worth-ignore-all", {{
+      method: "POST",
+      body: new FormData(),
+      headers: {{ Accept: "application/json", "X-Requested-With": "fetch" }},
+      credentials: "same-origin"
+    }})
+      .then(function (r) {{ return r.json().then(function (data) {{ return {{ okHttp: r.ok, data: data }}; }}); }})
+      .then(function (res) {{
+        var data = res.data || {{}};
+        showNotice(data.notice || (data.ok ? "OK" : "Falha"), data.kind || (data.ok ? "success" : "error"));
+        worthPage = 1;
+        persistWorthState();
+        requestWorthRefresh();
+      }})
+      .catch(function () {{
+        showNotice("Falha de comunicação com o painel.", "error");
+        setWorthIgnoreConfirm(false);
+      }});
+  }}
   var worthBody = document.getElementById("worth-body");
   if (worthBody) {{
     worthBody.addEventListener("click", function (ev) {{
@@ -2839,6 +2903,7 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
       if (preset && worthBody.contains(preset)) {{
         worthMinMatch = parseInt(preset.getAttribute("data-worth-min-match"), 10) || 0;
         worthPage = 1;
+        persistWorthState();
         requestWorthRefresh();
         return;
       }}
@@ -2848,7 +2913,21 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
         if (isNaN(val)) val = 0;
         worthMinMatch = Math.max(0, Math.min(100, val));
         worthPage = 1;
+        persistWorthState();
         requestWorthRefresh();
+        return;
+      }}
+      if (ev.target && ev.target.id === "worth-ignore-all") {{
+        setWorthIgnoreConfirm(true);
+        return;
+      }}
+      if (ev.target && ev.target.id === "worth-ignore-all-no") {{
+        setWorthIgnoreConfirm(false);
+        return;
+      }}
+      if (ev.target && ev.target.id === "worth-ignore-all-yes") {{
+        ev.target.disabled = true;
+        ignoreAllWorth();
         return;
       }}
       var btn = ev.target.closest("[data-worth-page]");
@@ -2857,6 +2936,7 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
       var next = parseInt(btn.getAttribute("data-worth-page"), 10);
       if (!next || next === worthPage) return;
       worthPage = next;
+      persistWorthState();
       requestWorthRefresh();
     }});
     worthBody.addEventListener("keydown", function (ev) {{
@@ -2892,8 +2972,14 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
           nextRunAtIso = data.next_run_at || null;
           updateNextRunTimer();
         }}
-        if (data.worth_page) worthPage = data.worth_page;
-        if (typeof data.worth_min_match !== "undefined") worthMinMatch = data.worth_min_match;
+        if (data.worth_page) {{
+          worthPage = data.worth_page;
+          persistWorthState();
+        }}
+        if (typeof data.worth_min_match !== "undefined") {{
+          worthMinMatch = data.worth_min_match;
+          persistWorthState();
+        }}
         applyRegion(statsEl, data.stats_html, data.stats_hash, {{ key: "stats" }});
         applyRegion(jobsEl, data.jobs_html, data.jobs_hash, {{ key: "jobs", skipIfBusy: true, wrapScroll: ".table-wrap" }});
         applyRegion(historyEl, data.history_html, data.history_hash, {{ key: "history" }});
@@ -2946,7 +3032,9 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
     "/queue-eval-new": 1,
     "/queue-clear": 1,
     "/clear-logs": 1,
-    "/worth-easy-apply": 1
+    "/worth-easy-apply": 1,
+    "/job-status": 1,
+    "/worth-ignore-all": 1
   }};
   function noticeClass(kind) {{
     return {{
@@ -2974,11 +3062,16 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
     var path = action.split("?")[0];
     if (!PROCESS_PATHS[path]) return;
     ev.preventDefault();
-    var btn = form.querySelector('button[type="submit"], button:not([type])');
-    if (btn) btn.disabled = true;
+    var submitter = ev.submitter || form.querySelector('button[type="submit"], button:not([type])');
+    if (submitter) submitter.disabled = true;
+    var body = new FormData(form);
+    // multiplos botoes name=status (aplicada/ignorar/salvar): incluir o clicado
+    if (submitter && submitter.name) {{
+      body.set(submitter.name, submitter.value);
+    }}
     fetch(path, {{
       method: "POST",
-      body: new FormData(form),
+      body: body,
       headers: {{ Accept: "application/json", "X-Requested-With": "fetch" }},
       credentials: "same-origin"
     }})
@@ -2990,13 +3083,17 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
           var fileInput = form.querySelector('input[type="file"]');
           if (fileInput) fileInput.value = "";
         }}
-        refresh();
+        if (path === "/job-status" || path === "/worth-ignore-all" || path === "/worth-easy-apply") {{
+          requestWorthRefresh();
+        }} else {{
+          refresh();
+        }}
       }})
       .catch(function () {{
         showNotice("Falha de comunicação com o painel.", "error");
       }})
       .then(function () {{
-        if (btn) btn.disabled = false;
+        if (submitter) submitter.disabled = false;
       }});
   }});
   setInterval(refresh, 1500);
@@ -3348,8 +3445,25 @@ class Handler(BaseHTTPRequestHandler):
             if form.get("status") in STATUSES and form.get("id", "").isdigit():
                 with connect() as db:
                     applied = now_iso() if form["status"] == "applied" else None
-                    db.execute("UPDATE jobs SET status=?, applied_at=COALESCE(?, applied_at) WHERE id=?", (form["status"], applied, int(form["id"])))
-            self.redirect("Etapa da vaga atualizada.")
+                    db.execute(
+                        "UPDATE jobs SET status=?, applied_at=COALESCE(?, applied_at) WHERE id=?",
+                        (form["status"], applied, int(form["id"])),
+                    )
+                labels = {"applied": "marcada como aplicada", "ignored": "ignorada", "saved": "salva"}
+                label = labels.get(form["status"], "atualizada")
+                self.respond_notice(f"Vaga {label}.")
+            else:
+                self.respond_notice("Pedido inválido.", notice_kind="error", ok=False)
+        elif path == "/worth-ignore-all":
+            with connect() as db:
+                cur = db.execute("UPDATE jobs SET status='ignored' WHERE status='worth'")
+                n = cur.rowcount if cur.rowcount is not None else 0
+            if n <= 0:
+                self.respond_notice("Nenhuma vaga em Vale a pena olhar para ignorar.", notice_kind="info")
+            elif n == 1:
+                self.respond_notice("1 vaga ignorada.")
+            else:
+                self.respond_notice(f"{n} vagas ignoradas.")
         elif path == "/notes":
             if form.get("id", "").isdigit():
                 with connect() as db:
