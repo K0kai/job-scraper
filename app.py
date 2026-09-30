@@ -123,6 +123,8 @@ DEFAULT_SETTINGS = {
     "apify_actors_json": "[{\"id\": \"curious_coder~linkedin-jobs-scraper\", \"label\": \"LinkedIn Jobs\", \"enabled\": true, \"input_mode\": \"linkedin_search\", \"count\": 25}]",
     "apify_linkedin_filter_json": "",
     "apify_linkedin_filter_hash": "",
+    "ai_usage_json": "",
+    "apify_quota_snapshot_json": "",
     "smtp_host": "",
     "smtp_port": "587",
     "smtp_user": "",
@@ -345,6 +347,18 @@ def set_setting(key: str, value: str) -> None:
         db.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
 
 
+def _boot_usage_tracker() -> None:
+    from usage_tracker import STORE_KEY, configure_persistence
+
+    configure_persistence(
+        lambda: settings().get(STORE_KEY, "") or "",
+        lambda value: set_setting(STORE_KEY, value),
+    )
+
+
+_boot_usage_tracker()
+
+
 def detect_language(text: str) -> tuple[str, float]:
     """Detect English/Portuguese locally, using Lingua when installed."""
     sample = re.sub(r"<[^>]+>", " ", text or "")
@@ -413,14 +427,19 @@ Job description:
             result = json.loads(response.read().decode("utf-8"))
     except HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")[:300]
-        if exc.code in {401, 403, 429, 502, 503, 504} or "quota" in body.casefold():
+        quota = exc.code in {401, 403, 429, 502, 503, 504} or "quota" in body.casefold()
+        _record_ai_usage(provider, model, None, ok=False, quota_error=quota)
+        if quota:
             raise AiUnavailableError(f"IA indisponível ao gerar carta (HTTP {exc.code}).") from exc
         raise RuntimeError(f"Falha ao chamar a API de IA (HTTP {exc.code}).") from exc
     except Exception as exc:
         msg = str(exc).casefold()
-        if any(t in msg for t in ("429", "quota", "unavailable", "timeout")):
+        quota = any(t in msg for t in ("429", "quota", "unavailable", "timeout"))
+        _record_ai_usage(provider, model, None, ok=False, quota_error=quota)
+        if quota:
             raise AiUnavailableError(f"IA indisponível ao gerar carta: {exc}") from exc
         raise RuntimeError(f"Falha ao chamar a API de IA ({exc.__class__.__name__}).") from exc
+    _record_ai_usage(provider, model, result if isinstance(result, dict) else None, ok=True, quota_error=False)
     if provider == "openai":
         parts = [part.get("text", "") for item in result.get("output", []) for part in item.get("content", []) if part.get("type") == "output_text"]
         letter = "\n".join(parts).strip()
@@ -429,6 +448,28 @@ Job description:
     if not letter:
         raise RuntimeError("A API não retornou uma carta de apresentação.")
     return letter
+
+
+def _record_ai_usage(
+    provider: str,
+    model: str,
+    result: dict | None,
+    *,
+    ok: bool,
+    quota_error: bool,
+) -> None:
+    try:
+        from usage_tracker import try_record_ai_result
+
+        try_record_ai_result(
+            provider=provider,
+            model=model,
+            result=result,
+            ok=ok,
+            quota_error=quota_error,
+        )
+    except Exception:
+        pass
 
 
 def get_ai_key(provider: str) -> str:
@@ -593,9 +634,12 @@ Description: {re.sub(r'<[^>]+>', ' ', job['description'])[:10000]}"""
             result = json.loads(response.read().decode("utf-8"))
     except HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")[:300]
-        if exc.code in {401, 403, 429} or "quota" in body.casefold():
+        quota = exc.code in {401, 403, 429} or "quota" in body.casefold()
+        _record_ai_usage(provider, model, None, ok=False, quota_error=quota)
+        if quota:
             raise AiUnavailableError(f"IA indisponível (HTTP {exc.code}).") from exc
         raise
+    _record_ai_usage(provider, model, result if isinstance(result, dict) else None, ok=True, quota_error=False)
     if provider == "openai":
         raw = "\n".join(part.get("text", "") for item in result.get("output", []) for part in item.get("content", []) if part.get("type") == "output_text")
     else:
@@ -1167,6 +1211,141 @@ def apify_monthly_usage_usd(token: str) -> tuple[float, str]:
     return used, label
 
 
+def load_apify_quota_snapshot() -> dict:
+    from usage_tracker import APIFY_SNAPSHOT_KEY
+
+    raw = (settings().get(APIFY_SNAPSHOT_KEY) or "").strip()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def refresh_apify_quota_snapshot() -> dict:
+    """Busca limites oficiais da Apify e grava cache em settings (não usado no /live)."""
+    from usage_tracker import APIFY_SNAPSHOT_KEY, parse_apify_limits
+
+    token = secret_get("apify_token")
+    cfg = settings()
+    try:
+        local_limit = float(str(cfg.get("apify_monthly_credit_limit_usd", "5")).replace(",", "."))
+    except ValueError:
+        local_limit = 5.0
+    if not token:
+        snap = {
+            "used_usd": 0.0,
+            "api_limit_usd": 0.0,
+            "local_limit_usd": local_limit,
+            "cycle_label": "—",
+            "pct_of_local": 0.0,
+            "pct_of_api": 0.0,
+            "fetched_at": "",
+            "error": "Token Apify não configurado (IA & integrações).",
+        }
+        set_setting(APIFY_SNAPSHOT_KEY, json.dumps(snap, ensure_ascii=False))
+        return snap
+    try:
+        payload = fetch_json(f"{APIFY_API}/users/me/limits", headers=apify_headers(token), timeout=30)
+        snap = parse_apify_limits(payload if isinstance(payload, dict) else {}, local_limit_usd=local_limit)
+        # Alinha também o last_usage legado usado pelo coletor.
+        set_setting("apify_last_usage_usd", f"{snap['used_usd']:.4f}")
+        set_setting("apify_last_usage_cycle", snap.get("cycle_label") or "")
+    except Exception as exc:
+        snap = {
+            "used_usd": 0.0,
+            "api_limit_usd": 0.0,
+            "local_limit_usd": local_limit,
+            "cycle_label": "—",
+            "pct_of_local": 0.0,
+            "pct_of_api": 0.0,
+            "fetched_at": "",
+            "error": f"Falha ao consultar Apify: {exc}",
+        }
+    set_setting(APIFY_SNAPSHOT_KEY, json.dumps(snap, ensure_ascii=False))
+    return snap
+
+
+def usage_dashboard_html() -> str:
+    """Painel Uso & cotas: Apify (cache API) + estimativa local da IA ativa."""
+    from usage_tracker import STORE_KEY, load_store, summarize_ai_usage
+
+    cfg = settings()
+    provider = (cfg.get("ai_provider") or "gemini").casefold()
+    model = (cfg.get("ai_model") or "").strip()
+    snap = load_apify_quota_snapshot()
+    store = load_store(cfg.get(STORE_KEY) or "")
+    ai = summarize_ai_usage(store, provider=provider)
+
+    def bar(pct: float, *, warn: float = 80.0) -> str:
+        pct = max(0.0, min(100.0, float(pct or 0)))
+        cls = "usage-bar-fill warn" if pct >= warn else "usage-bar-fill"
+        return (
+            f'<div class="usage-bar"><div class="{cls}" style="width:{pct:.1f}%"></div></div>'
+            f'<p class="hint" style="margin:6px 0 0">{pct:.0f}% do limite</p>'
+        )
+
+    if snap.get("error") and not snap.get("fetched_at"):
+        apify_body = f'<p class="hint">{esc(snap.get("error"))}</p>'
+    elif not snap:
+        apify_body = '<p class="hint">Ainda sem dados. Clique em <strong>Atualizar cotas</strong> para consultar a API Apify.</p>'
+    else:
+        used = float(snap.get("used_usd") or 0)
+        api_lim = float(snap.get("api_limit_usd") or 0)
+        local_lim = float(snap.get("local_limit_usd") or 0)
+        effective = local_lim if local_lim > 0 else api_lim
+        pct = float(snap.get("pct_of_local") if local_lim > 0 else snap.get("pct_of_api") or 0)
+        err = snap.get("error") or ""
+        apify_body = (
+            f'<div class="usage-metrics">'
+            f'<div><span>Usado (ciclo)</span><strong>${used:.2f}</strong></div>'
+            f'<div><span>Limite da conta (API)</span><strong>${api_lim:.2f}</strong></div>'
+            f'<div><span>Limite local (painel)</span><strong>${local_lim:.2f}</strong></div>'
+            f'<div><span>Ciclo</span><strong>{esc(snap.get("cycle_label") or "—")}</strong></div>'
+            f'</div>'
+            f'{bar(pct if effective > 0 else 0)}'
+            f'<p class="hint">Última consulta: {esc(snap.get("fetched_at") or "—")}'
+            + (f' · {esc(err)}' if err else "")
+            + "</p>"
+        )
+
+    day = ai["day"]
+    month = ai["month"]
+    provider_label = {"gemini": "Gemini", "openai": "OpenAI"}.get(provider, provider)
+    ai_body = (
+        f'<p class="hint"><strong>Estimativa local deste app</strong> — não é a cota oficial do provedor. '
+        f'Conta só chamadas feitas por aqui (tokens quando a API devolver).</p>'
+        f'<p class="hint">Provedor ativo: <strong>{esc(provider_label)}</strong>'
+        + (f' · modelo <code>{esc(model)}</code>' if model else "")
+        + f' · dia {esc(ai["day_label"])} / mês {esc(ai["month_label"])} (UTC)</p>'
+        f'<div class="usage-metrics">'
+        f'<div><span>Chamadas OK (hoje)</span><strong>{int(day.get("calls_ok") or 0)}</strong></div>'
+        f'<div><span>Erros de quota (hoje)</span><strong>{int(day.get("calls_quota_error") or 0)}</strong></div>'
+        f'<div><span>Tokens in / out (hoje)</span><strong>{int(day.get("tokens_in") or 0)} / {int(day.get("tokens_out") or 0)}</strong></div>'
+        f'<div><span>Chamadas OK (mês)</span><strong>{int(month.get("calls_ok") or 0)}</strong></div>'
+        f'<div><span>Tokens in / out (mês)</span><strong>{int(month.get("tokens_in") or 0)} / {int(month.get("tokens_out") or 0)}</strong></div>'
+        f'<div><span>Erros de quota (mês)</span><strong>{int(month.get("calls_quota_error") or 0)}</strong></div>'
+        f'</div>'
+        f'<p class="hint">Painel oficial: '
+        f'<a href="https://aistudio.google.com/usage" target="_blank" rel="noreferrer">Google AI Studio</a> · '
+        f'<a href="https://platform.openai.com/usage" target="_blank" rel="noreferrer">OpenAI Usage</a></p>'
+    )
+
+    return (
+        '<section class="panel">'
+        '<div class="actions" style="justify-content:space-between;margin-top:0">'
+        "<h2 style=\"margin:0\">Uso &amp; cotas</h2>"
+        '<form method="post" action="/usage-refresh" class="js-process-form">'
+        '<button type="submit" class="subtle">Atualizar cotas Apify</button></form></div>'
+        '<div class="usage-grid">'
+        f'<article class="usage-card"><h3>Apify</h3>{apify_body}</article>'
+        f'<article class="usage-card"><h3>IA ({esc(provider_label)})</h3>{ai_body}</article>'
+        "</div></section>"
+    )
+
+
 def normalize_apify_actor_id(actor_id: str) -> str:
     raw = (actor_id or "").strip()
     if "/" in raw and "~" not in raw:
@@ -1405,12 +1584,16 @@ Resume summary EN: {resume_en[:6000] or '[none]'}
             result = json.loads(response.read().decode("utf-8"))
     except HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")[:300]
-        if exc.code in {401, 403, 429} or "quota" in body.casefold():
+        quota = exc.code in {401, 403, 429} or "quota" in body.casefold()
+        _record_ai_usage(provider, model, None, ok=False, quota_error=quota)
+        if quota:
             raise AiUnavailableError(f"IA indisponível ao gerar filtro LinkedIn (HTTP {exc.code}).") from exc
         raise
     except URLError as exc:
+        _record_ai_usage(provider, model, None, ok=False, quota_error=True)
         raise AiUnavailableError(f"IA indisponível ao gerar filtro LinkedIn: {exc}") from exc
 
+    _record_ai_usage(provider, model, result if isinstance(result, dict) else None, ok=True, quota_error=False)
     if provider == "openai":
         raw_text = "\n".join(
             part.get("text", "")
@@ -2464,6 +2647,7 @@ def live_payload(*, worth_page: int = 1, worth_min_match: int = 0) -> dict:
     except Exception:
         pass
     linkedin_filter = linkedin_filter_panel_html()
+    usage = usage_dashboard_html()
     next_in = next_run_countdown_seconds(status.get("next_run_at"))
     return {
         "state": status["state"],
@@ -2489,6 +2673,8 @@ def live_payload(*, worth_page: int = 1, worth_min_match: int = 0) -> dict:
         "resume_status": resume_status_payload(),
         "linkedin_filter_html": linkedin_filter,
         "linkedin_filter_hash": _live_hash(linkedin_filter),
+        "usage_html": usage,
+        "usage_hash": _live_hash(usage),
     }
 
 
@@ -2775,6 +2961,15 @@ color:#c9c9d1;border:1px solid var(--line);border-radius:10px;padding:12px;max-h
 .queue-succeeded{background:rgba(78,163,107,.16);color:#8fd6a6}
 .queue-failed{background:rgba(194,84,77,.2);color:#f0a0a0}
 .queue-cancelled{background:var(--panel2);color:var(--muted)}
+.usage-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px;margin-top:14px}
+.usage-card{border:1px solid var(--line);border-radius:12px;padding:16px;background:var(--panel2)}
+.usage-card h3{margin:0 0 12px;font-size:14px;color:var(--white)}
+.usage-metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:12px;margin:10px 0}
+.usage-metrics span{display:block;font-size:11px;color:var(--muted2);margin-bottom:4px}
+.usage-metrics strong{font-size:16px;color:var(--white)}
+.usage-bar{height:8px;border-radius:999px;background:#1a1a1e;overflow:hidden;margin-top:8px}
+.usage-bar-fill{height:100%;background:var(--ok);border-radius:999px}
+.usage-bar-fill.warn{background:var(--warn)}
 .worth-list{display:grid;gap:14px}
 .worth-card{border:1px solid var(--line);border-radius:12px;padding:15px;background:var(--panel)}
 .worth-head{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap}
@@ -2809,6 +3004,7 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
     logs_view = logs_html()
     queue_view = queue_html()
     worth_view = worth_html()
+    usage_view = usage_dashboard_html()
     linkedin_filter_view = linkedin_filter_panel_html(cfg)
     notice_class = {
         "success": "notice notice-ok",
@@ -2831,6 +3027,7 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
 <button type="button" class="tab active" data-tab="painel">Visão geral</button>
 <button type="button" class="tab" data-tab="vale">Vale a pena olhar</button>
 <button type="button" class="tab" data-tab="filas">Filas de IA</button>
+<button type="button" class="tab" data-tab="uso">Uso &amp; cotas</button>
 <button type="button" class="tab" data-tab="logs">Logs</button>
 <span class="nav-label">Configuração</span>
 <button type="button" class="tab" data-tab="busca">Busca &amp; coleta</button>
@@ -2866,6 +3063,8 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
 <div id="tab-vale" class="tab-panel"><section class="panel"><h2>Vale a pena olhar</h2><p class="hint">Vagas com bom match em LinkedIn (Easy Apply desligado/falhou) ou em que e-mail/formulário automático não funcionou. Em vagas LinkedIn, use <strong>Easy Apply</strong> para preencher sem nova busca — você confirma o envio no Chrome.</p><div id="worth-body">{worth_view}</div></section></div>
 
 <div id="tab-filas" class="tab-panel"><section class="panel"><h2>Filas de IA (async + retry)</h2><p class="hint">Análise de currículo e candidaturas rodam em paralelo (até 3 workers). Em fila/rate-limit da API, o job entra em retry automático até sucesso, expirar (24h) ou cancelar.</p><div id="queue-body">{queue_view}</div></section></div>
+
+<div id="tab-uso" class="tab-panel"><div id="usage-body">{usage_view}</div></div>
 
 <div id="tab-logs" class="tab-panel"><section class="panel"><div class="actions" style="justify-content:space-between;margin-top:0"><h2 style="margin:0">Logs do processo</h2><form method="post" action="/clear-logs" class="js-process-form"><button class="subtle" type="submit">Limpar logs</button></form></div><p class="hint">Atualiza automaticamente. Mostra coleta, análise de currículo, triagem da IA, SMTP e navegador.</p><div id="logs-body" class="log-console">{logs_view}</div></section></div>
 
@@ -3103,6 +3302,12 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
         applyRegion(worthEl, data.worth_html, data.worth_hash, {{ key: "worth", skipIfBusy: !worthForceUpdate }});
         worthForceUpdate = false;
         applyRegion(
+          document.getElementById("usage-body"),
+          data.usage_html,
+          data.usage_hash,
+          {{ key: "usage", skipIfBusy: true }}
+        );
+        applyRegion(
           document.getElementById("linkedin-filter-slot"),
           data.linkedin_filter_html,
           data.linkedin_filter_hash,
@@ -3148,6 +3353,7 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
     "/queue-eval-new": 1,
     "/queue-clear": 1,
     "/clear-logs": 1,
+    "/usage-refresh": 1,
     "/worth-easy-apply": 1,
     "/job-status": 1,
     "/worth-ignore-all": 1
@@ -3504,6 +3710,19 @@ class Handler(BaseHTTPRequestHandler):
             n = clear_logs()
             log_event("info", "logs", f"Histórico limpo ({n} entradas removidas).")
             self.respond_notice("Logs limpos.", notice_kind="info")
+        elif path == "/usage-refresh":
+            snap = refresh_apify_quota_snapshot()
+            if snap.get("error") and not snap.get("fetched_at"):
+                self.respond_notice(str(snap.get("error")), notice_kind="warning")
+            elif snap.get("error"):
+                self.respond_notice(f"Apify atualizado com aviso: {snap.get('error')}", notice_kind="warning")
+            else:
+                used = float(snap.get("used_usd") or 0)
+                lim = float(snap.get("local_limit_usd") or snap.get("api_limit_usd") or 0)
+                self.respond_notice(
+                    f"Apify: ${used:.2f} de ${lim:.2f} no ciclo {snap.get('cycle_label') or 'atual'}.",
+                    notice_kind="success",
+                )
         elif path == "/queue-cancel":
             jid = form.get("id", "")
             if jid.isdigit() and queue.cancel(int(jid)):

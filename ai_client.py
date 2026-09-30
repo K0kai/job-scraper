@@ -28,6 +28,7 @@ def call_ai_text(
     if not api_key:
         raise AiUnavailableError("IA indisponivel: chave nao configurada.")
     provider = provider.casefold().strip()
+    result: dict | None = None
     try:
         if provider == "openai":
             endpoint = "https://api.openai.com/v1/responses"
@@ -54,24 +55,45 @@ def call_ai_text(
             result = json.loads(response.read().decode("utf-8"))
     except HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")[:300]
-        if exc.code in {401, 403, 429} or "quota" in body.casefold():
+        quota = exc.code in {401, 403, 429} or "quota" in body.casefold()
+        _record(provider, model, None, ok=False, quota_error=quota)
+        if quota:
             raise AiUnavailableError(f"IA indisponivel (HTTP {exc.code}).") from exc
         raise
     except Exception as exc:
         msg = str(exc).casefold()
-        if "quota" in msg or "api key" in msg or "401" in msg or "429" in msg:
+        quota = "quota" in msg or "api key" in msg or "401" in msg or "429" in msg
+        _record(provider, model, None, ok=False, quota_error=quota)
+        if quota:
             raise AiUnavailableError(str(exc)) from exc
         raise
+
+    _record(provider, model, result if isinstance(result, dict) else None, ok=True, quota_error=False)
 
     if provider == "openai":
         return "\n".join(
             part.get("text", "")
-            for item in result.get("output", [])
+            for item in (result or {}).get("output", [])
             for part in item.get("content", [])
             if part.get("type") == "output_text"
         ).strip()
     return "\n".join(
         part.get("text", "")
-        for item in result.get("candidates", [])
+        for item in (result or {}).get("candidates", [])
         for part in item.get("content", {}).get("parts", [])
     ).strip()
+
+
+def _record(provider: str, model: str, result: dict | None, *, ok: bool, quota_error: bool) -> None:
+    try:
+        from usage_tracker import try_record_ai_result
+
+        try_record_ai_result(
+            provider=provider,
+            model=model,
+            result=result,
+            ok=ok,
+            quota_error=quota_error,
+        )
+    except Exception:
+        pass

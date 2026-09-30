@@ -16,6 +16,28 @@ class AiUnavailableError(RuntimeError):
     """Chave ausente, quota esgotada ou falha de autenticação/billing da IA."""
 
 
+def _record_usage(
+    provider: str,
+    model: str,
+    result: dict | None,
+    *,
+    ok: bool,
+    quota_error: bool,
+) -> None:
+    try:
+        from usage_tracker import try_record_ai_result
+
+        try_record_ai_result(
+            provider=provider,
+            model=model,
+            result=result,
+            ok=ok,
+            quota_error=quota_error,
+        )
+    except Exception:
+        pass
+
+
 def extract_pdf_text(path: str) -> str:
     from pypdf import PdfReader
 
@@ -207,16 +229,22 @@ Resume text:
                 result = json.loads(response.read().decode("utf-8"))
         except HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")[:400]
-            if exc.code in {401, 403, 429} or "quota" in body.casefold() or "billing" in body.casefold():
+            quota = exc.code in {401, 403, 429} or "quota" in body.casefold() or "billing" in body.casefold()
+            _record_usage(provider, model, None, ok=False, quota_error=quota)
+            if quota:
                 raise AiUnavailableError(f"IA indisponível (HTTP {exc.code}).") from exc
             raise RuntimeError(f"Falha ao analisar currículo (HTTP {exc.code}): {body}") from exc
         except AiUnavailableError:
             raise
         except Exception as exc:
             message = str(exc).casefold()
-            if "quota" in message or "insufficient" in message or "api key" in message:
+            quota = "quota" in message or "insufficient" in message or "api key" in message
+            _record_usage(provider, model, None, ok=False, quota_error=quota)
+            if quota:
                 raise AiUnavailableError(f"IA indisponível: {exc}") from exc
             raise
+
+        _record_usage(provider, model, result if isinstance(result, dict) else None, ok=True, quota_error=False)
 
         if provider == "openai":
             raw = "\n".join(part.get("text", "") for item in result.get("output", []) for part in item.get("content", []) if part.get("type") == "output_text")
