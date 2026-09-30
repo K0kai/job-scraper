@@ -135,6 +135,15 @@ class BaseATSHandler(ABC):
         """Avanço de wizard não-padrão; False → kernel usa o botão Next genérico."""
         return False
 
+    def watch_wait(self, page, ctx: ApplyContext) -> None:
+        """Durante a janela assistida, chamado a cada ~4s (via on_tick).
+
+        Use para widgets que aparecem DEPOIS do preenchimento/captcha — ex.:
+        modal de perguntas da empresa. Nunca deve lançar (router protege, mas
+        mantenha o corpo defensivo).
+        """
+        return None
+
 
 # ---------------------------------------------------------------------------
 # Registry

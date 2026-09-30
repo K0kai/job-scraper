@@ -219,6 +219,16 @@ def _page_has_checkpoint(page) -> bool:
 def _wait_for_human_checkpoint(page, *, minutes: int) -> bool:
     """Return True if checkpoint cleared within the wait window."""
     deadline = time.time() + max(1, minutes) * 60
+    # Hybrid captcha (pydoll): tenta Turnstile com clique humanizado ANTES de
+    # incomodar o humano. reCAPTCHA/puzzles seguem com você (limites do pydoll).
+    try:
+        from hybrid_captcha import try_solve_turnstile
+
+        if try_solve_turnstile(page) and not _page_has_checkpoint(page):
+            LOG.info("Checkpoint resolvido por hybrid automation (turnstile).")
+            return True
+    except Exception as exc:
+        LOG.debug("hybrid checkpoint: %s", exc)
     LOG.warning(
         "LinkedIn checkpoint/CAPTCHA detected — resolve it in the Chrome window "
         "(up to %s min). Automation paused.",

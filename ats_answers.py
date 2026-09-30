@@ -30,9 +30,13 @@ ConnectFn = Callable[[], sqlite3.Connection]
 # perguntas que são identidade — perfil humano decide, jamais IA
 DIVERSITY_RE = re.compile(
     r"gender|sex\b|sexo|race|ethnic|racial|ra[cç]a|cor\b|"
-    r"disab|defici|pcd|orienta\w*\s+sexual|sexual\s+orienta|lgbt|veteran|ind[ií]gena|self.?identified",
+    r"disab|defici|pcd|orienta\w*\s+sexual|sexual\s+orienta|lgbt|veteran|ind[ií]gena|self.?identified|"
+    r"accessib|accommodat|necessit[ao].{0,30}(adapt|recurs)|\bICD\b|\bCID\b|laudo|m[eé]dico",
     re.I,
 )
+#: identidade em area de texto que pede NUMERO/codigo (ex.: CID do laudo) —
+#: nunca template canonico; so nota livre do painel ou humano
+NUMBERISH_RE = re.compile(r"number|n[uú]mero|c[oó]digo|code|qual o", re.I)
 # consentimento legal — nunca responder automaticamente aqui
 CONSENT_RE = re.compile(
     r"\bagree\b|consent|terms|privacy|autorizo|concordo|pol[ií]tica de privacidade",
@@ -41,34 +45,101 @@ CONSENT_RE = re.compile(
 
 NOT_INFORMED = "not_informed"
 
+#: pergunta de identidade que PEDS explicacao — template humano, nunca texto canonico
+DESCRIBE_RE = re.compile(r"describ|descrev|explai|explic|tell us|why|por que|detail", re.I)
+
+#: valor canonico do painel → texto a digitar em textarea/input de identidade
+_DIVERSITY_TEXT: dict[str, dict[str, tuple[str, str]]] = {
+    "gender": {
+        "female": ("Female", "Mulher"),
+        "male": ("Male", "Homem"),
+        "other": ("Non-binary", "Não binário"),
+        NOT_INFORMED: ("Prefer not to disclose", "Prefiro não informar"),
+    },
+    "race": {
+        "white": ("White", "Branca"),
+        "black": ("Black", "Preta"),
+        "pardo": ("Mixed race", "Parda"),
+        "asian": ("Asian", "Amarela/asiática"),
+        "indigenous": ("Indigenous", "Indígena"),
+        NOT_INFORMED: ("Prefer not to disclose", "Prefiro não informar"),
+    },
+    "pcd": {
+        "yes": ("Yes", "Sim"),
+        "no": ("No", "Não"),
+        NOT_INFORMED: ("Prefer not to disclose", "Prefiro não informar"),
+    },
+    "lgbtq": {
+        "yes": ("Yes", "Sim"),
+        "no": ("No", "Não"),
+        NOT_INFORMED: ("Prefer not to disclose", "Prefiro não informar"),
+    },
+}
+
+_DIVERSITY_SETTING = {
+    "gender": "candidate_gender",
+    "race": "candidate_race",
+    "lgbtq": "candidate_lgbtq",
+    "pcd": "candidate_pcd",
+}
+
+
+def diversity_text_for(cfg: dict[str, str], category: str, language: str = "en") -> str | None:
+    """Texto a DIGITAR em area de texto de identidade. Nunca e texto de IA.
+
+    'other'/categoria sem mapa usa a nota livre do painel se houver.
+    not_informed tem frase canonica honesta ('Prefiro nao informar').
+    """
+    if category not in _DIVERSITY_SETTING:  # veteran/outros: so nota livre
+        return (cfg.get("candidate_diversity_note") or "").strip() or None
+    raw = (
+        _truthy_pcd(cfg)
+        if category == "pcd"
+        else (cfg.get(_DIVERSITY_SETTING[category]) or NOT_INFORMED).strip().casefold()
+    )
+    if raw == "other":
+        note = (cfg.get("candidate_diversity_note") or "").strip()
+        if note:
+            return note
+    entry = _DIVERSITY_TEXT.get(category, {}).get(raw or NOT_INFORMED)
+    if entry is None:  # valor livre digitado no painel → usar direto
+        return raw or None
+    return entry[1] if (language or "en") == "pt" else entry[0]
+
+
 # aliases de cada valor canônico do perfil → texto que casa com opções reais
+# (ordem importa: aliases mais específicos/seguros primeiro — "man" antes de
+# "male", que casaria "female" por substring)
 _PROFILE_ALIASES: dict[str, dict[str, tuple[str, ...]]] = {
     "gender": {
-        "male": ("male", "man", "homem", "masculino"),
-        "female": ("female", "woman", "mulher", "feminino"),
-        "other": ("other", "non-binary", "nao binario", "não binário", "outro"),
-        NOT_INFORMED: ("prefer not", "nao informar", "não informar", "decline", "prefiro nao"),
+        "male": ("man", "male", "homem", "masculino"),
+        "female": ("woman", "female", "mulher", "feminino"),
+        "other": ("non-binary", "nao binario", "não binário", "other", "outro"),
+        NOT_INFORMED: ("rather not", "prefer not", "nao informar", "não informar", "decline", "prefiro nao"),
     },
     "race": {
         "white": ("white", "branca", "branco"),
         "black": ("black", "preta", "preto", "afro"),
-        "pardo": ("pardo", "mixed", "multirracial", "morena", "moreno"),
-        "asian": ("asian", "asiatica", "asiático", "amarela"),
-        "indigenous": ("indigenous", "indigena", "indígena", "amarela? nao", "branca? nao"),
+        "pardo": ("brown", "pardo", "mixed race", "mixed", "multirracial", "morena", "moreno"),
+        "asian": ("yellow", "asian", "asiatica", "asiática", "amarela"),
+        "indigenous": ("indigenous", "indigena", "indígena"),
         "not_specified": ("not specified", "nao informado"),
-        NOT_INFORMED: ("prefer not", "nao informar", "não informar", "decline"),
+        NOT_INFORMED: ("rather not", "prefer not", "nao informar", "não informar", "decline"),
     },
     "lgbtq": {
-        "yes": ("lgbt", "yes", "sim"),
-        "no": ("straight", "hetero", "no", "nao", "não"),
-        NOT_INFORMED: ("prefer not", "nao informar", "não informar", "decline"),
+        "yes": ("lgbt", "lesbian", "gay", "bisexual", "pansexual", "asexual", "yes", "sim"),
+        "no": ("heterosexual", "straight", "hetero", "no", "nao", "não"),
+        NOT_INFORMED: ("rather not", "prefer not", "nao informar", "não informar", "decline"),
     },
     "pcd": {
         "yes": ("yes", "sim", "pcd", "deficiency", "disability"),
         "no": ("no", "nao", "não"),
-        NOT_INFORMED: ("prefer not", "nao informar", "não informar"),
+        NOT_INFORMED: ("rather not", "prefer not", "nao informar", "não informar"),
     },
 }
+
+#: opções que significam "não declarado" — jamais chutadas se o perfil é afirmativo
+NEUTRAL_OPT_RE = re.compile(r"rather not|prefer not|prefiro nao|prefiro não|don'?t belong", re.I)
 
 _CATEGORY_FOR_RE = (
     ("gender", re.compile(r"gender|sex\b|sexo", re.I)),
@@ -76,6 +147,103 @@ _CATEGORY_FOR_RE = (
     ("lgbtq", re.compile(r"lgbt|orienta|sexual orientation|gay|trans", re.I)),
     ("pcd", re.compile(r"disab|defici|pcd|accommodat", re.I)),
 )
+
+
+#: opcoes que significam "recusa declarada" — nunca chutadas se o perfil e afirmativo
+_NOT_DECLARED_RE = re.compile(r"rather not|prefer not|nao informar|não informar|decline", re.I)
+
+
+def profile_state(cfg: dict[str, str], category: str) -> str:
+    """Valor canonico do painel para a categoria (pcd normalizado yes/no)."""
+    if category == "pcd":
+        return _truthy_pcd(cfg)
+    setting = _DIVERSITY_SETTING.get(category)
+    if not setting:
+        return NOT_INFORMED
+    return (cfg.get(setting) or NOT_INFORMED).strip().casefold()
+
+
+def _match_option(options: list[str], aliases: tuple[str, ...], *, skip: re.Pattern | None = None) -> str | None:
+    """Primeira opcao real que casa um alias — por TOKENS, nunca substring solta
+    ('man' nao pode casar 'Woman...', 'black' nao pode casar 'Brown ... black features')."""
+    for alias in aliases:
+        na = normalize(alias)
+        if not na:
+            continue
+        na_tokens = set(na.split())
+        for opt in options:
+            if skip and skip.search(opt):
+                continue
+            nopt = normalize(opt)
+            if nopt == na or nopt.startswith(na) or na_tokens <= set(nopt.split()):
+                return opt
+    return None
+
+
+def diversity_answer_for_options(cfg: dict[str, str], category: str, options: list[str]) -> str | None:
+    """Opcao real que casa o perfil de diversidade para uma categoria. None = humano."""
+    if category not in _PROFILE_ALIASES:
+        return None
+    value = profile_state(cfg, category)
+    aliases = _PROFILE_ALIASES[category].get(value, (value,) if value else ())
+    skip = None if value == NOT_INFORMED else _NOT_DECLARED_RE
+    return _match_option(options, aliases, skip=skip)
+
+
+#: grupo tipo InHire: "Voce pertence a um dos grupos abaixo?" (checkbox multiplas)
+GROUPS_Q_RE = re.compile(r"belong to one of.{0,25}groups|pertence.{0,25}(aos? )?grupos", re.I | re.S)
+
+
+def _infer_category_from_options(options: list[str]) -> str | None:
+    """Sem pergunta clara: deduz a categoria pelo conteudo das opcoes."""
+    hay = " | ".join(options).casefold()
+    scores = {
+        "race": len(re.findall(r"black person|brown person|indigenous|preta|parda|ind[ií]gena", hay)),
+        "pcd": len(re.findall(r"disabilit|deficienc|pcd", hay)),
+        "lgbtq": len(re.findall(r"lgbt|lesbian|gay|bisexual|pansexual|asexual|hetero", hay)),
+        "gender": len(re.findall(r"cisgender|transgender|non-binary|agender|gender identity", hay)),
+    }
+    best = max(scores, key=lambda k: scores[k])
+    return best if scores[best] >= 2 else None
+
+#: (categoria, valor do perfil) → palavras-chave que identificam a opcao no grupo
+_MEMBERSHIP_KEYWORDS: dict[tuple[str, str], tuple[str, ...]] = {
+    ("race", "black"): ("black person", "pretos?"),
+    ("race", "pardo"): ("brown person", "pardos?"),
+    ("race", "indigenous"): ("indigenous", "indigena"),
+    ("gender", "female"): ("woman", "mulher"),
+    ("lgbtq", "yes"): ("lgbt",),
+    ("pcd", "yes"): ("with disabilities", "com deficiencia"),
+}
+
+
+def match_membership_options(cfg: dict[str, str], options: list[str]) -> list[str] | None:
+    """Marcacoes do grupo de 'pertence a algum grupo' a partir do perfil. None = humano."""
+    states = {c: profile_state(cfg, c) for c in ("gender", "race", "lgbtq", "pcd")}
+    chosen: list[str] = []
+    for (cat, val), keywords in _MEMBERSHIP_KEYWORDS.items():
+        if states.get(cat) != val:
+            continue
+        for kw in keywords:
+            match = next((opt for opt in options if normalize(kw) in normalize(opt)), None)
+            if match and match not in chosen:
+                chosen.append(match)
+                break
+    if chosen:
+        return chosen
+
+    def find(sub: str) -> str | None:
+        return next((opt for opt in options if sub in normalize(opt)), None)
+
+    any_informed = any(v != NOT_INFORMED for v in states.values())
+    all_informed = all(v != NOT_INFORMED for v in states.values())
+    if not any_informed:  # tudo "prefiro nao informar" → recusa explicita se existir
+        got = find("rather not") or find("prefer not") or find("nao informar")
+        return [got] if got else None
+    if all_informed:  # afirmou tudo e nenhum casa grupo minorizado → "nenhum dos grupos"
+        got = find("don t belong") or find("not belong") or find("none") or find("nenhum")
+        return [got] if got else None
+    return None  # mistura de informado + nao informado: ambiguo, humano decide
 
 
 def classify_group(question: str) -> str:
@@ -90,21 +258,6 @@ def classify_group(question: str) -> str:
     return "company"
 
 
-def profile_for_diversity(cfg: dict[str, str], category: str) -> list[str] | None:
-    """Opções aceitas p/ a categoria, vindo do painel. None = sem perfil → humano."""
-    setting_map = {
-        "gender": "candidate_gender",
-        "race": "candidate_race",
-        "lgbtq": "candidate_lgbtq",
-        "pcd": "candidate_pcd",
-    }
-    if category not in setting_map:
-        return None
-    raw = (cfg.get(setting_map[category]) or cfg.get(f"inhire_{category}") or NOT_INFORMED).strip().casefold()
-    aliases = _PROFILE_ALIASES.get(category, {}).get(raw)
-    if aliases is None:  # valor livre do painel: usa direto como consulta
-        aliases = (raw,)
-    return list(aliases)
 
 
 def _truthy_pcd(cfg: dict[str, str]) -> str:
@@ -257,44 +410,94 @@ def ask_open_cached(
 _CHOICE_GROUPS_JS = """(root) => {
   const scope = root || document;
   const groups = [];
-  const seen = new Map();
   const nodes = scope.querySelectorAll('input[type="radio"], input[type="checkbox"]');
-  let idx = 0;
+  const optLabel = (el) => {
+    const id = el.id || '';
+    if (id) {
+      const lab = (el.getRootNode() || document).querySelector(`label[for="${CSS.escape(id)}"]`);
+      if (lab && (lab.innerText || '').trim()) return lab.innerText.trim();
+    }
+    if (el.closest('label')) return (el.closest('label').innerText || '').trim();
+    if (el.getAttribute('aria-label')) return el.getAttribute('aria-label');
+    return (el.value || '').trim();
+  };
+  // name compartilhado so agrupa se divide inputs; senao fieldset/grupo/texto.
+  const nameCount = {};
+  for (const el of nodes) nameCount[el.name] = (nameCount[el.name] || 0) + 1;
+  let contSeq = 0;
+  const groupKey = (el) => {
+    if (el.name && nameCount[el.name] > 1) return 'name:' + el.name;
+    const fs = el.closest('fieldset');
+    if (fs) {
+      const lg = fs.querySelector('legend');
+      if (lg && (lg.innerText || '').trim()) return 'text:' + lg.innerText.trim();
+    }
+    const rg = el.closest('[role="radiogroup"], [role="group"]');
+    if (rg) {
+      const by = rg.getAttribute('aria-labelledby');
+      const node = by ? (rg.getRootNode() || document).getElementById(by) : null;
+      const t = node ? (node.innerText || '').trim() : (rg.getAttribute('aria-label') || '');
+      if (t) return 'text:' + t;
+    }
+    // InHire: name e UUID por input e sem fieldset — sobe ate o menor container
+    // que reuna 2+ inputs. Input solo (consentimento) vira grupo pelo proprio label.
+    let cur = el.parentElement;
+    while (cur && cur.querySelectorAll('input[type="radio"], input[type="checkbox"]').length < 2) {
+      cur = cur.parentElement;
+    }
+    if (!cur) return 'label:' + (optLabel(el) || el.id || '');
+    if (!cur.__radarKey) cur.__radarKey = 'cont:' + (contSeq++);
+    return cur.__radarKey;
+  };
+  const questionOf = (key, list) => {
+    if (key.startsWith('name:') || key.startsWith('text:') || key.startsWith('label:')) {
+      return key.slice(key.indexOf(':') + 1);
+    }
+    let cont = null;
+    for (const el of nodes) {
+      let cur = el.parentElement;
+      while (cur && cur.querySelectorAll('input[type="radio"], input[type="checkbox"]').length < 2) cur = cur.parentElement;
+      if (cur && cur.__radarKey === key) { cont = cur; break; }
+    }
+    if (!cont) return '';
+    // a pergunta pode estar num irmao ANTES do container das opcoes: sobe ate 4 niveis
+    for (let up = 0; up < 4 && cont; up++) {
+      const all = (cont.innerText || '').trim();
+      let cut = all.length;
+      for (const e of list) {
+        const probe = (e.label || '').slice(0, 40);
+        const at = probe ? all.indexOf(probe) : -1;
+        if (at >= 0 && at < cut) cut = at;
+      }
+      const lines = all.slice(0, cut).trim().split(String.fromCharCode(10)).map(s => s.trim()).filter(Boolean);
+      for (let j = lines.length - 1; j >= 0; j--) {
+        if (lines[j].replace(/[*\\s]+$/, '').endsWith('?')) return lines[j];
+      }
+      cont = cont.parentElement;
+    }
+    return '';
+  };
+  const entries = [];
   for (const el of nodes) {
     if (el.disabled || el.hidden) continue;
     const rect = el.getBoundingClientRect();
     if (!rect.width && !rect.height && !el.closest('label')) continue;
-    const id = el.id || '';
-    let label = '';
-    if (id) {
-      const lab = document.querySelector(`label[for="${CSS.escape(id)}"]`);
-      if (lab) label = (lab.innerText || '').trim();
-    }
-    if (!label && el.closest('label')) label = (el.closest('label').innerText || '').trim();
-    if (!label && el.getAttribute('aria-label')) label = el.getAttribute('aria-label');
-    if (!label) label = (el.value || '').trim();
-    let legend = '';
-    const fs = el.closest('fieldset');
-    if (fs) {
-      const lg = fs.querySelector('legend');
-      if (lg) legend = (lg.innerText || '').trim();
-    }
-    if (!legend) {
-      const rg = el.closest('[role="radiogroup"], [role="group"]');
-      if (rg) {
-        const by = rg.getAttribute('aria-labelledby');
-        const node = by ? document.getElementById(by) : null;
-        legend = node ? (node.innerText || '').trim() : (rg.getAttribute('aria-label') || '');
-      }
-    }
-    const key = legend || el.name || label || 'group';
-    if (!seen.has(key)) {
-      seen.set(key, groups.length);
-      groups.push({ question: (key || '').slice(0, 300), name: el.name || '', multiple: el.type === 'checkbox', options: [] });
-    }
-    const g = groups[seen.get(key)];
-    el.setAttribute('data-radar-choice', String(idx));
-    g.options.push({ label: (label || '').slice(0, 200), index: idx });
+    entries.push({ el, key: groupKey(el), label: optLabel(el) || (el.value || '').trim() });
+  }
+  const byKey = new Map();
+  for (const e of entries) {
+    if (!byKey.has(e.key)) byKey.set(e.key, []);
+    byKey.get(e.key).push(e);
+  }
+  for (const [key, list] of byKey) {
+    const q = questionOf(key, list) || (list[0].label || 'group');
+    groups.push({ question: (q || '').slice(0, 300), name: list[0].el.name || '', multiple: list[0].el.type === 'checkbox', options: [] });
+  }
+  const keyIndex = new Map([...byKey.keys()].map((k, i) => [k, i]));
+  let idx = 0;
+  for (const e of entries) {
+    e.el.setAttribute('data-radar-choice', String(idx));
+    groups[keyIndex.get(e.key)].options.push({ label: (e.label || '').slice(0, 200), index: idx });
     idx += 1;
   }
   return groups;
@@ -329,7 +532,6 @@ def answer_choice_groups(scope, ctx, *, log_prefix: str = "form") -> tuple[list[
     deferred: list[str] = []
     groups = collect_choice_groups(scope)
     ai = ctx.ai or {}
-    pcd_state = _truthy_pcd(ctx.cfg)
     for group in groups:
         question = group.get("question") or ""
         options = [o.get("label") or "" for o in group.get("options") or []]
@@ -337,18 +539,19 @@ def answer_choice_groups(scope, ctx, *, log_prefix: str = "form") -> tuple[list[
         if kind == "consent":
             continue  # obrigaçao do handler, nao decisao de IA
         chosen: list[str] | None = None
-        if kind.startswith("diversity:"):
+        # "pertence a um dos grupos?" casa RACA+PCD+LGBTI+ na MESMA pergunta —
+        # o texto nao necessariamente cai em DIVERSITY_RE, entao vem primeiro.
+        if group.get("multiple") and (
+            GROUPS_Q_RE.search(question)
+            or GROUPS_Q_RE.search(" ".join(options))
+        ):
+            chosen = match_membership_options(ctx.cfg, options)
+        elif kind.startswith("diversity:"):
             category = kind.split(":", 1)[1]
-            if category == "pcd":
-                aliases = _PROFILE_ALIASES["pcd"].get(pcd_state)
-            else:
-                aliases = profile_for_diversity(ctx.cfg, category)
-            if aliases:
-                for alias in aliases:
-                    match = pick_select_option(options, alias)
-                    if match:
-                        chosen = [match]
-                        break
+            if category == "other":
+                category = _infer_category_from_options(options) or "other"
+            got = diversity_answer_for_options(ctx.cfg, category, options)
+            chosen = [got] if got else None
         elif kind == "company" and ai.get("api_key"):
             cached = cache_get(ai.get("connect_fn"), question)
             if cached:

@@ -157,10 +157,10 @@ def run_ats_flow(
                     f"(botao: {submit_res.button_label})"
                 )
             # submit clicado mas sem confirmacao — nao insiste, deixa com humano
-            return _assisted_finish(instance, page, handler_cls, fill_note, human_wait)
+            return _assisted_finish(instance, page, handler_cls, fill_note, human_wait, ctx)
         LOG.info("%s submit falhou (%s); caindo para assistido.", handler_cls.name, submit_res.error)
 
-    return _assisted_finish(instance, page, handler_cls, fill_note, human_wait)
+    return _assisted_finish(instance, page, handler_cls, fill_note, human_wait, ctx)
 
 
 def _verify_now() -> float:
@@ -183,13 +183,26 @@ def _confirm_submission(instance, page, *, timeout_s: float = 20) -> bool:
     return False
 
 
-def _assisted_finish(instance, page, handler_cls, fill_note: str, human_wait: int) -> tuple[str, str]:
+def _assisted_finish(instance, page, handler_cls, fill_note: str, human_wait: int, ctx: ApplyContext | None = None) -> tuple[str, str]:
+    # Hybrid captcha (pydoll): se e Turnstile, tentamos o clique humanizado ANTES
+    # de incomodar voce. reCAPTCHA/hCaptcha/puzzles continuam com o humano.
+    try:
+        from hybrid_captcha import try_solve_turnstile
+
+        if try_solve_turnstile(page):
+            LOG.info("%s: turnstile resolvido por hybrid automation.", handler_cls.name)
+    except Exception as exc:
+        LOG.debug("hybrid turnstile: %s", exc)
     LOG.info(
         "%s: preenchido. Resolva captcha/envio no Chrome (ate %s min). O robo nao envia sozinho.",
         handler_cls.name,
         human_wait,
     )
-    outcome = wait_for_human(page, minutes=human_wait, success_regex=handler_cls.success_regex)
+    on_tick = None
+    if ctx is not None:
+        def on_tick(p):  # watcher do handler durante a espera (ex.: modal de perguntas)
+            instance.watch_wait(p, ctx)
+    outcome = wait_for_human(page, minutes=human_wait, success_regex=handler_cls.success_regex, on_tick=on_tick)
     if outcome == "submitted":
         return OUTCOME_ASSISTED, f"{handler_cls.name} preenchido; voce enviou (assistido){fill_note}."
     if outcome == "timeout":

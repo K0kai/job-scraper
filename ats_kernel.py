@@ -16,11 +16,10 @@ import time
 
 from ats_answers import (
     DIVERSITY_RE,
-    _PROFILE_ALIASES,
-    _truthy_pcd,
+    _infer_category_from_options,
     answer_choice_groups,
     classify_group,
-    profile_for_diversity,
+    diversity_answer_for_options,
 )
 from ats_base import ApplyContext, FillResult, SubmitResult
 from browser_engine import (
@@ -194,13 +193,13 @@ def _apply_field(page, field: dict, rule: dict | None, ctx: ApplyContext) -> tup
     if rule is None:
         # pergunta de diversidade em <select> nativo → perfil do painel (nunca IA)
         if field.get("tag") == "select" and DIVERSITY_RE.search(label):
-            category = classify_group(label).split(":", 1)[1]
-            aliases = profile_for_diversity(ctx.cfg, category) or []
-            if category == "pcd":
-                aliases = _PROFILE_ALIASES["pcd"].get(_truthy_pcd(ctx.cfg)) or []
-            for alias in aliases:
-                if safe_select(page, sel, field.get("options") or [], alias):
-                    return (f"diversidade:{category}", True)
+            kind = classify_group(label)
+            category = kind.split(":", 1)[1]
+            if category == "other":
+                category = _infer_category_from_options(field.get("options") or []) or "other"
+            got = diversity_answer_for_options(ctx.cfg, category, field.get("options") or [])
+            if got and safe_select(page, sel, field.get("options") or [], got):
+                return (f"diversidade:{category}", True)
             return None  # sem perfil/opção: deixa para o humano, nao é erro
         if field.get("required") and field.get("tag") in {"input", "textarea", "select"}:
             return (label, False)

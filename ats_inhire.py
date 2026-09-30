@@ -239,8 +239,104 @@ def _fill_if_present(page, selector: str, value: str) -> None:
         LOG.warning("InHire fill %s failed: %s", selector, exc)
 
 
-def _fill_diversity_step(page, *, cfg: dict[str, str]) -> None:
-    """Step 2: PCD Yes/No + privacy. Does not click final Continue (captcha)."""
+_DD_QUESTIONS_JS = """() => {
+  const dds = [...document.querySelectorAll('[aria-label="Dropdown select"]')];
+  return dds.map((d, i) => {
+    let n = d.parentElement, question = '';
+    for (let up = 0; up < 6 && n && !question; up++) {
+      let sib = n.previousElementSibling;
+      for (let s = 0; s < 3 && sib; s++) {
+        const t = (sib.innerText || '').replace(/\\s+/g, ' ').trim();
+        if (t.length > 8 && t.includes('?')) { question = t.slice(0, 220); break; }
+        sib = sib.previousElementSibling;
+      }
+      n = n.parentElement;
+    }
+    return { i, question };
+  });
+}"""
+
+_DD_OPTIONS_JS = """() => [...document.querySelectorAll('.react-dropdown-select-dropdown button')]
+  .map(b => (b.getAttribute('aria-label') || (b.innerText || '').split(String.fromCharCode(10))[0] || '').trim())
+  .filter(Boolean)"""
+
+
+def _dd_open(page, idx: int) -> list[str]:
+    """Abre o dropdown React idx e devolve os titulos das opcoes (fecha com Esc)."""
+    try:
+        dd = page.locator('[aria-label="Dropdown select"]').nth(idx)
+        dd.scroll_into_view_if_needed(timeout=2500)
+        dd.click(force=True, timeout=4000)
+        _pause(0.35, 0.7)
+        opts = list(page.evaluate(_DD_OPTIONS_JS) or [])
+        page.keyboard.press("Escape")
+        _pause(0.2, 0.4)
+        return opts
+    except Exception:
+        return []
+
+
+def _dd_pick(page, idx: int, option_title: str) -> bool:
+    try:
+        dd = page.locator('[aria-label="Dropdown select"]').nth(idx)
+        dd.click(force=True, timeout=4000)
+        _pause(0.35, 0.7)
+        opt = page.locator(".react-dropdown-select-dropdown button").filter(
+            has_text=re.compile(re.escape(option_title[:60]))
+        )
+        if not opt.count():
+            page.keyboard.press("Escape")
+            return False
+        opt.first.click(force=True, timeout=4000)
+        _pause(0.3, 0.6)
+        return True
+    except Exception as exc:
+        LOG.debug("InHire dd pick(%s,%s) falhou: %s", idx, option_title, exc)
+        try:
+            page.keyboard.press("Escape")
+        except Exception:
+            pass
+        return False
+
+
+def _answer_diversity_dropdowns(page, cfg: dict[str, str]) -> list[str]:
+    """Dropdowns React de identidade (genero/orientacao/raca/PCD) → PERFIL, nunca IA."""
+    from ats_answers import classify_group, diversity_answer_for_options, profile_state
+
+    answered: list[str] = []
+    try:
+        items = list(page.evaluate(_DD_QUESTIONS_JS) or [])
+    except Exception:
+        return answered
+    for item in items:
+        question = item.get("question") or ""
+        if not question:
+            continue
+        kind = classify_group(question)
+        if not kind.startswith("diversity:"):
+            continue  # telefone/pais etc. tratados no proprio fluxo
+        category = kind.split(":", 1)[1]
+        if category == "other":
+            continue
+        # orientacao expecifica: painel so tem yes/no — 'yes' e ambiguo demais
+        if "orienta" in question.casefold() and profile_state(cfg, "lgbtq") == "yes":
+            LOG.info("InHire orientacao sexual: 'sou LGBTI+' nao indica qual opcao; fica com voce.")
+            continue
+        idx = int(item.get("i", -1))
+        options = _dd_open(page, idx)
+        if not options:
+            continue
+        chosen = diversity_answer_for_options(cfg, category, options)
+        if not chosen:
+            LOG.info("InHire '%s': sem perfil p/ opcoes %s; fica com voce.", question[:60], options[:3])
+            continue
+        if _dd_pick(page, idx, chosen):
+            answered.append(f"{question[:70]} → {chosen}")
+    return answered
+
+
+def _fill_diversity_step(page, *, cfg: dict[str, str], ctx=None) -> None:
+    """Step 2: grupos de marcacao + dropdowns React de identidade + privacidade."""
     # Navigate to diversity if Next is available.
     next_btn = page.get_by_role("button", name=re.compile(r"^(Next|Avançar|Continue)$", re.I))
     try:
@@ -254,41 +350,18 @@ def _fill_diversity_step(page, *, cfg: dict[str, str]) -> None:
         except Exception:
             pass
 
-    # Perfil humano decide PCD; "não informar" NÃO chuta Yes/No — fica com você.
-    from ats_answers import _truthy_pcd
-
-    pcd_state = _truthy_pcd(cfg)
-    if pcd_state not in {"yes", "no"}:
-        LOG.info("InHire: PCD marcado como 'não informar'; pergunta fica com você no Chrome.")
-        _fill_privacy_checkbox(page)
-        return
-    pcd_label = "Yes" if pcd_state == "yes" else "No"
-    # PT UI fallbacks
-    pcd_query = pcd_label
-    pcd_alt = "Sim" if pcd_state == "yes" else "Não"
-
-    opened = _select_react_dropdown(
-        page,
-        matcher=r"Select one of the options|Selecione uma das opções",
-        option_query=pcd_query,
-        option_regex=rf"^{re.escape(pcd_query)}$|^{re.escape(pcd_alt)}$",
-    )
-    if not opened:
-        # Click option list without filter text (already open / different placeholder).
+    # Grupo "voce pertence a um dos grupos?" (checkboxes) + possiveis radios da etapa.
+    if ctx is not None:
         try:
-            dd = page.locator('[aria-label="Dropdown select"]').filter(
-                has_text=re.compile(r"Select one|Selecione uma|Yes|No|Sim|Não", re.I)
-            )
-            if dd.count():
-                dd.first.click(force=True)
-                _pause(0.3, 0.6)
-                opt = page.locator(".react-dropdown-select-dropdown button").filter(
-                    has_text=re.compile(rf"^{re.escape(pcd_query)}$|^{re.escape(pcd_alt)}$", re.I)
-                )
-                if opt.count():
-                    opt.first.click(force=True)
+            from ats_answers import answer_choice_groups
+
+            answer_choice_groups(page, ctx, log_prefix="inhire-div")
         except Exception as exc:
-            LOG.warning("InHire PCD dropdown failed: %s", exc)
+            LOG.debug("InHire diversity choice groups: %s", exc)
+
+    # Dropdowns React de identidade: genero/orientacao/raca/PCD — tudo por perfil.
+    for label in _answer_diversity_dropdowns(page, cfg):
+        LOG.info("InHire diversidade: %s", label)
 
     # Privacy agreement on diversity step.
     _fill_privacy_checkbox(page)
@@ -305,6 +378,125 @@ def _fill_privacy_checkbox(page) -> None:
         LOG.warning("InHire privacy checkbox failed: %s", exc)
 
 
+_MODAL_SELECTOR = 'div[role="dialog"], [class*="modal" i], [class*="popup" i]'
+_MODAL_CONTINUE_RE = re.compile(
+    r"^(pros(?:se)?guir|continuar|next|avan(?:c|\u00e7)ar|pr\u00f3xima|responder|confirm(?:ar)?)$",
+    re.I,
+)
+_MODAL_SUBMIT_RE = re.compile(r"submit|enviar|candidatar|finalizar|apply|concluir", re.I)
+
+
+def _question_modal(page):
+    """Modal embutido de perguntas da empresa (aparece APOIS a diversidade/captcha)."""
+    try:
+        for cand in page.locator(_MODAL_SELECTOR).all():
+            try:
+                if not cand.is_visible(timeout=400):
+                    continue
+                if cand.locator('input[type="radio"], input[type="checkbox"], textarea').count():
+                    return cand
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return None
+
+
+def _modal_question(modal) -> str:
+    """Pergunta atual do modal = primeiro titulo/paragrafo com texto."""
+    for sel in ("h2, h3, [class*='question' i], label, p"):
+        try:
+            els = modal.locator(sel).all()
+        except Exception:
+            continue
+        for el in els:
+            try:
+                t = (el.inner_text(timeout=400) or "").replace("\n", " ").strip()
+            except Exception:
+                continue
+            if len(t) >= 12 and "?" in t:
+                return t[:300]
+        for el in els:
+            try:
+                t = (el.inner_text(timeout=400) or "").replace("\n", " ").strip()
+            except Exception:
+                continue
+            if len(t) >= 15:
+                return t[:300]
+    return ""
+
+
+def _answer_modal_texts(modal, ctx) -> int:
+    """Textarea/input de texto do modal: diversidade→perfil, empresa→IA com cache."""
+    from ats_answers import (
+        DIVERSITY_RE,
+        NUMBERISH_RE,
+        ask_open_cached,
+        classify_group,
+        diversity_text_for,
+    )
+
+    ai = ctx.ai or {}
+    answered = 0
+    try:
+        fields = modal.locator("textarea, input[type='text']").all()
+    except Exception:
+        return 0
+    for el in fields:
+        try:
+            if not el.is_visible(timeout=400):
+                continue
+            name = (el.get_attribute("name") or "") + " " + (el.get_attribute("id") or "")
+            if "recaptcha" in name.casefold():
+                continue
+            if (el.input_value(timeout=600) or "").strip():
+                continue
+            question = _modal_question(modal) or name
+            if DIVERSITY_RE.search(question):
+                # pedem numero/codigo ("ICD/CID do laudo") ou DESCRICAO de
+                # necessidade — template canonico seria mentira; fica com humano.
+                from ats_answers import DESCRIBE_RE, NUMBERISH_RE
+
+                if NUMBERISH_RE.search(question) or DESCRIBE_RE.search(question):
+                    continue
+                # identidade em area de texto: SEMPRE o perfil, nunca IA
+                category = classify_group(question).split(":", 1)[1]
+                text = diversity_text_for(ctx.cfg, category, language=(ai.get("job") or {}).get("language") or "en")
+                if not text:
+                    continue
+                el.click(timeout=3000)
+                el.fill(text)
+                answered += 1
+                continue
+            if not ai.get("api_key"):
+                continue
+            from apply_channels import generate_open_answer
+
+            answer = ask_open_cached(
+                question=question,
+                generate=lambda q=question: generate_open_answer(
+                    question=q,
+                    job=ai.get("job") or {},
+                    resume_summary=ai.get("resume_summary") or "",
+                    resume_json=ai.get("resume_json") or "",
+                    facts=ai.get("facts") or "",
+                    provider=ai.get("provider") or "",
+                    model=ai.get("model") or "",
+                    api_key=ai.get("api_key") or "",
+                ),
+                connect_fn=ai.get("connect_fn"),
+                provider=ai.get("provider") or "",
+                model=ai.get("model") or "",
+                now_iso=ai.get("now_iso") or "",
+            )
+            el.click(timeout=3000)
+            el.fill(answer[:1200])
+            answered += 1
+        except Exception as exc:
+            LOG.debug("InHire modal text answer: %s", exc)
+    return answered
+
+
 @register
 class InHireHandler(BaseATSHandler):
     """Primeiro handler concreto da arquitetura — assistido (captcha no final)."""
@@ -312,6 +504,49 @@ class InHireHandler(BaseATSHandler):
     name = "inhire"
     hosts = ("inhire.app", "*.inhire.app")
     auto_submit_capable = False
+
+    def __init__(self):
+        self._last_modal_question = ""  # evita dupes entre ticks do watcher
+
+    def watch_wait(self, page, ctx) -> None:
+        """Modal de perguntas da empresa que aparece APOIS da diversidade/captcha.
+
+        Escolha unica avanca sozinha ao marcar; multipla/texto precisa do botao
+        Prosseguir — clicamos so quando ja respondemos algo neste tick.
+        """
+        modal = _question_modal(page)
+        if modal is None:
+            return
+        question = _modal_question(modal)
+        did = 0
+        try:
+            from ats_answers import answer_choice_groups
+
+            answered, _deferred = answer_choice_groups(modal, ctx, log_prefix="inhire-modal")
+            did += len(answered)
+            for a in answered:
+                LOG.info("InHire modal: %s", a)
+        except Exception as exc:
+            LOG.debug("InHire modal groups: %s", exc)
+        try:
+            did += _answer_modal_texts(modal, ctx)
+        except Exception as exc:
+            LOG.debug("InHire modal texts: %s", exc)
+        if did and question and question != self._last_modal_question:
+            self._last_modal_question = question
+            # escolha UNICA avanca sozinha ao marcar (nada a clicar). Pergunta
+            # multipla/escrita: clica 'Prosseguir/Continuar' se ainda houver modal.
+            try:
+                btns = modal.get_by_role("button", name=_MODAL_CONTINUE_RE).all()
+                for btn in btns:
+                    txt = (btn.inner_text(timeout=400) or "").strip()
+                    if _MODAL_SUBMIT_RE.search(txt):
+                        continue  # nunca finalizar/enviar
+                    if btn.is_visible(timeout=400) and btn.is_enabled(timeout=400):
+                        btn.click(timeout=4000)
+                        break
+            except Exception as exc:
+                LOG.debug("InHire modal continue: %s", exc)
     success_regex = SUCCESS_RE
 
     @classmethod
@@ -446,7 +681,7 @@ class InHireHandler(BaseATSHandler):
                 _click_visible_choice(page, ("Yes", "Sim"), nth=0)
                 _click_visible_choice(page, ("No", "Não", "Nao"), nth=1)
 
-            _fill_diversity_step(page, cfg=cfg)
+            _fill_diversity_step(page, cfg=cfg, ctx=ctx)
             filled.append("diversidade")
             return FillResult(ok=not missing, filled=filled, missing=missing)
         except Exception as exc:
