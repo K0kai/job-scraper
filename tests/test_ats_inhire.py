@@ -35,11 +35,11 @@ class RegistryTests(unittest.TestCase):
 
 
 class LegacyHelpersTests(unittest.TestCase):
-    """Comportamento que o painel já dependia precisa continuar."""
+    """Comportamento que o painel já dependia precisa continuar via handler."""
 
-    def test_is_inhire_url(self):
-        self.assertTrue(ats_inhire.is_inhire_url("https://a.inhire.app/j"))
-        self.assertFalse(ats_inhire.is_inhire_url("https://a.example.com/j"))
+    def test_can_handle_replaces_legacy_url_check(self):
+        self.assertTrue(ats_inhire.InHireHandler.can_handle("https://a.inhire.app/j"))
+        self.assertFalse(ats_inhire.InHireHandler.can_handle("https://a.example.com/j"))
 
     def test_linkedin_profile_value(self):
         self.assertEqual(

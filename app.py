@@ -22,7 +22,7 @@ from apply_channels import apply_via_browser, apply_via_email, record_blocked, s
 from form_rules import ensure_default_rules, list_rules, save_rules_from_form
 from job_queue import KIND_APPLY, KIND_LINKEDIN, KIND_RESUME, JobQueue, NonRetryableError
 from linkedin_apply import apply_via_linkedin, default_profile_dir
-from ats_inhire import is_inhire_url
+from ats_router import find_handler
 from resume_pipeline import (
     AiUnavailableError,
     get_resume,
@@ -622,10 +622,10 @@ def is_linkedin_job(job: dict) -> bool:
 
 
 def is_assisted_apply_job(job: dict) -> bool:
-    """LinkedIn Easy Apply / external Apply, or direct InHire career page."""
+    """LinkedIn Easy Apply / external Apply, ou carreira direta de ATS suportado."""
     if is_linkedin_job(job):
         return True
-    return is_inhire_url(str(job.get("url") or ""))
+    return find_handler(str(job.get("url") or "")) is not None
 
 
 def mark_worth_looking(job_id: int, *, score: int, reason: str, detail: str) -> None:
@@ -734,7 +734,7 @@ def process_auto_job(job_id: int) -> str:
             channel = "linkedin"
             if ok:
                 dry = "dry-run" in detail.casefold()
-                human_sent = detail.casefold().startswith("assisted:")
+                human_sent = detail.casefold().startswith(("assisted:", "auto:"))
                 job_status = "applied" if human_sent else ("prepared" if dry else "applied")
                 with connect() as db:
                     if job_status == "applied":
@@ -890,8 +890,8 @@ def process_worth_easy_apply(job_id: int) -> str:
     job = dict(job_row)
     if job.get("status") not in {"worth", "prepared", "review", "blocked"}:
         raise ValueError(f"Status '{job.get('status')}' não permite Easy Apply manual.")
-    if not is_linkedin_job(job) and not is_inhire_url(str(job.get("url") or "")):
-        raise ValueError("Esta vaga não é LinkedIn/InHire — use e-mail/formulário ou candidatura manual.")
+    if not is_linkedin_job(job) and find_handler(str(job.get("url") or "")) is None:
+        raise ValueError("Esta vaga não é LinkedIn nem ATS suportado — use e-mail/formulário ou candidatura manual.")
 
     with connect() as db:
         decision = db.execute(
@@ -953,7 +953,7 @@ def process_worth_easy_apply(job_id: int) -> str:
     channel = "linkedin"
     if ok:
         dry = "dry-run" in detail.casefold()
-        human_sent = detail.casefold().startswith("assisted:")
+        human_sent = detail.casefold().startswith(("assisted:", "auto:"))
         job_status = "applied" if human_sent else ("prepared" if dry else "applied")
         with connect() as db:
             if job_status == "applied":
@@ -2095,6 +2095,16 @@ def _worth_match_expr() -> str:
                       )"""
 
 
+def _notes_html(notes: str) -> str:
+    """Nota do card 'Vale a pena olhar'; destaque vermelho p/ handler ATS ausente."""
+    if "NO_HANDLER:" in (notes or ""):
+        return (
+            '<p class="hint" style="color:#b3261e;font-weight:600">'
+            f"{esc(notes)}</p>"
+        )
+    return f'<p class="hint">{esc(notes or "")}</p>'
+
+
 def worth_html(*, page: int = 1, page_size: int = WORTH_PAGE_SIZE, min_match: int = 0) -> str:
     page = max(1, int(page or 1))
     page_size = max(5, min(50, int(page_size or WORTH_PAGE_SIZE)))
@@ -2195,7 +2205,7 @@ def worth_html(*, page: int = 1, page_size: int = WORTH_PAGE_SIZE, min_match: in
             f'<div class="worth-head"><a class="job-title" href="{esc(job["url"])}" target="_blank" rel="noreferrer">{esc(job["title"])}</a>'
             f'<span class="analysis-badge analysis-ok">Match {esc(score_label)}</span></div>'
             f'<p class="hint"><strong>{esc(job["company"])}</strong> · {esc(job["location"])} · {esc(job["source"])} · {esc(format_brasilia(job["posted_at"] or job["first_seen_at"]))}</p>'
-            f'<p class="hint">{esc(job["notes"] or "")}</p>'
+            f'{_notes_html(job["notes"] or "")}'
             f'<p><a href="{esc(job["url"])}" target="_blank" rel="noreferrer">Abrir vaga para candidatura manual</a></p>'
             f'<details><summary>Descrição</summary><div class="description">{esc(desc)}</div></details>'
             f'<details><summary>{"Carta pronta para copiar" if letter else "Sem carta"}</summary><div class="description">{esc(letter or "—")}</div></details>'

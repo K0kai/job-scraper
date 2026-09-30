@@ -13,7 +13,7 @@ import logging
 import time
 from urllib.parse import urlparse
 
-from ats_base import ApplyContext, BaseATSHandler, FillResult, find_handler
+from ats_base import ApplyContext, BaseATSHandler, FillResult
 from wait_human import wait_for_human
 
 LOG = logging.getLogger("job-scraper")
@@ -47,6 +47,14 @@ def _ensure_handlers_loaded() -> None:
             importlib.import_module(module)
         except Exception as exc:  # handler quebrado não derruba o app
             LOG.warning("falha ao registrar handler %s: %s", module, exc)
+
+
+def find_handler(url: str):
+    """Busca o handler da URL garantindo o lazy-load dos módulos registrados."""
+    _ensure_handlers_loaded()
+    from ats_base import find_handler as _find
+
+    return _find(url)
 
 
 def _host_of(url: str) -> str:

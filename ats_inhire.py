@@ -10,7 +10,6 @@ import re
 import time
 
 from ats_base import BaseATSHandler, FillResult, register
-from wait_human import wait_for_human
 
 LOG = logging.getLogger("job-scraper")
 
@@ -425,30 +424,3 @@ class InHireHandler(BaseATSHandler):
             return FillResult(ok=not missing, filled=filled, missing=missing)
         except Exception as exc:
             return FillResult(ok=False, filled=filled, missing=missing, error=str(exc))
-
-
-# ---------------------------------------------------------------------------
-# Wrappers legados (removidos na integração final — Task 7)
-# ---------------------------------------------------------------------------
-
-def is_inhire_url(url: str) -> bool:
-    return InHireHandler.can_handle(url)
-
-
-def fill_inhire_form(page, *, cfg: dict[str, str], resume_path: str, cover_letter: str = "") -> str | None:
-    from ats_base import ApplyContext
-
-    ctx = ApplyContext(cfg=cfg, rules=[], resume_path=resume_path, cover_letter=cover_letter)
-    res = InHireHandler().fill(page, ctx)
-    if res.ok:
-        return None
-    return res.error or ("campos faltando: " + ", ".join(res.missing))
-
-
-def wait_for_human_inhire(page, *, minutes: int) -> str:
-    LOG.info(
-        "InHire: informacoes + diversidade preenchidos. Resolva captcha e clique "
-        "Continue/Enviar no Chrome (ate %s min). O robo nao envia sozinho.",
-        minutes,
-    )
-    return wait_for_human(page, minutes=minutes, success_regex=SUCCESS_RE)

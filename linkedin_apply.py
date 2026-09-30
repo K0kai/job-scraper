@@ -20,7 +20,7 @@ from apply_channels import (
     generate_open_answer,
     lookslike_open_question,
 )
-from ats_inhire import fill_inhire_form, is_inhire_url, wait_for_human_inhire
+from ats_router import find_handler
 
 LOG = logging.getLogger("job-scraper")
 
@@ -396,80 +396,81 @@ def _handle_external_ats(
     finish_ok,
     block,
 ) -> tuple[bool, str]:
-    """Fill known external ATS (InHire) in assisted mode; otherwise leave for human."""
-    cfg_local = dict(cfg)
-    salary = _salary_from_rules(rules, cfg)
-    if salary:
-        cfg_local["salary_expectation"] = salary
+    """Deixa o LinkedIn e espera a URL de destino; o router decide o handler."""
+    from ats_router import (
+        OUTCOME_ASSISTED,
+        OUTCOME_FAILED,
+        OUTCOME_NO_HANDLER,
+        OUTCOME_SUBMITTED,
+        OUTCOME_TIMEOUT,
+        find_handler,
+        run_ats_flow,
+    )
 
-    for _ in range(10):
+    # O redirect passa por linkedin.com/me/events antes do host final: poll curto.
+    deadline = time.monotonic() + 10
+    current = page.url or ""
+    while time.monotonic() < deadline:
         try:
             current = page.url or ""
         except Exception:
             current = ""
-        if is_inhire_url(current):
+        if find_handler(current) is not None:
             break
-        found = None
+        if current and "linkedin.com" not in current:
+            break
+        _human_pause(0.7, 1.2)
+    else:
+        # URL ainda no LinkedIn? varre abas (popup abriu fora daqui).
         for p in context.pages:
             try:
-                if is_inhire_url(p.url or ""):
-                    found = p
+                if find_handler(p.url or "") is not None:
+                    page = p
+                    current = p.url or ""
+                    try:
+                        page.bring_to_front()
+                    except Exception:
+                        pass
                     break
             except Exception:
                 continue
-        if found is not None:
-            page = found
-            try:
-                page.bring_to_front()
-            except Exception:
-                pass
-            break
-        _human_pause(0.7, 1.2)
 
-    try:
-        current = page.url or ""
-    except Exception:
-        current = ""
+    salary = _salary_from_rules(rules, cfg)
+    outcome, detail = run_ats_flow(
+        page,
+        context,
+        cfg=cfg,
+        rules=rules,
+        resume_path=resume_path,
+        cover_letter=cover_letter,
+        salary=salary,
+        human_wait=human_wait,
+    )
 
-    if is_inhire_url(current):
-        err = fill_inhire_form(page, cfg=cfg_local, resume_path=resume_path, cover_letter=cover_letter)
-        if err:
-            LOG.warning("InHire fill incomplete: %s — waiting for you.", err)
-        outcome = wait_for_human_inhire(page, minutes=human_wait)
-        try:
-            context.close()
-        except Exception:
-            pass
-        if outcome == "submitted":
-            return finish_ok(
-                "assisted: candidatura InHire enviada por você no Chrome.",
-                status_detail="InHire preenchido; você enviou (assistido; robô não resolveu captcha/enviar).",
-            )
-        if outcome == "timeout":
-            return finish_ok(
-                "dry-run: InHire preenchido; tempo esgotado sem confirmar envio.",
-                status_detail="InHire preenchido; timeout sem envio (captcha/diversidade ficam com você).",
-            )
-        return finish_ok(
-            "dry-run: InHire preenchido; janela fechada sem confirmação de envio.",
-            status_detail="InHire preenchido; janela fechada sem toast de sucesso.",
-        )
-
-    LOG.info("ATS externo não-InHire (%s) — aguardando você candidatar.", current)
-    outcome = wait_for_human_inhire(page, minutes=human_wait)
     try:
         context.close()
     except Exception:
         pass
-    if outcome == "submitted":
+
+    if outcome == OUTCOME_SUBMITTED:
         return finish_ok(
-            "assisted: candidatura externa enviada por você.",
-            status_detail=f"Apply externo ({current[:120]}); você enviou manualmente.",
+            f"auto: {detail}",
+            status_detail=f"Candidatura enviada pelo robô — {detail}",
         )
-    return block(
-        f"Apply externo aberto ({current[:160] or 'nova aba'}). "
-        "Preencha/envie no Chrome (preenchimento automático hoje: *.inhire.app)."
-    )
+    if outcome == OUTCOME_ASSISTED:
+        return finish_ok(
+            f"assisted: {detail}",
+            status_detail=detail or "ATS preenchido; você enviou (assistido).",
+        )
+    if outcome == OUTCOME_TIMEOUT:
+        return finish_ok(
+            f"dry-run: {detail}",
+            status_detail=detail or "ATS preenchido; sem confirmacao de envio.",
+        )
+    if outcome == OUTCOME_FAILED:
+        return block(f"Falha no ATS externo: {detail}")
+    # OUTCOME_NO_HANDLER: app.py manda para 'worth' e a nota carrega NO_HANDLER:
+    return block(detail)
 
 
 def _modal(page):
@@ -809,8 +810,8 @@ def apply_via_linkedin(
 
             page = context.pages[0] if context.pages else context.new_page()
 
-            # Direct InHire career URL (no LinkedIn hop).
-            if is_inhire_url(url):
+            # URL de ATS conhecido direto (sem hop LinkedIn) — handler decide.
+            if find_handler(url) is not None:
                 page.goto(url, wait_until="domcontentloaded", timeout=60000)
                 _human_pause(1.5, 3.0)
                 return _handle_external_ats(
@@ -916,7 +917,7 @@ def apply_via_linkedin(
             _human_pause(1.0, 2.0)
 
             try:
-                if is_inhire_url(page.url or ""):
+                if find_handler(page.url or "") is not None:
                     return _handle_external_ats(
                         page=page,
                         context=context,
@@ -946,7 +947,7 @@ def apply_via_linkedin(
                 except Exception:
                     for p in context.pages:
                         try:
-                            if is_inhire_url(p.url or ""):
+                            if find_handler(p.url or "") is not None:
                                 return _handle_external_ats(
                                     page=p,
                                     context=context,
