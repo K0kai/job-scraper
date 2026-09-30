@@ -1232,9 +1232,14 @@ def _substitute_apify_value(value: object, ctx: dict[str, str]) -> object:
     return value
 
 
-# LinkedIn Jobs search: f_E = experience, f_WT = workplace type.
+# LinkedIn Jobs search: f_E = experience, f_WT = workplace type, f_TPR = time posted.
 LINKEDIN_EXPERIENCE_CODES = {1, 2, 3, 4, 5, 6}
 LINKEDIN_WORKPLACE_CODES = {1, 2, 3}  # 1 on-site, 2 remote, 3 hybrid
+#: Past 24 hours — máxima prioridade (vagas do mesmo dia).
+LINKEDIN_TPR_DAY = "r86400"
+#: Past week — teto duro de 7 dias (nunca buscar mais antigo que isso).
+LINKEDIN_TPR_WEEK = "r604800"
+LINKEDIN_MAX_AGE_DAYS = 7
 
 
 def _resume_filter_fingerprint() -> str:
@@ -1355,12 +1360,15 @@ Other rules:
 - Prefer 2–4 experience codes centered on the candidate's seniority (usually one level below + main; avoid Director/Executive unless clearly supported).
 - keywords: 2–5 concrete job-search phrases (role + stack when useful), preferably in English for global remote reach; PT only if clearly Brazil-hybrid BH search.
 - Do NOT invent employers or skills; only use the resume summaries and facts.
+- RECENCY (mandatory — the URL builder enforces this; mention it in reason):
+  * Only consider jobs from the last 7 days (LinkedIn f_TPR=r604800).
+  * Strongly prioritize jobs posted today / last 24 hours (f_TPR=r86400) over older ones in the week.
 - Return ONLY JSON with keys:
   keywords (string array),
   locations (string array),
   experience_levels (integer array of f_E codes),
   workplace_types (integer array of f_WT codes),
-  reason (short string in Portuguese explaining the choice, mentioning remote global + hybrid BH).
+  reason (short string in Portuguese explaining the choice, mentioning remote global + hybrid BH + prioridade a vagas do dia / máx. 7 dias).
 
 Panel keyword preferences (roles/skills only — ignore geo bias here): {pref_keywords or '[none]'}
 Candidate facts PT: {facts_pt or '[none]'}
@@ -1521,19 +1529,29 @@ def linkedin_filter_panel_html(cfg: dict[str, str] | None = None) -> str:
         f"<strong>Keywords:</strong> {esc(', '.join(str(k) for k in keywords) or '—')}<br>"
         f"<strong>Locations:</strong> {esc(', '.join(str(x) for x in locations) or '—')}<br>"
         f"<strong>Nível (f_E):</strong> {esc(exp_txt)}<br>"
-        f"<strong>Local de trabalho (f_WT):</strong> {esc(wt_txt)}</p>"
+        f"<strong>Local de trabalho (f_WT):</strong> {esc(wt_txt)}<br>"
+        f"<strong>Recência (f_TPR):</strong> máx. {LINKEDIN_MAX_AGE_DAYS} dias "
+        f"(prioridade: mesmo dia / 24h)</p>"
         + (f'<p class="hint" style="margin:0 0 8px"><strong>Motivo:</strong> {reason}</p>' if reason else "")
         + '<details><summary>JSON completo</summary>'
         f'<pre style="margin:8px 0 0;white-space:pre-wrap;font:12px/1.4 ui-monospace,Menlo,Consolas,monospace;'
         f'max-height:240px;overflow:auto;background:#f4f7f7;padding:10px;border-radius:8px">{pretty}</pre>'
         "</details>"
-        '<p class="hint" style="margin:8px 0 0">Somente leitura. Regenera automaticamente quando o currículo '
-        "analisado muda e roda uma nova coleta LinkedIn/Apify.</p>"
+        '<p class="hint" style="margin:8px 0 0">Somente leitura. As URLs de busca sempre usam '
+        f"<code>f_TPR={LINKEDIN_TPR_DAY}</code> (mesmo dia, prioridade) e "
+        f"<code>f_TPR={LINKEDIN_TPR_WEEK}</code> (≤{LINKEDIN_MAX_AGE_DAYS} dias). "
+        "Regenera automaticamente quando o currículo analisado muda e roda uma nova coleta LinkedIn/Apify.</p>"
         "</div>"
     )
 
 
 def build_linkedin_search_urls(filter_data: dict, *, max_urls: int = 4) -> list[str]:
+    """Monta URLs de busca LinkedIn com recência obrigatória.
+
+    Toda URL leva ``f_TPR``: metade (arredondando pra cima) prioriza o mesmo dia
+    (``r86400``); o restante completa a janela de 7 dias (``r604800``). Nunca
+    busca sem teto de tempo — evita vagas velhas no scrape.
+    """
     keywords = [str(k) for k in (filter_data.get("keywords") or []) if str(k).strip()][:4]
     locations = [str(x) for x in (filter_data.get("locations") or []) if str(x).strip()][:4]
     if not keywords:
@@ -1571,20 +1589,43 @@ def build_linkedin_search_urls(filter_data: dict, *, max_urls: int = 4) -> list[
         # Sem f_WT explícito: remote global + BH.
         pairs = [("Remote", "2"), ("Belo Horizonte", "3")]
 
-    urls: list[str] = []
+    def _url(keyword: str, location: str, f_wt: str, tpr: str) -> str:
+        url = (
+            f"https://www.linkedin.com/jobs/search/?keywords={quote_plus(keyword)}"
+            f"&location={quote_plus(location)}&position=1&pageNum=0"
+            f"&f_TPR={tpr}"
+        )
+        if f_e:
+            url += f"&f_E={f_e}"
+        if f_wt:
+            url += f"&f_WT={f_wt}"
+        return url
+
+    day_urls: list[str] = []
+    week_urls: list[str] = []
     for keyword in keywords:
         for location, f_wt in pairs:
-            url = (
-                f"https://www.linkedin.com/jobs/search/?keywords={quote_plus(keyword)}"
-                f"&location={quote_plus(location)}&position=1&pageNum=0"
-            )
-            if f_e:
-                url += f"&f_E={f_e}"
-            if f_wt:
-                url += f"&f_WT={f_wt}"
-            urls.append(url)
-            if len(urls) >= max_urls:
-                return urls
+            day_urls.append(_url(keyword, location, f_wt, LINKEDIN_TPR_DAY))
+            week_urls.append(_url(keyword, location, f_wt, LINKEDIN_TPR_WEEK))
+
+    # Prioridade: mesmo dia primeiro (≥ metade dos slots); resto ≤7 dias.
+    day_slots = max(1, (max_urls + 1) // 2)
+    urls: list[str] = []
+    for u in day_urls[:day_slots]:
+        if u not in urls:
+            urls.append(u)
+        if len(urls) >= max_urls:
+            return urls
+    for u in week_urls:
+        if u not in urls:
+            urls.append(u)
+        if len(urls) >= max_urls:
+            return urls
+    for u in day_urls[day_slots:]:
+        if u not in urls:
+            urls.append(u)
+        if len(urls) >= max_urls:
+            return urls
     return urls
 
 
@@ -1663,9 +1704,75 @@ def _apify_item_url(item: dict) -> str:
     return ""
 
 
+def _linkedin_posted_age_days(posted_at: object) -> float | None:
+    """Idade em dias da postagem, ou None se não der pra inferir.
+
+    Aceita ISO / timestamp e textos relativos comuns do LinkedIn
+    ('Just now', '2 hours ago', '3 days ago', '1 week ago', ...).
+    """
+    if posted_at is None or posted_at == "":
+        return None
+    if isinstance(posted_at, (int, float)):
+        ts = float(posted_at)
+        if ts > 10_000_000_000:
+            ts /= 1000.0
+        try:
+            when = datetime.fromtimestamp(ts, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+        return max(0.0, (datetime.now(timezone.utc) - when).total_seconds() / 86400.0)
+
+    raw = str(posted_at).strip()
+    parsed = parse_utc(raw)
+    if parsed is not None:
+        return max(0.0, (datetime.now(timezone.utc) - parsed).total_seconds() / 86400.0)
+
+    low = raw.casefold()
+    if any(tok in low for tok in ("just now", "agora", "moments ago", "seconds ago", "second ago")):
+        return 0.0
+    m = re.search(r"(\d+)\s*(minute|minutos?|hour|horas?|day|dias?|week|semanas?|month|meses?)", low)
+    if not m:
+        m2 = re.search(r"(\d+)\s*([mhdw])\b", low)
+        if not m2:
+            return None
+        n = int(m2.group(1))
+        unit = m2.group(2)
+        if unit == "m":
+            return n / (60 * 24)
+        if unit == "h":
+            return n / 24.0
+        if unit == "d":
+            return float(n)
+        if unit == "w":
+            return float(n * 7)
+        return None
+    n = int(m.group(1))
+    unit = m.group(2)
+    if unit.startswith("min"):
+        return n / (60 * 24)
+    if unit.startswith("hour") or unit.startswith("hora"):
+        return n / 24.0
+    if unit.startswith("day") or unit.startswith("dia"):
+        return float(n)
+    if unit.startswith("week") or unit.startswith("semana"):
+        return float(n * 7)
+    if unit.startswith("month") or unit.startswith("mes"):
+        return float(n * 30)
+    return None
+
+
+def _linkedin_within_max_age(posted_at: object, *, max_days: int = LINKEDIN_MAX_AGE_DAYS) -> bool:
+    """True se a vaga cabe na janela (ou a data é desconhecida — não descartamos)."""
+    age = _linkedin_posted_age_days(posted_at)
+    if age is None:
+        return True
+    return age <= float(max_days)
+
+
 def normalize_apify_items(items: list, *, label: str) -> list[dict]:
     results: list[dict] = []
     source_name = f"Apify:{label}" if label else "Apify"
+    is_linkedin = "linkedin" in (label or "").casefold()
     for item in items:
         if not isinstance(item, dict):
             continue
@@ -1716,6 +1823,8 @@ def normalize_apify_items(items: list, *, label: str) -> list[dict]:
         if isinstance(posted_at, (int, float)) and posted_at > 10_000_000_000:
             # Indeed pubDate em milissegundos.
             posted_at = datetime.fromtimestamp(posted_at / 1000, tz=timezone.utc).isoformat(timespec="seconds")
+        if is_linkedin and not _linkedin_within_max_age(posted_at):
+            continue  # teto duro: >7 dias fora
         results.append(
             {
                 "source": source_name,
@@ -1728,6 +1837,13 @@ def normalize_apify_items(items: list, *, label: str) -> list[dict]:
                 "posted_at": posted_at,
             }
         )
+    if is_linkedin and results:
+        # Prioriza o mais recente (mesmo dia primeiro) na fila de inserção/triagem.
+        def _sort_key(job: dict) -> tuple:
+            age = _linkedin_posted_age_days(job.get("posted_at"))
+            return (age if age is not None else 3.5, str(job.get("title") or ""))
+
+        results.sort(key=_sort_key)
     return results
 
 
