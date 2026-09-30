@@ -1,30 +1,28 @@
-# InHire (inhire.app) ATS — assisted form fill (never auto-solves captcha / final submit).
+# InHire (inhire.app) ATS — handler da arquitetura ats_base.
+# NUNCA resolve captcha nem clica "Continue registration" (final) — assisted-first.
+# quirks mapeados: dropdowns React (aria-label="Dropdown select"), telefone BR com
+# +55 ANTES do número, país "Brazil (BR)" em UI inglesa, diversidade PCD, EULA.
 from __future__ import annotations
 
 import logging
 import random
 import re
 import time
-from urllib.parse import urlparse
+
+from ats_base import BaseATSHandler, FillResult, register
+from wait_human import wait_for_human
 
 LOG = logging.getLogger("job-scraper")
 
-INHIRE_HOST_RE = re.compile(r"(^|\.)inhire\.app$", re.I)
 SUCCESS_RE = re.compile(
     r"candidatura\s+enviada|application\s+sent|obrigad[oa]|recebemos\s+sua|"
     r"inscri[cç][aã]o\s+enviada|sucesso|registration\s+sent|continue\s+registration",
     re.I,
 )
 
-
-def is_inhire_url(url: str) -> bool:
-    try:
-        host = urlparse(url or "").netloc.casefold()
-    except Exception:
-        return False
-    if host.startswith("www."):
-        host = host[4:]
-    return bool(INHIRE_HOST_RE.search(host)) or "inhire.app" in (url or "").casefold()
+# evidência: https://acme.inhire.app jobs reais (sessão Easy Apply, 2026-09)
+NAME_FIELD_SELECTOR = "#name, input[name='name']"
+CAPTCHA_MARKERS = ("g-recaptcha", "recaptcha", "cf-challenge")
 
 
 def _pause(lo: float = 0.3, hi: float = 0.9) -> None:
@@ -181,7 +179,7 @@ def _select_react_dropdown(
 
 
 def _select_phone_country_code(page, *, dial: str = "+55") -> bool:
-    """Must run before typing the phone number."""
+    """Must run BEFORE typing the phone number."""
     try:
         phone_dd = page.locator('[aria-label="Dropdown select"]').nth(0)
         phone_dd.scroll_into_view_if_needed(timeout=3000)
@@ -297,112 +295,160 @@ def _fill_diversity_step(page, *, cfg: dict[str, str]) -> None:
         LOG.warning("InHire privacy checkbox failed: %s", exc)
 
 
-def fill_inhire_form(
-    page,
-    *,
-    cfg: dict[str, str],
-    resume_path: str,
-    cover_letter: str = "",
-) -> str | None:
-    """
-    Fill InHire Information + Diversity. Returns None on success, or an error string.
-    Does not solve captcha or click final 'Continue registration'.
-    """
-    _prefer_english_ui(page)
+@register
+class InHireHandler(BaseATSHandler):
+    """Primeiro handler concreto da arquitetura — assistido (captcha no final)."""
 
-    for label in ("Candidatar-se para a vaga", "Candidatar-se", "Candidatar", "Apply", "Apply for the job"):
-        btn = page.get_by_role("button", name=re.compile(rf"^{re.escape(label)}$", re.I))
+    name = "inhire"
+    hosts = ("inhire.app", "*.inhire.app")
+    auto_submit_capable = False
+    success_regex = SUCCESS_RE
+
+    @classmethod
+    def can_handle(cls, url: str) -> bool:
+        # mantém o comportamento legado: host OU substring em URLs estranhas
+        return super().can_handle(url) or "inhire.app" in (url or "").casefold()
+
+    def wait_ready(self, page, timeout_ms: int = 15000) -> bool:
         try:
-            if btn.count() and btn.first.is_visible(timeout=400):
-                btn.first.click(timeout=4000)
-                _pause(0.8, 1.4)
-                break
+            page.locator(NAME_FIELD_SELECTOR).first.wait_for(state="visible", timeout=timeout_ms)
+            return True
         except Exception:
-            continue
+            return False
 
-    try:
-        page.locator("#name, input[name='name']").first.wait_for(state="visible", timeout=15000)
-    except Exception:
-        return "Formulário InHire não apareceu (campo nome)."
-
-    name = (cfg.get("candidate_name") or "").strip()
-    email = (cfg.get("candidate_email") or "").strip()
-    phone = _local_phone_digits(cfg)
-    city = (cfg.get("candidate_city") or "").strip() or "Belo Horizonte"
-    city = city.split(",")[0].strip()
-    linkedin = _linkedin_profile_value(cfg)
-    salary = (cfg.get("linkedin_salary_expectation") or cfg.get("salary_expectation") or "").strip()
-
-    _fill_if_present(page, "#name, input[name='name']", name)
-    _fill_if_present(page, "#email, input[name='email']", email)
-
-    # Area code BEFORE the number.
-    _select_phone_country_code(page, dial="+55")
-    _fill_if_present(page, "#phone, input[name='phone']", phone)
-
-    _fill_if_present(page, "#linkedinUsername, input[name='linkedinUsername']", linkedin)
-
-    # Country of origin — always type/select "Brazil" (English list).
-    if not _select_country_brazil(page):
-        LOG.warning("InHire: country Brazil not selected.")
-
-    # City dropdown enables after country.
-    _pause(0.5, 1.0)
-    if not _select_react_dropdown(
-        page,
-        matcher=r"Enter your city|Informe sua cidade|City|cidade",
-        option_query=city,
-        option_regex=re.escape(city),
-    ):
-        # Only touch free-text city if enabled.
+    def detect_obstacles(self, page) -> list[str]:
         try:
-            city_input = page.locator("#district, input[name='district'], input[name='districtBr']").first
-            if city_input.count() and city_input.is_enabled(timeout=800):
-                city_input.fill(city)
+            html = page.content()[:200000]
         except Exception:
-            pass
+            return ["pagina-inacessivel"]
+        low = html.casefold()
+        if any(marker in low for marker in CAPTCHA_MARKERS):
+            return ["captcha"]
+        return []
 
-    if salary:
-        _fill_if_present(page, "#salaryExpectation, input[name='salaryExpectation']", salary)
+    def fill(self, page, ctx) -> FillResult:
+        """Sequência manual comprovada em campo (dropdowns React, ordem do telefone).
 
-    if resume_path:
+        O kernel genérico não alcança os widgets custom do InHire; sobrescrever
+        é o caso previsto pelo contrato. Nunca lança — devolve FillResult.
+        """
+        cfg = ctx.cfg
+        resume_path = ctx.resume_path
+        filled: list[str] = []
+        missing: list[str] = []
         try:
-            file_input = page.locator('input[type="file"][name="resume"], input[type="file"]')
-            if file_input.count():
-                file_input.first.set_input_files(resume_path)
-                _pause(0.6, 1.2)
+            _prefer_english_ui(page)
+
+            for label in ("Candidatar-se para a vaga", "Candidatar-se", "Candidatar", "Apply", "Apply for the job"):
+                btn = page.get_by_role("button", name=re.compile(rf"^{re.escape(label)}$", re.I))
+                try:
+                    if btn.count() and btn.first.is_visible(timeout=400):
+                        btn.first.click(timeout=4000)
+                        _pause(0.8, 1.4)
+                        break
+                except Exception:
+                    continue
+
+            if not self.wait_ready(page, timeout_ms=15000):
+                return FillResult(ok=False, filled=filled, missing=["form"],
+                                  error="Formulario InHire nao apareceu (campo nome).")
+
+            name = (cfg.get("candidate_name") or "").strip()
+            email = (cfg.get("candidate_email") or "").strip()
+            phone = _local_phone_digits(cfg)
+            city = (cfg.get("candidate_city") or "").strip() or "Belo Horizonte"
+            city = city.split(",")[0].strip()
+            linkedin = _linkedin_profile_value(cfg)
+            salary = (cfg.get("linkedin_salary_expectation") or cfg.get("salary_expectation") or ctx.salary or "").strip()
+
+            _fill_if_present(page, "#name, input[name='name']", name)
+            filled.append("nome")
+            _fill_if_present(page, "#email, input[name='email']", email)
+            filled.append("email")
+
+            # Area code BEFORE the number.
+            _select_phone_country_code(page, dial="+55")
+            _fill_if_present(page, "#phone, input[name='phone']", phone)
+            filled.append("telefone")
+
+            _fill_if_present(page, "#linkedinUsername, input[name='linkedinUsername']", linkedin)
+            filled.append("linkedin")
+
+            # Country of origin — always type/select "Brazil" (English list).
+            if _select_country_brazil(page):
+                filled.append("pais")
+            else:
+                missing.append("pais")
+
+            # City dropdown enables after country.
+            _pause(0.5, 1.0)
+            if _select_react_dropdown(
+                page,
+                matcher=r"Enter your city|Informe sua cidade|City|cidade",
+                option_query=city,
+                option_regex=re.escape(city),
+            ):
+                filled.append("cidade")
+            else:
+                # Only touch free-text city if enabled.
+                try:
+                    city_input = page.locator("#district, input[name='district'], input[name='districtBr']").first
+                    if city_input.count() and city_input.is_enabled(timeout=800):
+                        city_input.fill(city)
+                        filled.append("cidade")
+                    else:
+                        missing.append("cidade")
+                except Exception:
+                    missing.append("cidade")
+
+            if salary:
+                _fill_if_present(page, "#salaryExpectation, input[name='salaryExpectation']", salary)
+                filled.append("pretensao")
+
+            if resume_path:
+                try:
+                    file_input = page.locator('input[type="file"][name="resume"], input[type="file"]')
+                    if file_input.count():
+                        file_input.first.set_input_files(resume_path)
+                        _pause(0.6, 1.2)
+                        filled.append("curriculo")
+                except Exception as exc:
+                    LOG.warning("InHire resume upload failed: %s", exc)
+                    missing.append("curriculo")
+
+            # Hybrid availability / referral — English Yes/No (nth: first Yes = hybrid, second No = not referred).
+            _click_visible_choice(page, ("Yes", "Sim"), nth=0)
+            _click_visible_choice(page, ("No", "Não", "Nao"), nth=1)
+
+            _fill_diversity_step(page, cfg=cfg)
+            filled.append("diversidade")
+            return FillResult(ok=not missing, filled=filled, missing=missing)
         except Exception as exc:
-            LOG.warning("InHire resume upload failed: %s", exc)
+            return FillResult(ok=False, filled=filled, missing=missing, error=str(exc))
 
-    # Hybrid availability / referral — English Yes/No (nth: first Yes = hybrid, second No = not referred).
-    _click_visible_choice(page, ("Yes", "Sim"), nth=0)
-    _click_visible_choice(page, ("No", "Não", "Nao"), nth=1)
 
-    _fill_diversity_step(page, cfg=cfg)
-    return None
+# ---------------------------------------------------------------------------
+# Wrappers legados (removidos na integração final — Task 7)
+# ---------------------------------------------------------------------------
+
+def is_inhire_url(url: str) -> bool:
+    return InHireHandler.can_handle(url)
+
+
+def fill_inhire_form(page, *, cfg: dict[str, str], resume_path: str, cover_letter: str = "") -> str | None:
+    from ats_base import ApplyContext
+
+    ctx = ApplyContext(cfg=cfg, rules=[], resume_path=resume_path, cover_letter=cover_letter)
+    res = InHireHandler().fill(page, ctx)
+    if res.ok:
+        return None
+    return res.error or ("campos faltando: " + ", ".join(res.missing))
 
 
 def wait_for_human_inhire(page, *, minutes: int) -> str:
-    """Wait while user finishes captcha / final Continueregistration. Returns submitted|abandoned|timeout."""
-    deadline = time.time() + max(1, minutes) * 60
     LOG.info(
-        "InHire: informações + diversidade preenchidos. Resolva captcha e clique "
-        "Continue/Enviar no Chrome (até %s min). O robô não envia sozinho.",
+        "InHire: informacoes + diversidade preenchidos. Resolva captcha e clique "
+        "Continue/Enviar no Chrome (ate %s min). O robo nao envia sozinho.",
         minutes,
     )
-    while time.time() < deadline:
-        time.sleep(4)
-        try:
-            snip = (page.inner_text("body") or "")[:5000]
-        except Exception:
-            return "abandoned"
-        if SUCCESS_RE.search(snip) and "continue registration" not in snip.casefold():
-            # Avoid matching the button label itself; look for thank-you style copy.
-            if re.search(r"obrigad|thank you|recebemos|enviada|sucesso", snip, re.I):
-                return "submitted"
-        try:
-            if page.is_closed():
-                return "abandoned"
-        except Exception:
-            return "abandoned"
-    return "timeout"
+    return wait_for_human(page, minutes=minutes, success_regex=SUCCESS_RE)
