@@ -278,12 +278,17 @@ def classify_group(question: str) -> str:
 
 
 def _truthy_pcd(cfg: dict[str, str]) -> str:
-    raw = (cfg.get("candidate_pcd") or cfg.get("inhire_pcd") or "0").strip().casefold()
+    """
+    Retorna "yes" se candidato declarou PCD, "no" se não, ou valor informado se diferente.
+    """
+    raw = (cfg.get("candidate_pcd") or "").strip().casefold()
     if raw in {"1", "yes", "sim", "true"}:
         return "yes"
     if raw in {"0", "no", "nao", "não", "false"}:
         return "no"
-    return raw or NOT_INFORMED
+    if not raw:
+        return NOT_INFORMED
+    return raw
 
 
 def contract_choice_for(cfg: dict[str, str], options: list[str]) -> str | None:

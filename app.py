@@ -139,8 +139,6 @@ DEFAULT_SETTINGS = {
     "linkedin_min_gap_minutes": "12",
     "linkedin_human_wait_minutes": "12",
     "linkedin_login_wait_minutes": "25",
-    # InHire diversity: 0 = No (default), 1 = Yes — "apply as disabled person"
-    "inhire_pcd": "0",
     # Perfil de diversidade (identidade NUNCA vem de IA; 'not_informed' = não informar)
     "candidate_gender": "not_informed",
     "candidate_race": "not_informed",
@@ -2370,7 +2368,7 @@ def worth_html(*, page: int = 1, page_size: int = WORTH_PAGE_SIZE, min_match: in
                     f'<form method="post" action="/worth-easy-apply" class="js-process-form" style="display:inline">'
                     f'<input type="hidden" name="id" value="{int(job["id"])}">'
                     f'<button type="submit" title="LinkedIn Easy Apply ou Apply→InHire; você confirma envio/captcha">'
-                    f"Easy Apply</button></form>"
+                    f'<button class="red-accent-button">Easy Apply</button></form>'
                 )
             else:
                 easy_btn = (
@@ -2695,7 +2693,7 @@ border-left:2px solid transparent;transition:background .12s,color .12s}
 .sidebar-foot{margin-top:auto;border-top:1px solid var(--line);padding-top:14px}
 #collector-state{font-size:12px;font-weight:700;color:var(--muted);display:inline-flex;align-items:center;gap:7px}
 #collector-state::before{content:"";width:8px;height:8px;border-radius:50%;background:var(--muted2)}
-.content{padding:26px max(24px,calc((100vw - 1180px)/2));overflow-x:auto}
+.content{padding:26px max(24px,calc((100vw - 1600px)/2));overflow-x:auto}
 h1{font-size:20px;margin:0}
 h2{font-size:16px;margin:0 0 16px;font-weight:700;letter-spacing:-.01em;color:var(--white)}
 h3{font-size:13px}
@@ -2753,6 +2751,8 @@ border:1px solid var(--line2);background:var(--panel2)}
 .analysis-error{background:rgba(194,84,77,.2);color:#f0a0a0}
 .analysis-none{background:var(--panel2);color:var(--muted)}
 .analysis-error-text{color:#f0a0a0;font-size:12.5px;margin:8px 0}
+.red-accent-button{background:var(--accent);color:var(--white);border:1px solid var(--accent);border-radius:9px;padding:9px 15px;font-weight:700;font-size:13px;cursor:pointer;transition:filter .12s,background .12s}
+.red-accent-button:hover{filter:brightness(.92);background:var(--accent2);border-color:var(--accent2)}
 .resume-card{border:1px solid var(--line);border-radius:12px;padding:16px;background:var(--panel2)}
 .resume-dossier summary{color:var(--muted)}
 .resume-dossier-scroll{background:#0e0e10}
@@ -2859,7 +2859,7 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
 
 <div id="tab-ia" class="tab-panel"><section class="panel"><h2>IA &amp; integrações</h2><form method="post" action="/ai-settings"><div class="form-grid"><label>Provedor de IA<select name="ai_provider"><option value="gemini" {'selected' if cfg.get('ai_provider') == 'gemini' else ''}>Gemini</option><option value="openai" {'selected' if cfg.get('ai_provider') == 'openai' else ''}>OpenAI</option></select></label><label>Modelo<input name="ai_model" value="{esc(cfg.get('ai_model','gemini-2.5-flash'))}"></label><label>Motor de navegador<select name="browser_engine"><option value="pydoll" {'selected' if cfg.get('browser_engine','pydoll') == 'pydoll' else ''}>Pydoll (CDP, stealth — padrão)</option><option value="playwright" {'selected' if cfg.get('browser_engine','pydoll') == 'playwright' else ''}>Playwright (fallback)</option></select></label><label>Chave de IA (vazio mantém a salva)<input type="password" name="api_key" autocomplete="new-password"></label><label>Adzuna App ID<input name="adzuna_app_id" value=""></label><label>Adzuna API key<input type="password" name="adzuna_app_key" value=""></label><label>Token Apify<input type="password" name="apify_token" value="" autocomplete="new-password"></label></div><label style="margin-top:14px">Fatos profissionais em português<textarea name="candidate_facts_pt" rows="3">{esc(cfg.get('candidate_facts_pt',''))}</textarea></label><label style="margin-top:12px">Professional facts in English<textarea name="candidate_facts_en" rows="3">{esc(cfg.get('candidate_facts_en',''))}</textarea></label><p class="hint">Chaves vão para o cofre do sistema. Os fatos alimentam a IA nas perguntas abertas e de opções.</p><button style="margin-top:14px">Salvar IA e integrações</button></form></section><section class="panel"><h2>Regras de formulário (navegador)</h2><form method="post" action="/profile-settings">{rules_panel}<p class="hint">Modo <code>salary</code> escolhe automaticamente BRL×USD pela moeda do campo e aplica o multiplicador PJ ao valor BRL quando a contratação preferida é PJ; "Valor fixo" só é usado como desempate. No modo <code>select</code>, coloque em "Valor fixo" o texto da opção preferida. Perguntas abertas sem regra usam a IA.</p><button>Salvar regras</button></form></section></div>
 
-<div id="tab-automacao" class="tab-panel"><section class="panel"><h2>Automação &amp; LinkedIn</h2><form method="post" action="/automation-settings"><label style="margin:0 0 12px;display:flex;gap:8px;align-items:flex-start"><input type="checkbox" name="auto_apply" value="1" {'checked' if cfg.get('auto_apply') == '1' else ''} style="width:auto;margin-top:3px"> <span>Ativar triagem e candidatura automáticas (e-mail SMTP, depois formulário público)</span></label><label style="margin:0 0 12px;display:flex;gap:8px;align-items:flex-start"><input type="checkbox" name="linkedin_easy_apply" value="1" {'checked' if cfg.get('linkedin_easy_apply') == '1' else ''} style="width:auto;margin-top:3px"> <span>Easy Apply LinkedIn <em>assistido</em> (preenche; <strong>você</strong> clica Enviar — o robô nunca envia sozinho)</span></label><label style="margin:0 0 18px;display:flex;gap:8px;align-items:flex-start"><input type="checkbox" name="linkedin_risk_ack" value="1" {'checked' if cfg.get('linkedin_risk_ack') == '1' else ''} style="width:auto;margin-top:3px"> <span>Li e aceito: automação no LinkedIn pode violar os termos deles e gerar restrição/banimento; uso por minha conta e risco</span></label><div class="form-grid"><label>Score mínimo (%)<input name="minimum_match_score" type="number" min="0" max="100" value="{esc(cfg.get('minimum_match_score','80'))}"></label><label>Workers da fila (vagas em paralelo)<input name="queue_max_workers" type="number" min="1" max="8" value="{esc(cfg.get('queue_max_workers','3'))}"></label><label>Máx. tentativas por job<input name="queue_max_attempts" type="number" min="1" max="200" value="{esc(cfg.get('queue_max_attempts','40'))}"></label><label>TTL da fila (horas)<input name="queue_ttl_hours" type="number" min="1" max="168" value="{esc(cfg.get('queue_ttl_hours','24'))}"></label><label>Máx. Easy Apply / dia (teto 8)<input name="linkedin_max_per_day" type="number" min="1" max="8" value="{esc(cfg.get('linkedin_max_per_day','3'))}"></label><label>Intervalo mínimo entre vagas (min, mín. 5)<input name="linkedin_min_gap_minutes" type="number" min="5" max="180" value="{esc(cfg.get('linkedin_min_gap_minutes','12'))}"></label><label>Tempo para você revisar/enviar (min)<input name="linkedin_human_wait_minutes" type="number" min="3" max="45" value="{esc(cfg.get('linkedin_human_wait_minutes','12'))}"></label><label>Tempo para login manual (min)<input name="linkedin_login_wait_minutes" type="number" min="5" max="60" value="{esc(cfg.get('linkedin_login_wait_minutes','25'))}"></label><label>Perfil Chrome dedicado<input name="linkedin_chrome_profile" value="{esc(cfg.get('linkedin_chrome_profile') or '')}" placeholder="{esc(default_profile_dir(ROOT))}"></label></div><label style="margin:14px 0 0;display:flex;gap:8px;align-items:flex-start"><input type="checkbox" name="inhire_pcd" value="1" {'checked' if cfg.get('inhire_pcd') == '1' else ''} style="width:auto;margin-top:3px"> <span>InHire: candidatar como PCD (diversidade)</span></label><p class="hint">LinkedIn assistido: Easy Apply <em>ou</em> Apply externo (ex.: InHire) — 1 vaga por vez, limites diários, checkpoint/captcha com você. Sem o aceite de risco, Easy Apply não roda.</p><button style="margin-top:14px">Salvar automação</button></form></section></div>
+<!-- Código removido pois não é mais necessário com a aba de Perfil & Diversidade -->
 
 <div id="tab-smtp" class="tab-panel"><section class="panel"><h2>SMTP</h2><form method="post" action="/smtp-settings"><div class="form-grid"><label>Host<input name="smtp_host" value="{esc(cfg.get('smtp_host',''))}"></label><label>Porta<input name="smtp_port" type="number" value="{esc(cfg.get('smtp_port','587'))}"></label><label>Usuário<input name="smtp_user" value="{esc(cfg.get('smtp_user',''))}"></label><label>Remetente (From)<input name="smtp_from" value="{esc(cfg.get('smtp_from',''))}"></label><label>Senha (vazio mantém)<input type="password" name="smtp_password" autocomplete="new-password"></label><label>TLS<select name="smtp_use_tls"><option value="1" {'selected' if cfg.get('smtp_use_tls','1')=='1' else ''}>Sim (STARTTLS)</option><option value="0" {'selected' if cfg.get('smtp_use_tls')=='0' else ''}>Não</option></select></label></div><div class="actions"><button>Salvar SMTP</button></div></form><form method="post" action="/smtp-test" style="margin-top:8px"><button class="subtle" type="submit">Enviar e-mail de teste</button></form></section></div>
 
@@ -3457,8 +3457,6 @@ class Handler(BaseHTTPRequestHandler):
                 form["linkedin_easy_apply"] = "0"
             if "linkedin_risk_ack" not in form:
                 form["linkedin_risk_ack"] = "0"
-            if "inhire_pcd" not in form:
-                form["inhire_pcd"] = "0"
             # Assisted-only: strip any legacy auto-submit flag if present in DB form posts.
             form.pop("linkedin_stop_before_submit", None)
             save_settings(form)
