@@ -18,7 +18,10 @@ LOG = logging.getLogger("job-scraper")
 KIND_RESUME = "resume_analysis"
 KIND_APPLY = "job_apply"
 KIND_LINKEDIN = "linkedin_apply"
+KIND_WORTH_REVERIFY = "worth_reverify"
 ACTIVE_STATUSES = ("pending", "running", "retry_wait")
+# Compartilham perfil Chrome — no máximo um desses kinds em running.
+BROWSER_PROFILE_KINDS = (KIND_LINKEDIN, KIND_WORTH_REVERIFY)
 TERMINAL_STATUSES = ("succeeded", "failed", "cancelled")
 # Teto absoluto do jitter de retry (evita intervalos de horas).
 BACKOFF_CAP_SECONDS = 20 * 60
@@ -366,10 +369,11 @@ class JobQueue:
             rows = db.execute("SELECT status, COUNT(*) AS n FROM queue_jobs GROUP BY status").fetchall()
         return {row["status"]: int(row["n"]) for row in rows}
 
-    def _linkedin_running(self, db: sqlite3.Connection) -> bool:
+    def _browser_profile_busy(self, db: sqlite3.Connection) -> bool:
+        placeholders = ",".join("?" * len(BROWSER_PROFILE_KINDS))
         row = db.execute(
-            "SELECT 1 FROM queue_jobs WHERE kind=? AND status='running' LIMIT 1",
-            (KIND_LINKEDIN,),
+            f"SELECT 1 FROM queue_jobs WHERE kind IN ({placeholders}) AND status='running' LIMIT 1",
+            BROWSER_PROFILE_KINDS,
         ).fetchone()
         return row is not None
 
@@ -384,7 +388,7 @@ class JobQueue:
                    WHERE status IN ('pending','retry_wait') AND expires_at < ?""",
                 (now_s, now_s),
             )
-            linkedin_busy = self._linkedin_running(db)
+            browser_busy = self._browser_profile_busy(db)
             # Fetch extra candidates so filtering Easy Apply still fills worker slots.
             fetch_n = max(limit * 4, limit + 8)
             rows = db.execute(
@@ -393,12 +397,12 @@ class JobQueue:
                    ORDER BY id ASC LIMIT ?""",
                 (now_s, fetch_n),
             ).fetchall()
-            claimed_linkedin = False
+            claimed_browser = False
             for row in rows:
                 if len(claimed) >= limit:
                     break
                 kind = str(row["kind"])
-                if kind == KIND_LINKEDIN and (linkedin_busy or claimed_linkedin):
+                if kind in BROWSER_PROFILE_KINDS and (browser_busy or claimed_browser):
                     continue
                 cur = db.execute(
                     """UPDATE queue_jobs SET status='running', updated_at=?
@@ -407,8 +411,8 @@ class JobQueue:
                 )
                 if cur.rowcount:
                     claimed.append(row)
-                    if kind == KIND_LINKEDIN:
-                        claimed_linkedin = True
+                    if kind in BROWSER_PROFILE_KINDS:
+                        claimed_browser = True
         return claimed
 
     def _dispatch_loop(self) -> None:

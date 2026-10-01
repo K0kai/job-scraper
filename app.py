@@ -20,7 +20,15 @@ from zoneinfo import ZoneInfo
 
 from apply_channels import apply_via_browser, apply_via_email, record_blocked, send_smtp_email
 from form_rules import ensure_default_rules, list_rules, save_rules_from_form
-from job_queue import KIND_APPLY, KIND_LINKEDIN, KIND_RESUME, JobQueue, NonRetryableError
+from job_queue import (
+    ACTIVE_STATUSES,
+    KIND_APPLY,
+    KIND_LINKEDIN,
+    KIND_RESUME,
+    KIND_WORTH_REVERIFY,
+    JobQueue,
+    NonRetryableError,
+)
 from linkedin_apply import apply_via_linkedin, default_profile_dir
 from ats_router import find_handler
 from resume_pipeline import (
@@ -1099,12 +1107,45 @@ def enqueue_worth_easy_apply(job_id: int) -> str:
     return f"Candidatura assistida enfileirada (fila #{qid}). No Chrome: revise, captcha e Enviar são com você."
 
 
+def handle_worth_reverify_job(payload: dict) -> str:
+    from worth_reverify import format_summary, reverify_worth_jobs
+
+    summary = reverify_worth_jobs(connect, cfg=settings(), project_root=ROOT)
+    msg = format_summary(summary)
+    log_event("info", "worth-reverify", msg)
+    return msg
+
+
+def enqueue_worth_reverify() -> str:
+    with connect() as db:
+        n = int(db.execute("SELECT COUNT(*) AS n FROM jobs WHERE status='worth'").fetchone()["n"] or 0)
+    if n <= 0:
+        return "Nenhuma vaga em Vale a pena olhar para reverificar."
+    qid = queue.enqueue(KIND_WORTH_REVERIFY, {}, dedupe_key="worth-reverify")
+    log_event("info", "worth-reverify", f"Lote de reverificação enfileirado (fila #{qid}, {n} vaga(s)).")
+    return (
+        f"Reverificação enfileirada (fila #{qid}) para {n} vaga(s). "
+        "HTTP primeiro; LinkedIn/inconclusivos no Chrome. Só ignora inativas claras."
+    )
+
+
+def worth_reverify_busy() -> bool:
+    try:
+        for row in queue.list_jobs(limit=80):
+            if str(row["kind"]) == KIND_WORTH_REVERIFY and str(row["status"]) in ACTIVE_STATUSES:
+                return True
+    except Exception:
+        return False
+    return False
+
+
 queue = JobQueue(
     db_path=DB_PATH,
     handlers={
         KIND_RESUME: handle_resume_analysis_job,
         KIND_APPLY: handle_job_apply_job,
         KIND_LINKEDIN: handle_linkedin_apply_job,
+        KIND_WORTH_REVERIFY: handle_worth_reverify_job,
     },
     get_settings=settings,
     connect_fn=connect,
@@ -2372,6 +2413,7 @@ def queue_html(limit: int = 100) -> str:
         KIND_RESUME: "Análise de currículo",
         KIND_APPLY: "Candidatura",
         KIND_LINKEDIN: "Easy Apply LinkedIn",
+        KIND_WORTH_REVERIFY: "Reverificar Vale olhar",
     }
     status_label = {
         "pending": "Pendente",
@@ -2605,6 +2647,7 @@ def worth_html(
     sort: str = WORTH_SORT_NONE,
     date_from: str = "",
     date_to: str = "",
+    reverify_busy: bool | None = None,
 ) -> str:
     page = max(1, int(page or 1))
     page_size = max(5, min(50, int(page_size or WORTH_PAGE_SIZE)))
@@ -2614,6 +2657,8 @@ def worth_html(
     date_to = (date_to or "").strip()
     if date_from and date_to and date_from > date_to:
         date_from, date_to = date_to, date_from
+    if reverify_busy is None:
+        reverify_busy = worth_reverify_busy()
     offset = (page - 1) * page_size
     match_expr = _worth_match_expr()
     where = "jobs.status = 'worth'"
@@ -2688,14 +2733,14 @@ def worth_html(
         filter_bits.append(
             f'<button type="button" class="subtle worth-match-preset" data-worth-min-match="{n}">{label}</button>'
         )
+    reverify_disabled = " disabled" if reverify_busy else ""
+    reverify_label = "Reverificando…" if reverify_busy else "Reverificar ativas"
     filter_bits.append(
         '<span class="worth-ignore-all-wrap">'
+        f'<button type="button" class="subtle" id="worth-reverify"{reverify_disabled}>'
+        f"{esc(reverify_label)}</button>"
         '<button type="button" class="subtle" id="worth-ignore-all">Ignorar todas</button>'
-        '<span id="worth-ignore-all-confirm" hidden class="worth-ignore-confirm">'
-        '<span class="hint" style="margin:0;color:#ffd54a">Ignorar todas?</span>'
-        '<button type="button" class="stop" id="worth-ignore-all-yes">Confirmar</button>'
-        '<button type="button" class="subtle" id="worth-ignore-all-no">Cancelar</button>'
-        "</span></span>"
+        "</span>"
     )
     note_bits: list[str] = []
     if min_match > 0:
@@ -3199,7 +3244,13 @@ color:#c9c9d1;border:1px solid var(--line);border-radius:10px;padding:12px;max-h
 .worth-filter-item{margin:0;display:flex;flex-direction:column;gap:4px;font-size:11px;color:var(--muted2);white-space:nowrap}
 .worth-filter-item input{margin:0;min-width:0;width:118px}
 .worth-ignore-all-wrap{margin-left:auto;display:inline-flex;align-items:center;gap:8px;flex-shrink:0}
-.worth-ignore-confirm{display:inline-flex;align-items:center;gap:8px}
+.modal{position:fixed;inset:0;z-index:80;display:flex;align-items:center;justify-content:center;padding:20px}
+.modal[hidden]{display:none!important}
+.modal-backdrop{position:absolute;inset:0;background:rgba(0,0,0,.55)}
+.modal-dialog{position:relative;z-index:1;width:min(420px,100%);background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:22px 22px 18px;box-shadow:0 16px 48px rgba(0,0,0,.45)}
+.modal-dialog h3{margin:0 0 10px;font-size:16px;color:var(--white)}
+.modal-dialog .hint{margin:0 0 18px}
+.modal-dialog .actions{display:flex;justify-content:flex-end;gap:10px;margin:0}
 .worth-pager{display:inline-flex;align-items:center;gap:8px;flex-shrink:0;margin-left:4px}
 .worth-pager-btns{display:inline-flex;align-items:center;gap:6px}
 .worth-table th button.worth-sort-th{background:none;border:0;color:inherit;font:inherit;font-weight:700;letter-spacing:.08em;text-transform:uppercase;cursor:pointer;padding:0;display:inline-flex;align-items:center;gap:4px}
@@ -3302,6 +3353,18 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
 <div id="tab-smtp" class="tab-panel"><section class="panel"><h2>SMTP</h2><form method="post" action="/smtp-settings"><div class="form-grid"><label>Host<input name="smtp_host" value="{esc(cfg.get('smtp_host',''))}"></label><label>Porta<input name="smtp_port" type="number" value="{esc(cfg.get('smtp_port','587'))}"></label><label>Usuário<input name="smtp_user" value="{esc(cfg.get('smtp_user',''))}"></label><label>Remetente (From)<input name="smtp_from" value="{esc(cfg.get('smtp_from',''))}"></label><label>Senha (vazio mantém)<input type="password" name="smtp_password" autocomplete="new-password"></label><label>TLS<select name="smtp_use_tls"><option value="1" {'selected' if cfg.get('smtp_use_tls','1')=='1' else ''}>Sim (STARTTLS)</option><option value="0" {'selected' if cfg.get('smtp_use_tls')=='0' else ''}>Não</option></select></label></div><div class="actions"><button>Salvar SMTP</button></div></form><form method="post" action="/smtp-test" style="margin-top:8px"><button class="subtle" type="submit">Enviar e-mail de teste</button></form></section></div>
 
 <div id="tab-vale" class="tab-panel"><section class="panel"><h2>Vale a pena olhar</h2><p class="hint">Vagas com bom match em LinkedIn (Easy Apply desligado/falhou) ou em que e-mail/formulário automático não funcionou. Em vagas LinkedIn, use <strong>Easy Apply</strong> para preencher sem nova busca — você confirma o envio no Chrome.</p><div id="worth-body">{worth_view}</div></section></div>
+
+<div id="worth-ignore-modal" class="modal" hidden>
+  <div class="modal-backdrop" data-worth-ignore-dismiss></div>
+  <div class="modal-dialog" role="dialog" aria-modal="true" aria-labelledby="worth-ignore-modal-title">
+    <h3 id="worth-ignore-modal-title">Ignorar todas?</h3>
+    <p class="hint">Todas as vagas em <strong>Vale a pena olhar</strong> serão marcadas como ignoradas. Não remove o histórico — só sai desta lista.</p>
+    <div class="actions">
+      <button type="button" class="subtle" id="worth-ignore-all-no">Cancelar</button>
+      <button type="button" class="stop" id="worth-ignore-all-yes">Confirmar</button>
+    </div>
+  </div>
+</div>
 
 <div id="tab-filas" class="tab-panel"><section class="panel"><h2>Filas de IA (async + retry)</h2><p class="hint">Análise de currículo e candidaturas rodam em paralelo (até 3 workers). Em fila/rate-limit da API, o job entra em retry automático até sucesso, expirar (24h) ou cancelar.</p><div id="queue-body">{queue_view}</div></section></div>
 
@@ -3466,17 +3529,14 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
     refresh();
   }}
   function setWorthIgnoreConfirm(open) {{
-    var btn = document.getElementById("worth-ignore-all");
-    var box = document.getElementById("worth-ignore-all-confirm");
-    if (!btn || !box) return;
+    var modal = document.getElementById("worth-ignore-modal");
+    if (!modal) return;
     if (open) {{
-      btn.hidden = true;
-      box.hidden = false;
-      box.style.display = "inline-flex";
+      modal.hidden = false;
+      var yes = document.getElementById("worth-ignore-all-yes");
+      if (yes) yes.disabled = false;
     }} else {{
-      btn.hidden = false;
-      box.hidden = true;
-      box.style.display = "none";
+      modal.hidden = true;
     }}
   }}
   function ignoreAllWorth() {{
@@ -3490,6 +3550,7 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
       .then(function (res) {{
         var data = res.data || {{}};
         showNotice(data.notice || (data.ok ? "OK" : "Falha"), data.kind || (data.ok ? "success" : "error"));
+        setWorthIgnoreConfirm(false);
         worthPage = 1;
         persistWorthState();
         requestWorthRefresh();
@@ -3497,6 +3558,26 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
       .catch(function () {{
         showNotice("Falha de comunicação com o painel.", "error");
         setWorthIgnoreConfirm(false);
+      }});
+  }}
+  function enqueueWorthReverify() {{
+    var btn = document.getElementById("worth-reverify");
+    if (btn) btn.disabled = true;
+    fetch("/worth-reverify", {{
+      method: "POST",
+      body: new FormData(),
+      headers: {{ Accept: "application/json", "X-Requested-With": "fetch" }},
+      credentials: "same-origin"
+    }})
+      .then(function (r) {{ return r.json().then(function (data) {{ return {{ okHttp: r.ok, data: data }}; }}); }})
+      .then(function (res) {{
+        var data = res.data || {{}};
+        showNotice(data.notice || (data.ok ? "OK" : "Falha"), data.kind || (data.ok ? "success" : "error"));
+        requestWorthRefresh();
+      }})
+      .catch(function () {{
+        showNotice("Falha de comunicação com o painel.", "error");
+        if (btn) btn.disabled = false;
       }});
   }}
   var worthBody = document.getElementById("worth-body");
@@ -3528,13 +3609,9 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
         setWorthIgnoreConfirm(true);
         return;
       }}
-      if (ev.target && ev.target.id === "worth-ignore-all-no") {{
-        setWorthIgnoreConfirm(false);
-        return;
-      }}
-      if (ev.target && ev.target.id === "worth-ignore-all-yes") {{
-        ev.target.disabled = true;
-        ignoreAllWorth();
+      if (ev.target && ev.target.id === "worth-reverify") {{
+        if (ev.target.disabled) return;
+        enqueueWorthReverify();
         return;
       }}
       var btn = ev.target.closest("[data-worth-page]");
@@ -3553,6 +3630,27 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
       if (id !== "worth-min-match" && id !== "worth-date-from" && id !== "worth-date-to") return;
       ev.preventDefault();
       applyWorthFilters();
+    }});
+  }}
+  var ignoreModal = document.getElementById("worth-ignore-modal");
+  if (ignoreModal) {{
+    ignoreModal.addEventListener("click", function (ev) {{
+      if (ev.target && ev.target.id === "worth-ignore-all-no") {{
+        setWorthIgnoreConfirm(false);
+        return;
+      }}
+      if (ev.target && ev.target.id === "worth-ignore-all-yes") {{
+        ev.target.disabled = true;
+        ignoreAllWorth();
+        return;
+      }}
+      if (ev.target && ev.target.hasAttribute("data-worth-ignore-dismiss")) {{
+        setWorthIgnoreConfirm(false);
+      }}
+    }});
+    document.addEventListener("keydown", function (ev) {{
+      if (ev.key !== "Escape") return;
+      if (!ignoreModal.hidden) setWorthIgnoreConfirm(false);
     }});
   }}
   function refresh() {{
@@ -3653,6 +3751,7 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
     "/clear-logs": 1,
     "/usage-refresh": 1,
     "/worth-easy-apply": 1,
+    "/worth-reverify": 1,
     "/job-status": 1,
     "/worth-ignore-all": 1
   }};
@@ -3703,7 +3802,7 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
           var fileInput = form.querySelector('input[type="file"]');
           if (fileInput) fileInput.value = "";
         }}
-        if (path === "/job-status" || path === "/worth-ignore-all" || path === "/worth-easy-apply") {{
+        if (path === "/job-status" || path === "/worth-ignore-all" || path === "/worth-reverify" || path === "/worth-easy-apply") {{
           requestWorthRefresh();
         }} else {{
           refresh();
@@ -4112,6 +4211,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.respond_notice("1 vaga ignorada.")
             else:
                 self.respond_notice(f"{n} vagas ignoradas.")
+        elif path == "/worth-reverify":
+            note = enqueue_worth_reverify()
+            self.respond_notice(note, notice_kind="info")
         elif path == "/notes":
             if form.get("id", "").isdigit():
                 with connect() as db:

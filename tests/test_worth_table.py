@@ -77,6 +77,9 @@ class WorthTableHtmlTests(unittest.TestCase):
         self.assertIn('data-worth-sort-col="match"', html)
         self.assertNotIn('id="worth-sort"', html)
         self.assertEqual(html.count('class="worth-filters"'), 1)
+        self.assertIn('id="worth-reverify"', html)
+        self.assertIn('id="worth-ignore-all"', html)
+        self.assertNotIn("worth-ignore-all-confirm", html)
         self.assertIn("Table Job", html)
 
     def test_both_indicators_when_multi_sort(self) -> None:
