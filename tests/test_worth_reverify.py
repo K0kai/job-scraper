@@ -18,9 +18,39 @@ class ClassifyHttpTests(unittest.TestCase):
         body = "Sorry, this job is no longer accepting applications."
         self.assertEqual(worth_reverify.classify_http(200, body), "inactive")
 
+    def test_linkedin_applicants_copy_is_inactive(self) -> None:
+        # Texto real do LinkedIn usa "applicants", não "applications".
+        body = "No longer accepting applicants"
+        self.assertEqual(worth_reverify.classify_http(200, body), "inactive")
+
+    def test_closed_banner_beats_related_easy_apply(self) -> None:
+        # Página fechada ainda lista Easy Apply em vagas similares no mesmo HTML.
+        body = (
+            "No longer accepting applicants"
+            '<button aria-label="Easy Apply to Similar Role">Easy Apply</button>'
+        )
+        self.assertEqual(worth_reverify.classify_http(200, body), "inactive")
+
     def test_pt_closed_copy(self) -> None:
         body = "Esta vaga não está mais aceitando candidaturas."
         self.assertEqual(worth_reverify.classify_http(200, body), "inactive")
+
+    def test_pt_estamos_mais_aceitando_is_inactive(self) -> None:
+        body = "Não estamos mais aceitando candidaturas."
+        self.assertEqual(worth_reverify.classify_http(200, body), "inactive")
+
+    def test_pt_closed_banner_beats_candidatura_simplificada(self) -> None:
+        body = (
+            "Não estamos mais aceitando candidaturas."
+            '<button>Candidatura simplificada</button>'
+        )
+        self.assertEqual(worth_reverify.classify_http(200, body), "inactive")
+
+    def test_pt_candidaturas_encerradas_is_inactive(self) -> None:
+        self.assertEqual(
+            worth_reverify.classify_http(200, "Candidaturas encerradas"),
+            "inactive",
+        )
 
     def test_apply_signal_is_active(self) -> None:
         body = '<button>Easy Apply</button> Apply now for this role'
@@ -68,6 +98,58 @@ class BrowserWaitTests(unittest.TestCase):
         verdict, _detail = worth_reverify.wait_page_liveness_signal(
             FakePage(), timeout_ms=2_000, poll_ms=1
         )
+        self.assertEqual(verdict, "active")
+
+    def test_wait_returns_unknown_on_linkedin_load_error(self) -> None:
+        class FakePage:
+            url = "https://www.linkedin.com/jobs/view/9"
+
+            def content(self):
+                return "<html>Não foi possível carregar a página. Tente novamente.</html>"
+
+            def wait_for_timeout(self, ms):
+                raise AssertionError("não deve esperar timeout em load error")
+
+        verdict, detail = worth_reverify.wait_page_liveness_signal(
+            FakePage(), timeout_ms=25_000, poll_ms=500
+        )
+        self.assertEqual(verdict, "unknown")
+        self.assertIn("carregar", detail.casefold())
+
+    def test_check_url_retries_once_on_load_error(self) -> None:
+        calls = {"goto": 0, "reload": 0}
+
+        class FakePage:
+            url = "https://www.linkedin.com/jobs/view/9"
+
+            def goto(self, url, **kwargs):
+                calls["goto"] += 1
+
+            def reload(self, **kwargs):
+                calls["reload"] += 1
+
+            def content(self):
+                if calls["reload"] == 0:
+                    return "<html>Não foi possível carregar a página</html>"
+                return "<button>Easy Apply</button>"
+
+            def wait_for_timeout(self, ms):
+                return None
+
+            class mouse:
+                @staticmethod
+                def wheel(*a, **k):
+                    return None
+
+        session = worth_reverify.LinkedInLivenessSession.__new__(
+            worth_reverify.LinkedInLivenessSession
+        )
+        session._page = FakePage()
+        session.goto_timeout_ms = 1000
+        session.page_timeout_ms = 2000
+        session.should_abort = None
+        verdict, _detail = session.check_url("https://www.linkedin.com/jobs/view/9")
+        self.assertEqual(calls["reload"], 1)
         self.assertEqual(verdict, "active")
 
     def test_wait_unknown_on_timeout(self) -> None:

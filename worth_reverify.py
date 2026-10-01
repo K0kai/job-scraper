@@ -19,14 +19,20 @@ ACTIVE = "active"
 UNKNOWN = "unknown"
 
 INACTIVE_RE = re.compile(
-    r"no\s+longer\s+accepting\s+applications|"
+    # LinkedIn EN: "applicants"; ATS/copy: "applications".
+    r"no\s+longer\s+accepting\s+(?:applications?|applicants?)|"
     r"this\s+job\s+is\s+no\s+longer\s+available|"
     r"job\s+has\s+been\s+filled|"
     r"position\s+has\s+been\s+filled|"
+    # LinkedIn PT / ATS BR.
     r"esta\s+vaga\s+n[aã]o\s+est[aá]\s+mais\s+aceitando|"
+    r"esta\s+vaga\s+n[aã]o\s+est[aá]\s+mais\s+dispon[ií]vel|"
     r"vaga\s+(encerrada|expirada|indispon[ií]vel)|"
-    r"n[aã]o\s+est[aá]\s+mais\s+aceitando\s+candidaturas|"
-    r" candidaturas?\s+encerradas?|"
+    r"n[aã]o\s+est(?:[aá]|amos)\s+mais\s+aceitando\s+candidaturas|"
+    r"n[aã]o\s+aceitamos\s+mais\s+candidaturas|"
+    r"n[aã]o\s+estamos\s+mais\s+recebendo\s+candidaturas|"
+    r"\bcandidaturas?\s+encerradas?\b|"
+    r"inscri[cç][oõ]es?\s+encerradas?|"
     r"application\s+deadline\s+has\s+passed|"
     r"this\s+position\s+is\s+closed",
     re.I,
@@ -37,6 +43,17 @@ ACTIVE_RE = re.compile(
     r"apply\s+now|candidatar(-se)?|enviar\s+candidatura|"
     r"submit\s+application|apply\s+for\s+this\s+(job|role)|"
     r"finalizar\s+candidatura",
+    re.I,
+)
+
+# Erro transitório do LinkedIn — não é sinal de vaga ativa/fechada; não esperar timeout.
+LOAD_ERROR_RE = re.compile(
+    r"n[aã]o\s+foi\s+poss[ií]vel\s+carregar\s+a\s+p[aá]gina|"
+    r"couldn[’’']?t\s+load\s+(the\s+)?page|"
+    r"could\s+not\s+load\s+(the\s+)?page|"
+    r"unable\s+to\s+load\s+(the\s+)?page|"
+    r"page\s+isn[’’']?t\s+available|"
+    r"something\s+went\s+wrong",
     re.I,
 )
 
@@ -106,6 +123,10 @@ def check_http_liveness(url: str, *, timeout: float = 20.0) -> tuple[str, str]:
     return verdict, f"HTTP {status}"
 
 
+def page_has_load_error(body: str) -> bool:
+    return bool(LOAD_ERROR_RE.search(body or ""))
+
+
 def wait_page_liveness_signal(
     page,
     *,
@@ -129,6 +150,8 @@ def wait_page_liveness_signal(
         except Exception as exc:
             last_detail = f"content: {exc}"
             body = ""
+        if page_has_load_error(body):
+            return UNKNOWN, "não foi possível carregar a página"
         verdict = classify_http(200, body)
         if verdict == INACTIVE:
             return INACTIVE, "browser: vaga fechada"
@@ -245,12 +268,32 @@ class LinkedInLivenessSession:
             self._page.mouse.wheel(0, 400)
         except Exception:
             pass
-        return wait_page_liveness_signal(
+        verdict, detail = wait_page_liveness_signal(
             self._page,
             timeout_ms=self.page_timeout_ms,
             poll_ms=DEFAULT_POLL_MS,
             should_abort=self.should_abort,
         )
+        # Erro de carga do LinkedIn: um reload e tenta de novo; se persistir, segue o lote.
+        if verdict == UNKNOWN and "carregar a página" in detail.casefold():
+            LOG.info("worth-reverify: load error em %s — reload 1x", url)
+            try:
+                self._page.reload(wait_until="domcontentloaded", timeout=self.goto_timeout_ms)
+            except Exception as exc:
+                return UNKNOWN, f"reload: {exc}"
+            try:
+                self._page.wait_for_timeout(2000)
+            except Exception:
+                time.sleep(2.0)
+            verdict, detail = wait_page_liveness_signal(
+                self._page,
+                timeout_ms=self.page_timeout_ms,
+                poll_ms=DEFAULT_POLL_MS,
+                should_abort=self.should_abort,
+            )
+            if verdict == UNKNOWN and "carregar a página" in detail.casefold():
+                return UNKNOWN, "não foi possível carregar a página (após reload)"
+        return verdict, detail
 
 
 def check_job_liveness(
