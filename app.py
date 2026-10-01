@@ -2425,6 +2425,59 @@ def queue_html(limit: int = 100) -> str:
 
 
 WORTH_PAGE_SIZE = 15
+WORTH_SORT_MATCH = "match"  # alias: match DESC (default)
+WORTH_SORT_MATCH_ASC = "match_asc"
+WORTH_SORT_SEEN_DESC = "seen_desc"
+WORTH_SORT_SEEN_ASC = "seen_asc"
+WORTH_SORTS = {
+    WORTH_SORT_MATCH,
+    WORTH_SORT_MATCH_ASC,
+    WORTH_SORT_SEEN_DESC,
+    WORTH_SORT_SEEN_ASC,
+}
+
+
+def normalize_worth_sort(sort: str | None) -> str:
+    raw = (sort or "").strip().casefold()
+    if raw in {"match_desc", "score_desc"}:
+        return WORTH_SORT_MATCH
+    return raw if raw in WORTH_SORTS else WORTH_SORT_MATCH
+
+
+def worth_order_sql(sort: str | None) -> str:
+    kind = normalize_worth_sort(sort)
+    if kind == WORTH_SORT_SEEN_DESC:
+        return "jobs.first_seen_at DESC, jobs.id DESC"
+    if kind == WORTH_SORT_SEEN_ASC:
+        return "jobs.first_seen_at ASC, jobs.id DESC"
+    if kind == WORTH_SORT_MATCH_ASC:
+        return "COALESCE(match_score, 0) ASC, jobs.id DESC"
+    return "COALESCE(match_score, 0) DESC, jobs.id DESC"
+
+
+def _parse_worth_day(raw: str | None) -> datetime | None:
+    text = (raw or "").strip()
+    if not text:
+        return None
+    try:
+        y, m, d = (int(p) for p in text.split("-", 2))
+        return datetime(y, m, d, tzinfo=BRASILIA)
+    except (TypeError, ValueError):
+        return None
+
+
+def worth_date_bounds_utc(
+    date_from: str | None,
+    date_to: str | None,
+) -> tuple[str | None, str | None]:
+    """Converte dias YYYY-MM-DD (Brasília) em limites ISO UTC [lo, hi)."""
+    start_local = _parse_worth_day(date_from)
+    end_local = _parse_worth_day(date_to)
+    lo = start_local.astimezone(timezone.utc).isoformat(timespec="seconds") if start_local else None
+    hi = None
+    if end_local is not None:
+        hi = (end_local + timedelta(days=1)).astimezone(timezone.utc).isoformat(timespec="seconds")
+    return lo, hi
 
 
 def _worth_match_expr() -> str:
@@ -2454,10 +2507,24 @@ def _notes_html(notes: str) -> str:
     return f'<p class="hint">{esc(text)}</p>'
 
 
-def worth_html(*, page: int = 1, page_size: int = WORTH_PAGE_SIZE, min_match: int = 0) -> str:
+def worth_html(
+    *,
+    page: int = 1,
+    page_size: int = WORTH_PAGE_SIZE,
+    min_match: int = 0,
+    sort: str = WORTH_SORT_MATCH,
+    date_from: str = "",
+    date_to: str = "",
+) -> str:
     page = max(1, int(page or 1))
     page_size = max(5, min(50, int(page_size or WORTH_PAGE_SIZE)))
     min_match = max(0, min(100, int(min_match or 0)))
+    sort = normalize_worth_sort(sort)
+    date_from = (date_from or "").strip()
+    date_to = (date_to or "").strip()
+    # Se from > to, troca para não devolver lista vazia por engano.
+    if date_from and date_to and date_from > date_to:
+        date_from, date_to = date_to, date_from
     offset = (page - 1) * page_size
     match_expr = _worth_match_expr()
     where = "jobs.status = 'worth'"
@@ -2465,6 +2532,14 @@ def worth_html(*, page: int = 1, page_size: int = WORTH_PAGE_SIZE, min_match: in
     if min_match > 0:
         where += f" AND COALESCE({match_expr}, 0) >= ?"
         params.append(min_match)
+    lo, hi = worth_date_bounds_utc(date_from, date_to)
+    if lo:
+        where += " AND jobs.first_seen_at >= ?"
+        params.append(lo)
+    if hi:
+        where += " AND jobs.first_seen_at < ?"
+        params.append(hi)
+    order_sql = worth_order_sql(sort)
 
     with connect() as db:
         total = int(
@@ -2479,16 +2554,32 @@ def worth_html(*, page: int = 1, page_size: int = WORTH_PAGE_SIZE, min_match: in
                FROM jobs
                LEFT JOIN cover_letters ON cover_letters.job_id = jobs.id
                WHERE {where}
-               ORDER BY COALESCE(match_score, 0) DESC, jobs.id DESC
+               ORDER BY {order_sql}
                LIMIT ? OFFSET ?""",
             [*params, page_size, offset],
         ).fetchall()
 
+    sort_opts = [
+        (WORTH_SORT_MATCH, "Match (maior → menor)"),
+        (WORTH_SORT_MATCH_ASC, "Match (menor → maior)"),
+        (WORTH_SORT_SEEN_DESC, "Encontrada (mais recente)"),
+        (WORTH_SORT_SEEN_ASC, "Encontrada (mais antiga)"),
+    ]
+    sort_html = "".join(
+        f'<option value="{esc(value)}"{" selected" if value == sort else ""}>{esc(label)}</option>'
+        for value, label in sort_opts
+    )
     filter_bar = (
         '<div class="worth-filters actions" style="margin:0 0 12px;align-items:flex-end;flex-wrap:wrap">'
         '<label style="margin:0">Match mínimo (%)'
         f'<input type="number" id="worth-min-match" min="0" max="100" step="1" value="{min_match}" '
         'style="width:88px;margin-top:4px"></label>'
+        '<label style="margin:0">Ordenar'
+        f'<select id="worth-sort" style="margin-top:4px;min-width:200px">{sort_html}</select></label>'
+        '<label style="margin:0">Encontrada de'
+        f'<input type="date" id="worth-date-from" value="{esc(date_from)}" style="margin-top:4px"></label>'
+        '<label style="margin:0">até'
+        f'<input type="date" id="worth-date-to" value="{esc(date_to)}" style="margin-top:4px"></label>'
         '<button type="button" class="subtle" id="worth-apply-filter">Filtrar</button>'
         "".join(
             f'<button type="button" class="subtle worth-match-preset" data-worth-min-match="{n}">'
@@ -2505,13 +2596,29 @@ def worth_html(*, page: int = 1, page_size: int = WORTH_PAGE_SIZE, min_match: in
         + "</div>"
     )
 
+    def _filter_note() -> str:
+        bits: list[str] = []
+        if min_match > 0:
+            bits.append(f"match ≥ {min_match}")
+        if date_from or date_to:
+            bits.append(f"encontrada {date_from or '…'} → {date_to or '…'}")
+        if sort == WORTH_SORT_SEEN_DESC:
+            bits.append("ordem: encontrada ↓")
+        elif sort == WORTH_SORT_SEEN_ASC:
+            bits.append("ordem: encontrada ↑")
+        elif sort == WORTH_SORT_MATCH_ASC:
+            bits.append("ordem: match ↑")
+        elif sort == WORTH_SORT_MATCH:
+            bits.append("ordem: match ↓")
+        return (" · " + " · ".join(bits)) if bits else ""
+
     if total == 0:
         empty = (
             '<div data-worth-current="1">'
             '<p class="hint">Nenhuma vaga neste filtro. '
             + (
-                "Ajuste o match mínimo ou limpe o filtro."
-                if min_match > 0
+                "Ajuste match, datas ou limpe o filtro."
+                if min_match > 0 or date_from or date_to
                 else "Quando houver bom match mas LinkedIn, falha de formulário/e-mail, a vaga aparece aqui."
             )
             + "</p></div>"
@@ -2529,7 +2636,7 @@ def worth_html(*, page: int = 1, page_size: int = WORTH_PAGE_SIZE, min_match: in
                    FROM jobs
                    LEFT JOIN cover_letters ON cover_letters.job_id = jobs.id
                    WHERE {where}
-                   ORDER BY COALESCE(match_score, 0) DESC, jobs.id DESC
+                   ORDER BY {order_sql}
                    LIMIT ? OFFSET ?""",
                 [*params, page_size, offset],
             ).fetchall()
@@ -2562,7 +2669,9 @@ def worth_html(*, page: int = 1, page_size: int = WORTH_PAGE_SIZE, min_match: in
             f'<article class="worth-card">'
             f'<div class="worth-head"><a class="job-title" href="{esc(job["url"])}" target="_blank" rel="noreferrer">{esc(job["title"])}</a>'
             f'<span class="analysis-badge analysis-ok">Match {esc(score_label)}</span></div>'
-            f'<p class="hint"><strong>{esc(job["company"])}</strong> · {esc(job["location"])} · {esc(job["source"])} · {esc(format_brasilia(job["posted_at"] or job["first_seen_at"]))}</p>'
+            f'<p class="hint"><strong>{esc(job["company"])}</strong> · {esc(job["location"])} · {esc(job["source"])} · '
+            f'publicada {esc(format_brasilia(job["posted_at"] or job["first_seen_at"]))} · '
+            f'encontrada {esc(format_brasilia(job["first_seen_at"]))}</p>'
             f'{_notes_html(job["notes"] or "")}'
             f'<p><a href="{esc(job["url"])}" target="_blank" rel="noreferrer">Abrir vaga para candidatura manual</a></p>'
             f'<details><summary>Descrição</summary><div class="description">{esc(desc)}</div></details>'
@@ -2578,7 +2687,7 @@ def worth_html(*, page: int = 1, page_size: int = WORTH_PAGE_SIZE, min_match: in
         )
     start = offset + 1
     end = offset + len(rows)
-    filter_note = f" · match ≥ {min_match}" if min_match > 0 else ""
+    filter_note = _filter_note()
     pager_bits = [
         f'<div class="worth-pager" data-worth-pages="{pages}" data-worth-current="{page}">'
         f'<span class="hint">Mostrando {start}–{end} de {total}{filter_note}</span>'
@@ -2626,7 +2735,14 @@ def format_countdown(seconds: int | None) -> str:
     return f"{mins:02d}:{secs:02d}"
 
 
-def live_payload(*, worth_page: int = 1, worth_min_match: int = 0) -> dict:
+def live_payload(
+    *,
+    worth_page: int = 1,
+    worth_min_match: int = 0,
+    worth_sort: str = WORTH_SORT_MATCH,
+    worth_date_from: str = "",
+    worth_date_to: str = "",
+) -> dict:
     status = collector.snapshot()
     counts, jobs, runs = load_dashboard()
     collecting = status["state"] in {"running", "stopping"}
@@ -2637,8 +2753,17 @@ def live_payload(*, worth_page: int = 1, worth_min_match: int = 0) -> dict:
     queue = queue_html()
     worth_min_match = max(0, min(100, int(worth_min_match or 0)))
     worth_page = max(1, int(worth_page or 1))
+    worth_sort = normalize_worth_sort(worth_sort)
+    worth_date_from = (worth_date_from or "").strip()
+    worth_date_to = (worth_date_to or "").strip()
     # Clamp page so "ignorar" na última página não pede um OFFSET vazio.
-    worth = worth_html(page=worth_page, min_match=worth_min_match)
+    worth = worth_html(
+        page=worth_page,
+        min_match=worth_min_match,
+        sort=worth_sort,
+        date_from=worth_date_from,
+        date_to=worth_date_to,
+    )
     # worth_html já clampou page no HTML (data-worth-current); espelha no payload.
     try:
         m = re.search(r'data-worth-current="(\d+)"', worth or "")
@@ -2670,6 +2795,9 @@ def live_payload(*, worth_page: int = 1, worth_min_match: int = 0) -> dict:
         "worth_hash": _live_hash(worth),
         "worth_page": worth_page,
         "worth_min_match": worth_min_match,
+        "worth_sort": worth_sort,
+        "worth_date_from": worth_date_from,
+        "worth_date_to": worth_date_to,
         "resume_status": resume_status_payload(),
         "linkedin_filter_html": linkedin_filter,
         "linkedin_filter_hash": _live_hash(linkedin_filter),
@@ -3121,18 +3249,47 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
   var appliedHashes = {{}};
   var worthPage = 1;
   var worthMinMatch = 0;
+  var worthSort = "match";
+  var worthDateFrom = "";
+  var worthDateTo = "";
   var worthForceUpdate = false;
   try {{
     var savedPage = parseInt(localStorage.getItem("radar-worth-page"), 10);
     if (savedPage > 0) worthPage = savedPage;
     var savedMin = parseInt(localStorage.getItem("radar-worth-min-match"), 10);
     if (!isNaN(savedMin)) worthMinMatch = Math.max(0, Math.min(100, savedMin));
+    var savedSort = localStorage.getItem("radar-worth-sort") || "";
+    if (savedSort) worthSort = savedSort;
+    worthDateFrom = localStorage.getItem("radar-worth-date-from") || "";
+    worthDateTo = localStorage.getItem("radar-worth-date-to") || "";
   }} catch (e) {{}}
   function persistWorthState() {{
     try {{
       localStorage.setItem("radar-worth-page", String(worthPage));
       localStorage.setItem("radar-worth-min-match", String(worthMinMatch));
+      localStorage.setItem("radar-worth-sort", String(worthSort || "match"));
+      localStorage.setItem("radar-worth-date-from", String(worthDateFrom || ""));
+      localStorage.setItem("radar-worth-date-to", String(worthDateTo || ""));
     }} catch (e) {{}}
+  }}
+  function readWorthFilterInputs() {{
+    var minEl = document.getElementById("worth-min-match");
+    var sortEl = document.getElementById("worth-sort");
+    var fromEl = document.getElementById("worth-date-from");
+    var toEl = document.getElementById("worth-date-to");
+    if (minEl) {{
+      var val = parseInt(minEl.value, 10);
+      worthMinMatch = isNaN(val) ? 0 : Math.max(0, Math.min(100, val));
+    }}
+    if (sortEl && sortEl.value) worthSort = sortEl.value;
+    if (fromEl) worthDateFrom = fromEl.value || "";
+    if (toEl) worthDateTo = toEl.value || "";
+  }}
+  function applyWorthFilters() {{
+    readWorthFilterInputs();
+    worthPage = 1;
+    persistWorthState();
+    requestWorthRefresh();
   }}
   function panelBusy(el) {{
     if (!el) return false;
@@ -3217,19 +3374,15 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
       var preset = ev.target.closest(".worth-match-preset");
       if (preset && worthBody.contains(preset)) {{
         worthMinMatch = parseInt(preset.getAttribute("data-worth-min-match"), 10) || 0;
+        var minInput = document.getElementById("worth-min-match");
+        if (minInput) minInput.value = String(worthMinMatch);
         worthPage = 1;
         persistWorthState();
         requestWorthRefresh();
         return;
       }}
       if (ev.target && ev.target.id === "worth-apply-filter") {{
-        var input = document.getElementById("worth-min-match");
-        var val = input ? parseInt(input.value, 10) : 0;
-        if (isNaN(val)) val = 0;
-        worthMinMatch = Math.max(0, Math.min(100, val));
-        worthPage = 1;
-        persistWorthState();
-        requestWorthRefresh();
+        applyWorthFilters();
         return;
       }}
       if (ev.target && ev.target.id === "worth-ignore-all") {{
@@ -3256,10 +3409,17 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
     }});
     worthBody.addEventListener("keydown", function (ev) {{
       if (ev.key !== "Enter") return;
-      if (!ev.target || ev.target.id !== "worth-min-match") return;
+      if (!ev.target) return;
+      var id = ev.target.id || "";
+      if (id !== "worth-min-match" && id !== "worth-date-from" && id !== "worth-date-to") return;
       ev.preventDefault();
-      var applyBtn = document.getElementById("worth-apply-filter");
-      if (applyBtn) applyBtn.click();
+      applyWorthFilters();
+    }});
+    worthBody.addEventListener("change", function (ev) {{
+      if (!ev.target) return;
+      if (ev.target.id === "worth-sort") {{
+        applyWorthFilters();
+      }}
     }});
   }}
   function refresh() {{
@@ -3267,7 +3427,10 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
     inFlight = true;
     fetch(
       "/live?worth_page=" + encodeURIComponent(worthPage)
-        + "&worth_min_match=" + encodeURIComponent(worthMinMatch),
+        + "&worth_min_match=" + encodeURIComponent(worthMinMatch)
+        + "&worth_sort=" + encodeURIComponent(worthSort || "match")
+        + "&worth_date_from=" + encodeURIComponent(worthDateFrom || "")
+        + "&worth_date_to=" + encodeURIComponent(worthDateTo || ""),
       {{ headers: {{ Accept: "application/json" }} }}
     )
       .then(function (response) {{ return response.ok ? response.json() : Promise.reject(); }})
@@ -3289,12 +3452,14 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
         }}
         if (data.worth_page) {{
           worthPage = data.worth_page;
-          persistWorthState();
         }}
         if (typeof data.worth_min_match !== "undefined") {{
           worthMinMatch = data.worth_min_match;
-          persistWorthState();
         }}
+        if (data.worth_sort) worthSort = data.worth_sort;
+        if (typeof data.worth_date_from !== "undefined") worthDateFrom = data.worth_date_from || "";
+        if (typeof data.worth_date_to !== "undefined") worthDateTo = data.worth_date_to || "";
+        persistWorthState();
         applyRegion(statsEl, data.stats_html, data.stats_hash, {{ key: "stats" }});
         applyRegion(jobsEl, data.jobs_html, data.jobs_hash, {{ key: "jobs", skipIfBusy: true, wrapScroll: ".table-wrap" }});
         applyRegion(historyEl, data.history_html, data.history_hash, {{ key: "history" }});
@@ -3527,8 +3692,14 @@ class Handler(BaseHTTPRequestHandler):
             qs = parse_qs(parsed.query)
             worth_page = 1
             worth_min_match = 0
+            worth_sort = WORTH_SORT_MATCH
+            worth_date_from = ""
+            worth_date_to = ""
             raw_page = (qs.get("worth_page") or ["1"])[0]
             raw_min = (qs.get("worth_min_match") or ["0"])[0]
+            raw_sort = (qs.get("worth_sort") or ["match"])[0]
+            worth_date_from = (qs.get("worth_date_from") or [""])[0].strip()
+            worth_date_to = (qs.get("worth_date_to") or [""])[0].strip()
             try:
                 worth_page = max(1, int(raw_page))
             except ValueError:
@@ -3537,7 +3708,16 @@ class Handler(BaseHTTPRequestHandler):
                 worth_min_match = max(0, min(100, int(raw_min)))
             except ValueError:
                 worth_min_match = 0
-            self.send_json(live_payload(worth_page=worth_page, worth_min_match=worth_min_match))
+            worth_sort = normalize_worth_sort(raw_sort)
+            self.send_json(
+                live_payload(
+                    worth_page=worth_page,
+                    worth_min_match=worth_min_match,
+                    worth_sort=worth_sort,
+                    worth_date_from=worth_date_from,
+                    worth_date_to=worth_date_to,
+                )
+            )
             return
         self.send_page(render_page())
 
