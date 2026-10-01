@@ -2434,8 +2434,7 @@ WORTH_SORT_POSTED_ASC = "posted_asc"
 WORTH_SORT_POSTED_DESC = "posted_desc"
 # Legado do select antigo.
 WORTH_SORT_MATCH = WORTH_SORT_MATCH_DESC
-WORTH_SORTS = {
-    WORTH_SORT_NONE,
+WORTH_SORT_TOKEN = {
     WORTH_SORT_MATCH_ASC,
     WORTH_SORT_MATCH_DESC,
     WORTH_SORT_SEEN_ASC,
@@ -2443,62 +2442,106 @@ WORTH_SORTS = {
     WORTH_SORT_POSTED_ASC,
     WORTH_SORT_POSTED_DESC,
 }
+WORTH_SORTS = {WORTH_SORT_NONE, *WORTH_SORT_TOKEN}
 WORTH_SORT_COLS = ("match", "seen", "posted")
 
 
-def normalize_worth_sort(sort: str | None) -> str:
+def parse_worth_sorts(sort: str | None) -> list[str]:
+    """Lista ordenada de tokens ativos (primeiro = prioridade). Combináveis."""
     raw = (sort or "").strip().casefold()
+    if not raw:
+        return []
     if raw in {"match", "score_desc"}:
-        return WORTH_SORT_MATCH_DESC
-    if raw in WORTH_SORTS:
-        return raw
-    return WORTH_SORT_NONE
+        return [WORTH_SORT_MATCH_DESC]
+    if "," not in raw and "+" not in raw and raw in WORTH_SORT_TOKEN:
+        return [raw]
+    sep = "," if "," in raw else "+"
+    out: list[str] = []
+    seen_cols: set[str] = set()
+    for part in raw.split(sep):
+        token = part.strip().casefold()
+        if token in {"match", "score_desc"}:
+            token = WORTH_SORT_MATCH_DESC
+        if token not in WORTH_SORT_TOKEN:
+            continue
+        col = token.rsplit("_", 1)[0]
+        if col in seen_cols:
+            continue
+        seen_cols.add(col)
+        out.append(token)
+    return out
+
+
+def encode_worth_sorts(tokens: list[str]) -> str:
+    return ",".join(tokens)
+
+
+def normalize_worth_sort(sort: str | None) -> str:
+    """Normaliza string de sort (pode ser multi: match_desc,seen_asc)."""
+    return encode_worth_sorts(parse_worth_sorts(sort))
 
 
 def cycle_worth_sort(column: str, current: str | None) -> str:
-    """none → asc → desc → none (só uma coluna por vez)."""
+    """Cicla uma coluna (none→asc→desc→none) sem apagar as outras."""
     col = (column or "").strip().casefold()
     if col not in WORTH_SORT_COLS:
-        return WORTH_SORT_NONE
-    cur = normalize_worth_sort(current)
-    asc = f"{col}_asc"
-    desc = f"{col}_desc"
-    if cur == asc:
-        return desc
-    if cur == desc:
-        return WORTH_SORT_NONE
-    return asc
+        return normalize_worth_sort(current)
+    tokens = parse_worth_sorts(current)
+    cur_dir = ""
+    rest: list[str] = []
+    for token in tokens:
+        if token.startswith(col + "_"):
+            cur_dir = "asc" if token.endswith("_asc") else "desc"
+        else:
+            rest.append(token)
+    if cur_dir == "":
+        next_token = f"{col}_asc"
+    elif cur_dir == "asc":
+        next_token = f"{col}_desc"
+    else:
+        next_token = ""
+    if next_token:
+        # Última coluna clicada vira a prioridade principal do ORDER BY.
+        return encode_worth_sorts([next_token, *rest])
+    return encode_worth_sorts(rest)
 
 
-def worth_order_sql(sort: str | None) -> str:
-    kind = normalize_worth_sort(sort)
+def _worth_sort_clause(kind: str) -> str:
     if kind == WORTH_SORT_SEEN_DESC:
-        return "jobs.first_seen_at DESC, jobs.id DESC"
+        return "jobs.first_seen_at DESC"
     if kind == WORTH_SORT_SEEN_ASC:
-        return "jobs.first_seen_at ASC, jobs.id DESC"
+        return "jobs.first_seen_at ASC"
     if kind == WORTH_SORT_MATCH_ASC:
-        return "COALESCE(match_score, 0) ASC, jobs.id DESC"
+        return "COALESCE(match_score, 0) ASC"
     if kind == WORTH_SORT_MATCH_DESC:
-        return "COALESCE(match_score, 0) DESC, jobs.id DESC"
+        return "COALESCE(match_score, 0) DESC"
     if kind == WORTH_SORT_POSTED_ASC:
         return (
             "(CASE WHEN IFNULL(jobs.posted_at,'')='' THEN 1 ELSE 0 END) ASC, "
-            "jobs.posted_at ASC, jobs.id DESC"
+            "jobs.posted_at ASC"
         )
     if kind == WORTH_SORT_POSTED_DESC:
         return (
             "(CASE WHEN IFNULL(jobs.posted_at,'')='' THEN 1 ELSE 0 END) ASC, "
-            "jobs.posted_at DESC, jobs.id DESC"
+            "jobs.posted_at DESC"
         )
-    return "jobs.id DESC"
+    return ""
+
+
+def worth_order_sql(sort: str | None) -> str:
+    clauses = [_worth_sort_clause(t) for t in parse_worth_sorts(sort)]
+    clauses = [c for c in clauses if c]
+    if not clauses:
+        return "jobs.id DESC"
+    return ", ".join(clauses) + ", jobs.id DESC"
 
 
 def _worth_sort_indicator(sort: str, column: str) -> str:
-    kind = normalize_worth_sort(sort)
-    if kind == f"{column}_asc":
-        return " ↑"
-    if kind == f"{column}_desc":
-        return " ↓"
+    for token in parse_worth_sorts(sort):
+        if token == f"{column}_asc":
+            return " ↑"
+        if token == f"{column}_desc":
+            return " ↓"
     return ""
 
 
@@ -3354,12 +3397,22 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
     if (toEl) worthDateTo = toEl.value || "";
   }}
   function cycleWorthSort(col) {{
-    var asc = col + "_asc";
-    var desc = col + "_desc";
-    var cur = worthSort || "";
-    if (cur === asc) worthSort = desc;
-    else if (cur === desc) worthSort = "";
-    else worthSort = asc;
+    var parts = String(worthSort || "")
+      .split(",")
+      .map(function (s) {{ return s.trim(); }})
+      .filter(Boolean);
+    var curDir = "";
+    var rest = [];
+    parts.forEach(function (p) {{
+      if (p === col + "_asc") curDir = "asc";
+      else if (p === col + "_desc") curDir = "desc";
+      else rest.push(p);
+    }});
+    var next = "";
+    if (curDir === "") next = col + "_asc";
+    else if (curDir === "asc") next = col + "_desc";
+    if (next) rest.unshift(next);
+    worthSort = rest.join(",");
   }}
   function applyWorthFilters() {{
     readWorthFilterInputs();
