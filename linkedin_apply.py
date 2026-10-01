@@ -472,7 +472,7 @@ def _handle_external_ats(
             except Exception:
                 continue
 
-    salary = _salary_from_rules(rules, cfg, job_context_text(job))
+    salary = _salary_from_rules(rules, cfg, job_context_text((ai or {}).get("job")))
     outcome, detail = run_ats_flow(
         page,
         context,
