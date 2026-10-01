@@ -13,7 +13,10 @@ DEFAULT_RULES: list[dict[str, Any]] = [
     {"key": "email", "aliases": "email,e-mail,mail,correo", "mode": "text", "value_from": "candidate_email", "value": "", "sort_order": 20},
     {"key": "phone", "aliases": "phone,telephone,tel,telefone,celular,mobile,whatsapp", "mode": "text", "value_from": "candidate_phone", "value": "", "sort_order": 30},
     {"key": "linkedin", "aliases": "linkedin,linkedin url,profile url", "mode": "text", "value_from": "candidate_linkedin", "value": "", "sort_order": 40},
-    {"key": "city", "aliases": "city,cidade,location,localidade,endereço,address", "mode": "text", "value_from": "candidate_city", "value": "", "sort_order": 50},
+    {"key": "city", "aliases": "city,cidade,cidade atual,current city,localidade", "mode": "text", "value_from": "candidate_city", "value": "", "sort_order": 50},
+    {"key": "state", "aliases": "state,estado,province,provincia,província,uf,region,estado/provincia", "mode": "text", "value_from": "candidate_state", "value": "", "sort_order": 51},
+    {"key": "country", "aliases": "country of origin,país de origem,pais de origem,country,país,pais,nationality country,select a country", "mode": "select", "value_from": "candidate_country", "value": "", "sort_order": 52},
+    {"key": "current_company", "aliases": "current company,empresa atual,current employer,most recent employer,employer name,nome da empresa,company you work,where do you currently work,currently work", "mode": "text", "value_from": "candidate_current_company", "value": "", "sort_order": 53},
     {"key": "cpf", "aliases": "cpf,cadastro de pessoa física,documento,tax id,tax identification,id number,cpf number,número do documento", "mode": "text", "value_from": "candidate_cpf", "value": "", "sort_order": 55},
     {"key": "salary", "aliases": "salary,compensation,expected salary,salary expectation,faixa salarial,pretensão,pretensão salarial,remuneração,pay,salario,expectativa salarial", "mode": "salary", "value_from": "", "value": "", "sort_order": 60},
     {"key": "contract_type", "aliases": "contract type,type of contract,employment type,tipo de contratacao,contratacao,modelo de contratacao,regime", "mode": "select", "value_from": "candidate_contract_type", "value": "", "sort_order": 65},
@@ -26,6 +29,83 @@ def normalize(text: str) -> str:
     folded = unicodedata.normalize("NFKD", text or "")
     folded = "".join(ch for ch in folded if not unicodedata.combining(ch))
     return re.sub(r"[^a-z0-9]+", " ", folded.casefold()).strip()
+
+
+_EMPLOYER_SPLIT_RE = re.compile(r"\s+[—–]\s+")
+_BR_HINT_RE = re.compile(
+    r"\bbrazil\b|\bbrasil\b|\bbelo horizonte\b|\bsao paulo\b|\bsão paulo\b|"
+    r"\brio de janeiro\b|\bcuritiba\b|\bbrasilia\b|\brasília\b|\brecife\b|\bporto alegre\b",
+    re.I,
+)
+
+
+def extract_current_employer(resume_json: str | dict | None) -> str:
+    """Primeiro empregador do currículo (objeto, string normalizada ou chave dedicada)."""
+    data: dict | None = None
+    if isinstance(resume_json, dict):
+        data = resume_json
+    elif isinstance(resume_json, str) and resume_json.strip():
+        try:
+            parsed = json.loads(resume_json)
+            if isinstance(parsed, dict):
+                data = parsed
+        except (json.JSONDecodeError, ValueError, TypeError):
+            data = None
+    if not data:
+        return ""
+    dedicated = str(
+        data.get("current_employer")
+        or data.get("current_company")
+        or data.get("employer")
+        or ""
+    ).strip()
+    if dedicated:
+        return dedicated
+    experience = data.get("experience")
+    if not isinstance(experience, list) or not experience:
+        return ""
+    first = experience[0]
+    if isinstance(first, dict):
+        return str(first.get("employer") or "").strip()
+    text = str(first or "").strip()
+    if not text:
+        return ""
+    parts = _EMPLOYER_SPLIT_RE.split(text, maxsplit=2)
+    if len(parts) >= 2:
+        employer = parts[1].split(":", 1)[0].strip()
+        return employer
+    return ""
+
+
+def infer_candidate_country(
+    cfg: dict[str, str] | None = None,
+    resume_json: str | dict | None = None,
+) -> str:
+    """País do candidato: setting do painel, senão heurística BR a partir de cidade/CV."""
+    cfg = cfg or {}
+    explicit = str(cfg.get("candidate_country") or "").strip()
+    if explicit:
+        return explicit
+    hay_bits = [
+        str(cfg.get("candidate_city") or ""),
+    ]
+    data: dict | None = None
+    if isinstance(resume_json, dict):
+        data = resume_json
+    elif isinstance(resume_json, str) and resume_json.strip():
+        try:
+            parsed = json.loads(resume_json)
+            if isinstance(parsed, dict):
+                data = parsed
+        except (json.JSONDecodeError, ValueError, TypeError):
+            data = None
+    if data:
+        hay_bits.append(str(data.get("location_notes") or ""))
+        hay_bits.append(str(data.get("work_authorization_notes") or ""))
+    hay = " ".join(hay_bits)
+    if _BR_HINT_RE.search(hay):
+        return "Brazil"
+    return ""
 
 
 def ensure_default_rules(db: sqlite3.Connection) -> None:
@@ -79,7 +159,16 @@ def save_rules_from_form(db: sqlite3.Connection, form: dict[str, str]) -> None:
         order += 10
 
 
-def resolve_rule_value(rule: sqlite3.Row | dict, cfg: dict[str, str], *, cover_letter: str = "", resume_path: str = "", field_hint: str = "", job_text: str = "") -> str | None:
+def resolve_rule_value(
+    rule: sqlite3.Row | dict,
+    cfg: dict[str, str],
+    *,
+    cover_letter: str = "",
+    resume_path: str = "",
+    field_hint: str = "",
+    job_text: str = "",
+    resume_json: str | dict | None = None,
+) -> str | None:
     """Valor a aplicar. `field_hint` = label+placeholder+name do campo na página;
     `job_text` = texto da vaga/página. O modo `salary` usa `field_hint` para a
     moeda e `job_text` para detectar CLT×PJ (detecção vence a preferência do painel)."""
@@ -99,8 +188,26 @@ def resolve_rule_value(rule: sqlite3.Row | dict, cfg: dict[str, str], *, cover_l
             value = str(rule["value"] or "")
         return value
     value_from = str(rule["value_from"] or "").strip()
+    key = str(rule.get("key") or "").casefold()
     if value_from:
-        return cfg.get(value_from, "") or str(rule["value"] or "")
+        got = (cfg.get(value_from, "") or "").strip()
+        if got:
+            return got
+    if key == "current_company":
+        employer = extract_current_employer(resume_json)
+        if employer:
+            return employer
+        return str(rule["value"] or "")
+    if key == "country":
+        country = infer_candidate_country(cfg, resume_json)
+        if country:
+            return country
+        # Sem evidência: vazio (IA/humano perguntam) — não inventar Brazil.
+        return ""
+    if key == "state":
+        return (cfg.get("candidate_state") or "").strip() or str(rule["value"] or "")
+    if value_from:
+        return str(rule["value"] or "")
     return str(rule["value"] or "")
 
 

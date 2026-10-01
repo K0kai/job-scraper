@@ -61,6 +61,8 @@ class CopilotResumeExcerptTests(unittest.TestCase):
         self.assertIn("UFMG", excerpt)
         self.assertIn("Belo Horizonte", excerpt)
         self.assertIn("Brazilian citizen", excerpt)
+        self.assertIn("Current employer", excerpt)
+        self.assertIn("Co0", excerpt)
         self.assertLessEqual(len(excerpt), 2000)
 
     def test_fallback_to_summary_when_json_invalid(self) -> None:
@@ -98,7 +100,7 @@ class BuildCopilotPromptTests(unittest.TestCase):
         self.assertIn("=== RESUME EXCERPT (prioritized) ===", prompt)
         self.assertIn("Unicamp", prompt)
         self.assertIn("Campinas / remote BR", prompt)
-        self.assertIn("PANEL PROFILE for city/salary", prompt)
+        self.assertIn("PANEL PROFILE for city/country/state/salary", prompt)
 
 
 class RateLimitRetryTests(unittest.TestCase):
@@ -202,6 +204,24 @@ class CopilotFrugalityTests(unittest.TestCase):
         self.assertEqual(steps[0]["action"], "type")
         self.assertEqual(steps[-1]["action"], "select")
 
+    def test_batch_hoists_ask(self) -> None:
+        from ats_copilot import expand_action_steps
+
+        act = {
+            "action": "batch",
+            "args": {
+                "steps": [
+                    {"action": "type", "args": {"field": 0, "text": "x"}},
+                    {"action": "ask", "args": {"question": "Qual seu estado/UF?"}},
+                ]
+            },
+            "reason": "missing state",
+        }
+        steps = expand_action_steps(act)
+        self.assertEqual(len(steps), 1)
+        self.assertEqual(steps[0]["action"], "ask")
+        self.assertIn("estado", steps[0]["args"]["question"])
+
     def test_stagnation_and_no_progress(self) -> None:
         from ats_copilot import is_no_progress_outcome, should_abort_for_stagnation
 
@@ -216,6 +236,8 @@ class CopilotFrugalityTests(unittest.TestCase):
 
         self.assertIn("batch", ACTION_VOCAB)
         self.assertIn("Be frugal", ACTION_VOCAB)
+        self.assertIn("MUST `ask`", ACTION_VOCAB)
+        self.assertIn("country/state", ACTION_VOCAB)
         self.assertLessEqual(MAX_TURNS, 10)
         self.assertGreaterEqual(MAX_TURNS, 8)
 

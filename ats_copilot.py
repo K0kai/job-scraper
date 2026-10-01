@@ -105,7 +105,8 @@ Max 5 steps per batch. Available actions (args in parentheses):
 Rules:
 - Be frugal: prefer ONE batch that fills/clicks everything obvious, then click
   Next/Continue/Review (never Submit) OR emit `done` so the bot resumes.
-  If data is missing, `ask` immediately — do not probe with wait/scroll/mouse.
+  If data is missing, `ask` immediately as a STANDALONE action (never bury `ask`
+  inside a batch) — do not probe with wait/scroll/mouse.
   If you cannot unblock, `abort` quickly (do not burn turns guessing).
 - After filling required fields, prefer clicking Next/Continue/Review yourself
   in the same batch, or `done` — do not keep typing the same fields.
@@ -115,12 +116,20 @@ Rules:
 - Resume/CV upload: if RESUME FILE path is listed below, use `upload` on the file
   input. NEVER ask the human for a resume/CV — it is already on disk from the panel.
 - Fill what you can from CANDIDATE FACTS + PANEL PROFILE + RESUME EXCERPT. Prefer
-  PANEL PROFILE for city/salary/contact; prefer RESUME EXCERPT for education /
-  location_notes / work_authorization. For salary fields: panel salary_brl/usd are
-  MONTHLY; convert FX and match the field period (year/month/hour). Aim a bit below
-  local market for that country (~10–20%) because remote-from-abroad hiring is
-  cost-sensitive, but NEVER below the Brazil floor (converted). Prefer panel USD
-  remote anchor when present. Do not put N/A if a base salary exists.
+  PANEL PROFILE for city/country/state/salary/contact; prefer RESUME EXCERPT for
+  education / location_notes / work_authorization / current employer.
+  Country / State / Province / País / Estado / UF: use PANEL PROFILE
+  `country`/`state` (or an explicit line in FACTS/EXCERPT). If those are missing,
+  you MUST `ask` — do NOT invent Brazil, a Brazilian state, or the job-posting
+  country. City alone is NOT enough to fill country/state unless the text
+  explicitly names them.
+  Current company / employer: use RESUME EXCERPT "Current employer" or PANEL
+  PROFILE; do NOT use JOB.company (that is the hiring company).
+  For salary fields: panel salary_brl/usd are MONTHLY; convert FX and match the
+  field period (year/month/hour). Aim a bit below local market for that country
+  (~10–20%) because remote-from-abroad hiring is cost-sensitive, but NEVER below
+  the Brazil floor (converted). Prefer panel USD remote anchor when present.
+  Do not put N/A if a base salary exists.
   If a required field is still missing, prefer `ask` (human answers in the web
   panel; Chrome stays open) over `abort`. Only `abort` when the human
   cancelled/timed out, or for legal consent you must not sign. Never invent.
@@ -137,6 +146,9 @@ _PANEL_PROFILE_FIELDS: tuple[tuple[str, str], ...] = (
     ("candidate_phone", "phone"),
     ("candidate_linkedin", "linkedin"),
     ("candidate_city", "city"),
+    ("candidate_state", "state"),
+    ("candidate_country", "country"),
+    ("candidate_current_company", "current_company"),
     ("candidate_cpf", "cpf"),
     ("salary_expectation_brl", "salary_brl"),
     ("salary_expectation_usd", "salary_usd"),
@@ -199,7 +211,7 @@ def copilot_resume_excerpt(
     *,
     budget: int = 2000,
 ) -> str:
-    """Extrato priorizado: location/auth/education antes de skills/experiência."""
+    """Extrato priorizado: location/auth/employer/education antes de skills."""
     budget = max(200, int(budget))
     data = None
     raw = (resume_json or "").strip()
@@ -229,6 +241,11 @@ def copilot_resume_excerpt(
 
     _add("Location notes", data.get("location_notes"))
     _add("Work authorization", data.get("work_authorization_notes"))
+    from form_rules import extract_current_employer
+
+    employer = extract_current_employer(data)
+    if employer:
+        parts.append(f"Current employer:\n{_clip(employer, 120)}")
     _add("Education", data.get("education"), item_limit=8)
     headline = str(data.get("headline") or "").strip()
     seniority = str(data.get("seniority") or "").strip()
@@ -310,12 +327,20 @@ def expand_action_steps(act: dict) -> list[dict]:
         steps_raw = args.get("steps") if isinstance(args, dict) else None
         if not isinstance(steps_raw, list):
             return []
+        # ask/abort/done dentro de batch: promove o primeiro (antes eram descartados).
+        for step in steps_raw:
+            if not isinstance(step, dict):
+                continue
+            name = str(step.get("action") or "").strip().lower()
+            if name in {"ask", "abort", "done"}:
+                step_args = step.get("args") if isinstance(step.get("args"), dict) else {}
+                return [{"action": name, "args": step_args, "reason": why or str(step.get("reason") or "")}]
         out: list[dict] = []
         for step in steps_raw[:MAX_STEPS_PER_TURN]:
             if not isinstance(step, dict):
                 continue
             name = str(step.get("action") or "").strip().lower()
-            if not name or name in {"batch", "done", "abort", "ask"}:
+            if not name or name in {"batch"}:
                 continue
             step_args = step.get("args") if isinstance(step.get("args"), dict) else {}
             out.append({"action": name, "args": step_args, "reason": why})
@@ -912,6 +937,20 @@ def copilot_takeover(page, context, *, reason: str, cfg: dict, ai: dict,
         if not isinstance(args, dict):
             args = {}
         why = str(act.get("reason") or "")[:160]
+
+        # Batch com ask/abort/done: promove (antes o expand descartava ask).
+        if action == "batch":
+            steps_raw = args.get("steps") if isinstance(args.get("steps"), list) else []
+            for step in steps_raw:
+                if not isinstance(step, dict):
+                    continue
+                name = str(step.get("action") or "").strip().lower()
+                if name in {"ask", "abort", "done"}:
+                    action = name
+                    step_args = step.get("args") if isinstance(step.get("args"), dict) else {}
+                    args = step_args
+                    why = str(step.get("reason") or why)[:160]
+                    break
 
         if action == "done":
             if allow_submit and "submit" in why.casefold():

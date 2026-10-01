@@ -28,7 +28,15 @@ from browser_engine import (
     scan_buttons,
     wait_for_matching_button,
 )
-from form_rules import find_rule_for_label, job_context_text, pick_select_option, prepare_text_value, resolve_rule_value
+from form_rules import (
+    extract_current_employer,
+    find_rule_for_label,
+    infer_candidate_country,
+    job_context_text,
+    pick_select_option,
+    prepare_text_value,
+    resolve_rule_value,
+)
 
 LOG = logging.getLogger("job-scraper")
 
@@ -61,15 +69,16 @@ NEXT_PATTERNS = [
 #: e já os marca com data-radar-field para locator estável contra re-render.
 _FIELDS_JS = """() => {
   const out = [];
-  const nodes = document.querySelectorAll('input, textarea, select');
-  nodes.forEach((el, index) => {
-    const type = (el.type || '').toLowerCase();
-    if (['hidden', 'submit', 'button', 'checkbox-hack'].includes(type)) return;
-    if (type === 'checkbox' || type === 'radio') return; // handled por handler
-    if (el.disabled) return;
+  let index = 0;
+  const push = (el, meta) => {
     const rect = el.getBoundingClientRect();
     const style = window.getComputedStyle(el);
-    if (!rect.width || !rect.height || style.visibility === 'hidden') return;
+    if (!rect.width || !rect.height || style.visibility === 'hidden' || style.display === 'none') return;
+    el.setAttribute('data-radar-field', String(index));
+    out.push(Object.assign({ index }, meta));
+    index += 1;
+  };
+  const labelFor = (el) => {
     const id = el.id || '';
     let label = '';
     if (id) {
@@ -82,20 +91,49 @@ _FIELDS_JS = """() => {
       const legend = el.closest('fieldset')?.querySelector('legend');
       if (legend) label = legend.innerText || '';
     }
-    if (!label) label = [el.name, el.placeholder, el.id].filter(Boolean).join(' ');
+    if (!label) {
+      const prev = el.previousElementSibling;
+      if (prev && /label|span|p|div/i.test(prev.tagName)) label = prev.innerText || '';
+    }
+    if (!label) label = [el.name, el.placeholder, el.id, el.getAttribute('aria-label')].filter(Boolean).join(' ');
+    return (label || '').slice(0, 400);
+  };
+  document.querySelectorAll('input, textarea, select').forEach((el) => {
+    const type = (el.type || '').toLowerCase();
+    if (['hidden', 'submit', 'button', 'checkbox-hack'].includes(type)) return;
+    if (type === 'checkbox' || type === 'radio') return;
+    if (el.disabled) return;
     const options = el.tagName === 'SELECT' ? Array.from(el.options).map((o) => o.text) : [];
-    el.setAttribute('data-radar-field', String(index));
-    out.push({
-      index,
-      key: id || el.name || String(index),
-      label: (label || '').slice(0, 400),
+    push(el, {
+      key: el.id || el.name || String(index),
+      label: labelFor(el),
       tag: el.tagName.toLowerCase(),
       type,
       name: el.name || '',
-      id,
+      id: el.id || '',
       placeholder: el.placeholder || '',
       options,
       required: !!el.required,
+      widget: el.tagName === 'SELECT' ? 'select' : 'input',
+    });
+  });
+  document.querySelectorAll(
+    '[aria-label="Dropdown select"], [role="combobox"], [class*="react-dropdown-select"]'
+  ).forEach((el) => {
+    if (el.closest('[data-radar-field]')) return;
+    if (el.querySelector('[data-radar-field]')) return;
+    const text = (el.innerText || el.getAttribute('aria-label') || '').trim();
+    push(el, {
+      key: el.id || el.getAttribute('aria-label') || String(index),
+      label: (text || labelFor(el) || 'dropdown').slice(0, 400),
+      tag: 'combobox',
+      type: 'combobox',
+      name: el.getAttribute('name') || '',
+      id: el.id || '',
+      placeholder: '',
+      options: [],
+      required: false,
+      widget: 'combobox',
     });
   });
   return out;
@@ -176,7 +214,9 @@ def safe_fill(page, selector: str, value: str) -> bool:
 
 
 def safe_select(page, selector: str, options: list[str], preferred: str) -> bool:
-    chosen = pick_select_option(options, preferred)
+    chosen = pick_select_option(options, preferred) if options else None
+    if not chosen:
+        chosen = (preferred or "").strip() or None
     if not chosen:
         return False
     try:
@@ -184,6 +224,38 @@ def safe_select(page, selector: str, options: list[str], preferred: str) -> bool
         _pause(0.1, 0.3)
         return True
     except Exception:
+        pass
+    # Combobox / react-select: type-to-filter + option click.
+    return safe_combo_select(page, selector, chosen)
+
+
+def safe_combo_select(page, selector: str, preferred: str) -> bool:
+    """Abre dropdown custom (React/ARIA), digita filtro e escolhe a opção."""
+    query = (preferred or "").strip()
+    if not query:
+        return False
+    try:
+        loc = page.locator(selector).first
+        loc.scroll_into_view_if_needed(timeout=3000)
+        loc.click(timeout=5000, force=True)
+        _pause(0.2, 0.45)
+        page.keyboard.type(query, delay=random.randint(20, 45))
+        _pause(0.45, 0.9)
+        opt_re = re.compile(re.escape(query.split("(")[0].strip()) or query, re.I)
+        opt = page.locator(
+            "[role='option'], "
+            ".react-dropdown-select-dropdown button, "
+            ".react-dropdown-select-dropdown [role='option'], "
+            "[role='listbox'] [role='option']"
+        ).filter(has_text=opt_re)
+        if opt.count():
+            opt.first.click(timeout=5000, force=True)
+        else:
+            page.keyboard.press("Enter")
+        _pause(0.35, 0.7)
+        return True
+    except Exception as exc:
+        LOG.debug("safe_combo_select(%s) falhou: %s", selector, exc)
         return False
 
 
@@ -211,10 +283,14 @@ def _apply_field(page, field: dict, rule: dict | None, ctx: ApplyContext) -> tup
     field_hint = " ".join(
         str(field.get(k) or "") for k in ("label", "placeholder", "name", "id")
     )
+    resume_json = None
+    if isinstance(ctx.ai, dict):
+        resume_json = ctx.ai.get("resume_json")
     value = resolve_rule_value(
         rule, ctx.cfg, cover_letter=ctx.cover_letter, resume_path=ctx.resume_path,
         field_hint=field_hint,
         job_text=job_context_text((ctx.ai or {}).get("job")),
+        resume_json=resume_json,
     )
     if value is None:
         return None
@@ -233,6 +309,11 @@ def _apply_field(page, field: dict, rule: dict | None, ctx: ApplyContext) -> tup
             LOG.debug("upload falhou (%s): %s", sel, exc)
             return (key, False)
     value = prepare_text_value(rule, str(value), field_hint)
+    is_combo = (
+        str(field.get("widget") or "").casefold() == "combobox"
+        or str(field.get("tag") or "").casefold() == "combobox"
+        or str(field.get("type") or "").casefold() == "combobox"
+    )
     if mode == "salary":
         from salary_review import finalize_salary_value
 
@@ -246,7 +327,7 @@ def _apply_field(page, field: dict, rule: dict | None, ctx: ApplyContext) -> tup
         ) or str(value)
         # input de texto: digita no formato da moeda inferida. select nativo
         # (faixas): tenta casar; sem opcao compativel → humano decide.
-        if field.get("tag") == "select":
+        if field.get("tag") == "select" or is_combo:
             preferred = str(rule.get("value") or "").strip() or str(value)
             if safe_select(page, sel, field.get("options") or [], preferred):
                 return (key, True)
@@ -256,12 +337,18 @@ def _apply_field(page, field: dict, rule: dict | None, ctx: ApplyContext) -> tup
         if safe_fill(page, sel, str(value)):
             return (key, True)
         return (key, False)
-    if field.get("tag") == "select" or mode == "select":
-        preferred = str(value)
-        if mode == "select" and rule.get("value"):
-            preferred = str(rule["value"])
+    if field.get("tag") == "select" or mode == "select" or is_combo:
+        preferred = str(value).strip()
+        # rule.value só como fallback se o valor resolvido veio vazio
+        if not preferred and mode == "select" and rule.get("value"):
+            preferred = str(rule["value"]).strip()
+        if not preferred:
+            return (key, False)
         if safe_select(page, sel, field.get("options") or [], preferred):
             return (key, True)
+        if preferred != str(value).strip() and str(value).strip():
+            if safe_select(page, sel, field.get("options") or [], str(value)):
+                return (key, True)
         return (key, False)
     if safe_fill(page, sel, str(value)):
         return (key, True)
