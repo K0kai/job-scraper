@@ -71,6 +71,16 @@ class WorthTableHtmlTests(unittest.TestCase):
                 ),
             )
 
+    def test_live_js_keeps_match_and_date_filters_together(self) -> None:
+        """Presets leem datas; refresh não deixa resposta velha apagar filtros."""
+        import inspect
+
+        src = inspect.getsource(self.app.render_page)
+        self.assertIn("pendingWorthRefresh", src)
+        self.assertIn("liveReqGen", src)
+        handler = src[src.find('closest(".worth-match-preset")') :]
+        self.assertIn("readWorthFilterInputs()", handler[:800])
+
     def test_table_layout_single_toolbar_no_select(self) -> None:
         html = self.app.worth_html(page=1, page_size=10, sort="")
         self.assertIn("<table", html)

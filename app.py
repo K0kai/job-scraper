@@ -3443,6 +3443,8 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
   var worthDateFrom = "";
   var worthDateTo = "";
   var worthForceUpdate = false;
+  var liveReqGen = 0;
+  var pendingWorthRefresh = false;
   try {{
     var savedPage = parseInt(localStorage.getItem("radar-worth-page"), 10);
     if (savedPage > 0) worthPage = savedPage;
@@ -3540,6 +3542,12 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
     worthForceUpdate = true;
     var worthEl = document.getElementById("worth-body");
     if (worthEl) worthEl.removeAttribute("data-hash");
+    if (inFlight) {{
+      pendingWorthRefresh = true;
+      // Invalida a resposta em voo p/ não reaplicar HTML/filtros velhos.
+      liveReqGen += 1;
+      return;
+    }}
     refresh();
   }}
   function setWorthIgnoreConfirm(open) {{
@@ -3599,6 +3607,8 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
     worthBody.addEventListener("click", function (ev) {{
       var preset = ev.target.closest(".worth-match-preset");
       if (preset && worthBody.contains(preset)) {{
+        // Lê datas (e match digitado) antes — preset não pode apagar o intervalo.
+        readWorthFilterInputs();
         worthMinMatch = parseInt(preset.getAttribute("data-worth-min-match"), 10) || 0;
         var minInput = document.getElementById("worth-min-match");
         if (minInput) minInput.value = String(worthMinMatch);
@@ -3670,6 +3680,8 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
   function refresh() {{
     if (inFlight || document.hidden) return;
     inFlight = true;
+    pendingWorthRefresh = false;
+    var reqGen = ++liveReqGen;
     fetch(
       "/live?worth_page=" + encodeURIComponent(worthPage)
         + "&worth_min_match=" + encodeURIComponent(worthMinMatch)
@@ -3695,22 +3707,22 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
           nextRunAtIso = data.next_run_at || null;
           updateNextRunTimer();
         }}
-        if (data.worth_page) {{
-          worthPage = data.worth_page;
+        // Cliente é a fonte da verdade p/ match+data+sort. Resposta velha do /live
+        // não pode sobrescrever um filtro que o usuário acabou de mudar.
+        var worthFresh = reqGen === liveReqGen;
+        if (worthFresh) {{
+          if (data.worth_page) worthPage = data.worth_page;
+          if (typeof data.worth_sort !== "undefined") worthSort = data.worth_sort || "";
+          persistWorthState();
         }}
-        if (typeof data.worth_min_match !== "undefined") {{
-          worthMinMatch = data.worth_min_match;
-        }}
-        if (typeof data.worth_sort !== "undefined") worthSort = data.worth_sort || "";
-        if (typeof data.worth_date_from !== "undefined") worthDateFrom = data.worth_date_from || "";
-        if (typeof data.worth_date_to !== "undefined") worthDateTo = data.worth_date_to || "";
-        persistWorthState();
         applyRegion(statsEl, data.stats_html, data.stats_hash, {{ key: "stats" }});
         applyRegion(jobsEl, data.jobs_html, data.jobs_hash, {{ key: "jobs", skipIfBusy: true, wrapScroll: ".table-wrap" }});
         applyRegion(historyEl, data.history_html, data.history_hash, {{ key: "history" }});
         applyRegion(queueEl, data.queue_html, data.queue_hash, {{ key: "queue", skipIfBusy: true }});
-        applyRegion(worthEl, data.worth_html, data.worth_hash, {{ key: "worth", skipIfBusy: !worthForceUpdate }});
-        worthForceUpdate = false;
+        if (worthFresh) {{
+          applyRegion(worthEl, data.worth_html, data.worth_hash, {{ key: "worth", skipIfBusy: !worthForceUpdate }});
+          worthForceUpdate = false;
+        }}
         applyRegion(
           document.getElementById("usage-body"),
           data.usage_html,
@@ -3749,7 +3761,15 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
         }}
       }})
       .catch(function () {{}})
-      .then(function () {{ inFlight = false; worthForceUpdate = false; }});
+      .then(function () {{
+        inFlight = false;
+        if (pendingWorthRefresh) {{
+          worthForceUpdate = true;
+          refresh();
+        }} else {{
+          worthForceUpdate = false;
+        }}
+      }});
   }}
   var noticeTimer = null;
   var PROCESS_PATHS = {{
