@@ -913,7 +913,7 @@ def apply_via_linkedin(
     context = None
     try:
         with sync_playwright() as playwright:
-            from browser_engine import persistent_launch_kwargs
+            from browser_engine import BACKGROUND_RUN_ARGS, persistent_launch_kwargs
 
             launch_kwargs = persistent_launch_kwargs(
                 profile,
@@ -921,6 +921,8 @@ def apply_via_linkedin(
                 slow_mo=random.randint(40, 90),
                 viewport={"width": 1280, "height": 900},
                 locale="en-US",
+                # Mesmo da reverificação: SPA não trava com a janela atrás de outras.
+                args=list(BACKGROUND_RUN_ARGS),
             )
             try:
                 context = playwright.chromium.launch_persistent_context(channel="chrome", **launch_kwargs)

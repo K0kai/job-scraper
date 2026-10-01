@@ -77,6 +77,16 @@ class PersistentLaunchKwargsTests(unittest.TestCase):
         for arg in browser_engine.BACKGROUND_RUN_ARGS:
             self.assertIn(arg, kw["args"])
 
+    def test_easy_apply_launch_includes_background_args(self):
+        """Easy Apply deve usar os mesmos args anti-throttle da reverificação."""
+        import inspect
+
+        import linkedin_apply
+
+        src = inspect.getsource(linkedin_apply.apply_via_linkedin)
+        self.assertIn("BACKGROUND_RUN_ARGS", src)
+        self.assertIn("args=list(BACKGROUND_RUN_ARGS)", src.replace(" ", ""))
+
 
 FAKE_BUTTONS = [
     {"index": 0, "text": "Sign in", "aria": "", "visible": True, "tag": "button"},
