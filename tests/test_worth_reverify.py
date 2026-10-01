@@ -95,9 +95,10 @@ class BrowserWaitTests(unittest.TestCase):
             def wait_for_timeout(self, ms):
                 return None
 
-        verdict, _detail = worth_reverify.wait_page_liveness_signal(
-            FakePage(), timeout_ms=2_000, poll_ms=1
-        )
+        with mock.patch.object(worth_reverify, "ACTIVE_CONFIRM_GRACE_MS", 30):
+            verdict, _detail = worth_reverify.wait_page_liveness_signal(
+                FakePage(), timeout_ms=2_000, poll_ms=1
+            )
         self.assertEqual(verdict, "active")
 
     def test_wait_prefers_late_closed_banner_over_early_easy_apply(self) -> None:
@@ -124,6 +125,22 @@ class BrowserWaitTests(unittest.TestCase):
             FakePage(), timeout_ms=5_000, poll_ms=1
         )
         self.assertEqual(verdict, "inactive")
+
+    def test_wait_confirms_active_after_grace(self) -> None:
+        class FakePage:
+            url = "https://www.linkedin.com/jobs/view/4"
+
+            def content(self):
+                return '<button>Easy Apply</button>'
+
+            def wait_for_timeout(self, ms):
+                return None
+
+        with mock.patch.object(worth_reverify, "ACTIVE_CONFIRM_GRACE_MS", 30):
+            verdict, _detail = worth_reverify.wait_page_liveness_signal(
+                FakePage(), timeout_ms=2_000, poll_ms=1
+            )
+        self.assertEqual(verdict, "active")
 
     def test_wait_returns_unknown_on_linkedin_load_error(self) -> None:
         class FakePage:

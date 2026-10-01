@@ -60,6 +60,9 @@ LOAD_ERROR_RE = re.compile(
 USER_AGENT = "JobScraperLocal/0.1 (personal job search; liveness check)"
 DEFAULT_PAGE_WAIT_MS = 25_000
 DEFAULT_POLL_MS = 500
+# Após o 1º sinal de "ativa", espera mais este tempo por um banner de fechamento
+# que o SPA LinkedIn costuma hidratar depois do Easy Apply de similares.
+ACTIVE_CONFIRM_GRACE_MS = 5_000
 
 
 def needs_browser_check(url: str) -> bool:
@@ -173,6 +176,8 @@ def wait_page_liveness_signal(
     deadline = time.monotonic() + max(0.05, timeout_ms / 1000.0)
     last_detail = "sem leitura"
     saw_active = False
+    active_since: float | None = None
+    grace_s = max(0.0, ACTIVE_CONFIRM_GRACE_MS / 1000.0)
     while True:
         if should_abort and should_abort():
             return UNKNOWN, "abortado"
@@ -189,14 +194,19 @@ def wait_page_liveness_signal(
         if page_has_load_error(body):
             return UNKNOWN, "não foi possível carregar a página"
         verdict = classify_http(200, body)
+        now = time.monotonic()
         if verdict == INACTIVE:
             return INACTIVE, "browser: vaga fechada"
         if verdict == ACTIVE:
             saw_active = True
+            if active_since is None:
+                active_since = now
             last_detail = "sinal de candidatura (aguardando possível fechamento)"
+            if grace_s <= 0 or now >= active_since + grace_s:
+                return ACTIVE, "browser: candidatura disponível"
         else:
             last_detail = "HTML ainda sem sinal claro"
-        if time.monotonic() >= deadline:
+        if now >= deadline:
             if saw_active:
                 return ACTIVE, "browser: candidatura disponível"
             return UNKNOWN, f"timeout esperando sinal ({last_detail})"
