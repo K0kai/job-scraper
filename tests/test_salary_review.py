@@ -50,6 +50,24 @@ class ReviewSalaryValueTests(unittest.TestCase):
         self.assertEqual(value, "$ 54,000")
         self.assertEqual(meta["action"], "adjust")
 
+    def test_skip_review_when_period_known_usd(self) -> None:
+        from salary_review import needs_salary_ai_review
+
+        self.assertFalse(
+            needs_salary_ai_review({"period": "year", "currency": "USD"}, options=None)
+        )
+        self.assertTrue(
+            needs_salary_ai_review({"period": "unknown", "currency": "USD"}, options=None)
+        )
+        self.assertTrue(
+            needs_salary_ai_review(
+                {"period": "year", "currency": "USD"}, options=["40k", "50k"]
+            )
+        )
+        self.assertTrue(
+            needs_salary_ai_review({"period": "month", "currency": "COP"}, options=None)
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

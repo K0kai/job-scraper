@@ -173,6 +173,24 @@ def review_salary_value(
     return value, meta
 
 
+def needs_salary_ai_review(
+    proposal: dict,
+    *,
+    options: list[str] | None = None,
+) -> bool:
+    """Só chama IA quando período é ambíguo, há faixas select, ou moeda 'de mercado'."""
+    period = str(proposal.get("period") or "unknown").casefold()
+    currency = str(proposal.get("currency") or "").upper()
+    if options:
+        return True
+    if period == "unknown":
+        return True
+    # BRL/USD com período claro: FX+normalização bastam (economiza 1 chamada)
+    if currency in {"BRL", "USD"}:
+        return False
+    return True
+
+
 def finalize_salary_value(
     cfg: dict[str, str],
     *,
@@ -182,11 +200,13 @@ def finalize_salary_value(
     ai: dict[str, Any] | None = None,
     fallback: str = "",
 ) -> str:
-    """Proposta do bot + review (se IA disponível)."""
+    """Proposta do bot + review só quando necessário."""
     from salary_policy import propose_salary
 
     prop = propose_salary(cfg, field_hint=field_hint, job_text=job_text)
     proposed = str(prop.get("formatted") or fallback or "")
+    if not needs_salary_ai_review(prop, options=options):
+        return proposed.strip()
     final, _meta = review_salary_value(
         proposed_formatted=proposed,
         proposal=prop,
@@ -202,6 +222,7 @@ def finalize_salary_value(
 __all__ = [
     "build_salary_review_prompt",
     "finalize_salary_value",
+    "needs_salary_ai_review",
     "parse_salary_review",
     "review_salary_value",
 ]

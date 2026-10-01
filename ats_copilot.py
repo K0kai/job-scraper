@@ -38,10 +38,14 @@ SOLVED = "solved"      # IA destravou o fluxo; pode retomar o preenchimento/envi
 ABORTED = "aborted"    # IA desistiu (ou sem IA/esgotou turnos): fechar + nota amarela
 UNAVAILABLE = "unavailable"  # IA nao configurada: segue o comportamento antigo (humano)
 
-MAX_TURNS = 12  # cada turno = 1 chamada de IA + 1 acao; trava = bug, nao paciencia
-_TURN_PAUSE = (0.6, 1.6)
+MAX_TURNS = 8  # folga p/ free tier: estagnação corta antes do teto cheio
+_TURN_PAUSE = (0.4, 1.0)
 #: teto de espera acumulada em retries de rate-limit (429/quota) no mesmo takeover
 AI_RATE_LIMIT_BUDGET_SECONDS = 600
+#: turnos seguidos sem progresso → abort (em vez de gastar o teto inteiro)
+STAGNATION_LIMIT = 4
+#: ações por turno (1 chamada de IA → N passos)
+MAX_STEPS_PER_TURN = 4
 
 #: nunca clicados pelo copiloto - envio de candidatura fica com a politica do handler
 _SUBMIT_BLOCK_RE = re.compile(
@@ -52,11 +56,15 @@ _SUBMIT_BLOCK_RE = re.compile(
 # vocabulario de comandos oferecido a IA (tudo que o bot sabe executar)
 ACTION_VOCAB = """
 You are taking FULL control of a browser automation that got STUCK on a job
-application page. Decide the single next action. Reply with ONLY a JSON object:
+application page. Decide the next step(s). Reply with ONLY a JSON object:
 
   {"action": "<name>", "args": { ... }, "reason": "<short why>"}
 
-Available actions (args in parentheses):
+Or a short batch (preferred when several fills/clicks are obvious):
+
+  {"action":"batch","args":{"steps":[{"action":"...","args":{...}}, ...]}, "reason":"..."}
+
+Max 4 steps per batch. Available actions (args in parentheses):
   click    (field=<idx> | button=<idx> | selector="<css>" | x=<int> y=<int>)
   type     (field=<idx> | selector="<css>", text="<string>")
   select   (field=<idx> | selector="<css>", value="<option text>")   # native <select>
@@ -68,12 +76,14 @@ Available actions (args in parentheses):
   open     (url="<https://...>")                                     # open a new tab
   close    ()                                                        # close the active tab
   js       (code="<inline JS, no return stmt, use `document`>")
-  info     ()                                                        # ask for a fresh page snapshot
   done     ()                                                        # unblocked; hand back to caller
   ask      (question="<what data is missing>")                       # pause; human answers in the panel
   abort    (reason="<why it cannot be automated>")                   # give up -> yellow note
 
 Rules:
+- Be frugal: prefer ONE batch that fills/clicks everything obvious, then `done`.
+  If data is missing, `ask` immediately — do not probe with wait/scroll/mouse.
+  If you cannot unblock, `abort` quickly (do not burn turns guessing).
 - NEVER emit a click whose target text matches submit/apply/finalizar/enviar. The
   caller handles the real submission; you only unblock the flow.
 - Prefer `field`/`button` indices from the page snapshot; they are stable handles.
@@ -232,6 +242,59 @@ def extract_action(text: str) -> dict | None:
         obj.setdefault("args", {})
         return obj
     return None
+
+
+def expand_action_steps(act: dict) -> list[dict]:
+    """Normaliza action única ou batch → lista de passos (máx MAX_STEPS_PER_TURN)."""
+    if not act:
+        return []
+    action = str(act.get("action") or "").strip().lower()
+    args = act.get("args") if isinstance(act.get("args"), dict) else {}
+    why = str(act.get("reason") or "")
+    if action == "batch":
+        steps_raw = args.get("steps") if isinstance(args, dict) else None
+        if not isinstance(steps_raw, list):
+            return []
+        out: list[dict] = []
+        for step in steps_raw[:MAX_STEPS_PER_TURN]:
+            if not isinstance(step, dict):
+                continue
+            name = str(step.get("action") or "").strip().lower()
+            if not name or name in {"batch", "done", "abort", "ask"}:
+                continue
+            step_args = step.get("args") if isinstance(step.get("args"), dict) else {}
+            out.append({"action": name, "args": step_args, "reason": why})
+        return out
+    return [{"action": action, "args": args, "reason": why}]
+
+
+def action_signature(action: str, args: dict) -> str:
+    """Assinatura estável p/ detectar loops (mesma ação + args chave)."""
+    keys = sorted((args or {}).keys())
+    parts = [action]
+    for k in keys:
+        if k in {"text", "code", "question", "reason"}:
+            parts.append(f"{k}=…")
+        else:
+            parts.append(f"{k}={args.get(k)}")
+    return "|".join(parts)
+
+
+def is_no_progress_outcome(action: str, desc: str, *, refused_submit: bool = False) -> bool:
+    """True quando o turno não destravou o fluxo (não vale gastar mais retries cegos)."""
+    if refused_submit:
+        return True
+    act = (action or "").casefold()
+    if act in {"info", "wait", "mouse", "scroll"}:
+        return True
+    d = (desc or "").casefold()
+    if any(tok in d for tok in ("failed", "no target", "no click", "error:", "unknown action", "invalid")):
+        return True
+    return False
+
+
+def should_abort_for_stagnation(no_progress_streak: int, *, limit: int = STAGNATION_LIMIT) -> bool:
+    return no_progress_streak >= max(1, int(limit))
 
 
 def build_copilot_prompt(
@@ -516,6 +579,8 @@ def copilot_takeover(page, context, *, reason: str, cfg: dict, ai: dict,
     active = page
     open_ask_id: int | None = None
     connect_fn = ai.get("connect_fn")
+    no_progress_streak = 0
+    last_sig = ""
 
     from ai_client import call_ai_text
 
@@ -568,6 +633,12 @@ def copilot_takeover(page, context, *, reason: str, cfg: dict, ai: dict,
         act = extract_action(raw)
         if not act:
             history.append(f"turn {turn}: resposta irregular, pedindo JSON")
+            no_progress_streak += 1
+            if should_abort_for_stagnation(no_progress_streak):
+                _fail_open_ask()
+                return abort_close(
+                    active, context, "copiloto estagnou (respostas irregulares)"
+                )
             continue
 
         action = str(act["action"]).strip().lower()
@@ -585,6 +656,9 @@ def copilot_takeover(page, context, *, reason: str, cfg: dict, ai: dict,
             question = str(args.get("question") or why or "").strip()
             if not question:
                 history.append(f"turn {turn}: ask sem pergunta")
+                no_progress_streak += 1
+                if should_abort_for_stagnation(no_progress_streak):
+                    return abort_close(active, context, "copiloto estagnou (ask vazio)")
                 continue
             if not callable(connect_fn):
                 return abort_close(active, context, "ask sem connect_fn — " + question[:120])
@@ -624,19 +698,56 @@ def copilot_takeover(page, context, *, reason: str, cfg: dict, ai: dict,
             facts = load_facts(connect_fn, lang) or (facts + f"\n{question}: {answer}").strip()
             history.append(f"turn {turn}: ask -> answered ({_clip(answer, 80)})")
             open_ask_id = ask_id
-            continue
-        if action == "click" and target_is_submit(click_target_label(args, fields, buttons)):
-            history.append(f"turn {turn}: recusado clique em botao de envio ({why})")
+            no_progress_streak = 0
             continue
 
-        desc, new_page = exec_action(active, context, action, args, fields)
-        if new_page is not None:
-            active = new_page
-        history.append(
-            f"turn {turn}: {action}({json.dumps(args, ensure_ascii=False)[:120]}) -> {desc} | {why}"
-        )
-        LOG.info("copiloto: %s", history[-1])
-        time.sleep(random.uniform(*_TURN_PAUSE))
+        steps = expand_action_steps(act)
+        if not steps:
+            history.append(f"turn {turn}: batch vazio")
+            no_progress_streak += 1
+            if should_abort_for_stagnation(no_progress_streak):
+                return abort_close(active, context, "copiloto estagnou (batch vazio)")
+            continue
+
+        turn_progressed = False
+        for step in steps:
+            step_action = str(step.get("action") or "").strip().lower()
+            step_args = step.get("args") if isinstance(step.get("args"), dict) else {}
+            step_why = str(step.get("reason") or why)[:160]
+            if step_action == "click" and target_is_submit(
+                click_target_label(step_args, fields, buttons)
+            ):
+                history.append(
+                    f"turn {turn}: recusado clique em botao de envio ({step_why})"
+                )
+                no_progress_streak += 1
+                continue
+            sig = action_signature(step_action, step_args)
+            if sig and sig == last_sig:
+                history.append(f"turn {turn}: acao repetida ignorada ({sig})")
+                no_progress_streak += 1
+                continue
+            desc, new_page = exec_action(active, context, step_action, step_args, fields)
+            if new_page is not None:
+                active = new_page
+            history.append(
+                f"turn {turn}: {step_action}({json.dumps(step_args, ensure_ascii=False)[:120]}) "
+                f"-> {desc} | {step_why}"
+            )
+            LOG.info("copiloto: %s", history[-1])
+            if is_no_progress_outcome(step_action, desc):
+                no_progress_streak += 1
+            else:
+                no_progress_streak = 0
+                turn_progressed = True
+            last_sig = sig
+            time.sleep(random.uniform(*_TURN_PAUSE))
+
+        if not turn_progressed and should_abort_for_stagnation(no_progress_streak):
+            _fail_open_ask()
+            return abort_close(
+                active, context, "copiloto estagnou sem progresso — abortando cedo"
+            )
 
     _fail_open_ask()
     return abort_close(active, context, "copiloto esgotou os turnos sem destravar")
@@ -666,19 +777,25 @@ __all__ = [
     "ACTION_VOCAB",
     "AI_RATE_LIMIT_BUDGET_SECONDS",
     "COPILOT_FAIL_PREFIX",
+    "MAX_STEPS_PER_TURN",
     "MAX_TURNS",
     "SOLVED",
+    "STAGNATION_LIMIT",
     "UNAVAILABLE",
     "abort_close",
+    "action_signature",
     "build_copilot_prompt",
     "call_ai_with_rate_limit_retry",
     "click_target_label",
     "copilot_resume_excerpt",
     "copilot_takeover",
     "exec_action",
+    "expand_action_steps",
     "extract_action",
+    "is_no_progress_outcome",
     "panel_profile_block",
     "resolve_selector",
+    "should_abort_for_stagnation",
     "snapshot_page",
     "target_is_submit",
 ]

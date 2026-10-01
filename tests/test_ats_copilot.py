@@ -179,5 +179,42 @@ class RateLimitRetryTests(unittest.TestCase):
         self.assertEqual(history, [])
 
 
+class CopilotFrugalityTests(unittest.TestCase):
+    def test_expand_batch_and_cap(self) -> None:
+        from ats_copilot import MAX_STEPS_PER_TURN, expand_action_steps
+
+        act = {
+            "action": "batch",
+            "args": {
+                "steps": [
+                    {"action": "type", "args": {"field": 0, "text": "a"}},
+                    {"action": "type", "args": {"field": 1, "text": "b"}},
+                    {"action": "click", "args": {"button": 2}},
+                    {"action": "click", "args": {"button": 3}},
+                ]
+            },
+            "reason": "fill",
+        }
+        steps = expand_action_steps(act)
+        self.assertEqual(len(steps), MAX_STEPS_PER_TURN)
+        self.assertEqual(steps[0]["action"], "type")
+
+    def test_stagnation_and_no_progress(self) -> None:
+        from ats_copilot import is_no_progress_outcome, should_abort_for_stagnation
+
+        self.assertTrue(is_no_progress_outcome("wait", "waited"))
+        self.assertTrue(is_no_progress_outcome("click", "no target"))
+        self.assertFalse(is_no_progress_outcome("type", "typed"))
+        self.assertTrue(should_abort_for_stagnation(4))
+        self.assertFalse(should_abort_for_stagnation(3))
+
+    def test_vocab_prefers_batch_and_frugal(self) -> None:
+        from ats_copilot import ACTION_VOCAB, MAX_TURNS
+
+        self.assertIn("batch", ACTION_VOCAB)
+        self.assertIn("Be frugal", ACTION_VOCAB)
+        self.assertLessEqual(MAX_TURNS, 8)
+
+
 if __name__ == "__main__":
     unittest.main()
