@@ -70,15 +70,19 @@ class FillOutcomeTests(unittest.TestCase):
         page.locator.side_effect = lambda sel: calls.append(f"locator:{sel}") or mock.MagicMock()
         page.content.return_value = "<html>sem captcha</html>"
         with mock.patch.object(handler, "wait_ready", return_value=True), \
+             mock.patch("ats_inhire._name_field_visible", return_value=True), \
+             mock.patch("ats_inhire._react_dropdown_present", return_value=False), \
+             mock.patch("ats_inhire._city_free_text_present", return_value=False), \
+             mock.patch("ats_inhire._salary_field_present", return_value=False), \
              mock.patch("ats_inhire._select_phone_country_code",
                         side_effect=lambda p, dial: calls.append("phone_code") or True), \
-             mock.patch("ats_inhire._select_country_brazil", return_value=True), \
-             mock.patch("ats_inhire._select_react_dropdown", return_value=True), \
              mock.patch("ats_inhire._click_visible_choice", return_value=True), \
              mock.patch("ats_inhire._fill_diversity_step"), \
              mock.patch("ats_inhire._prefer_english_ui"), \
              mock.patch("ats_inhire._continue_disabled", return_value=False), \
-             mock.patch("ats_inhire._pause"):
+             mock.patch("ats_inhire._pause"), \
+             mock.patch("ats_inhire._fill_if_present"), \
+             mock.patch("ats_inhire._salary_inhire") as salary_ai:
             ctx = ats_base.ApplyContext(
                 cfg={"candidate_name": "Ana", "candidate_email": "a@x.com",
                      "candidate_phone": "+55 31 91234-5678"},
@@ -86,8 +90,102 @@ class FillOutcomeTests(unittest.TestCase):
             )
             res = handler.fill(page, ctx)
         self.assertTrue(res.ok)
+        salary_ai.assert_not_called()
         order = [c for c in calls if c in ("phone_code",) or c.startswith("locator:#phone")]
         self.assertEqual(order[0], "phone_code")
+
+    def test_salary_ai_deferred_until_field_present(self):
+        handler = ats_inhire.InHireHandler()
+        page = mock.MagicMock()
+        order: list[str] = []
+
+        def fill_present(page, sel, value):
+            if "name" in sel:
+                order.append("nome")
+
+        with mock.patch.object(handler, "wait_ready", return_value=True), \
+             mock.patch("ats_inhire._name_field_visible", return_value=True), \
+             mock.patch("ats_inhire._react_dropdown_present", return_value=False), \
+             mock.patch("ats_inhire._city_free_text_present", return_value=False), \
+             mock.patch("ats_inhire._salary_field_present", return_value=True), \
+             mock.patch("ats_inhire._select_phone_country_code", return_value=True), \
+             mock.patch("ats_inhire._click_visible_choice", return_value=True), \
+             mock.patch("ats_inhire._fill_diversity_step"), \
+             mock.patch("ats_inhire._prefer_english_ui"), \
+             mock.patch("ats_inhire._continue_disabled", return_value=False), \
+             mock.patch("ats_inhire._pause"), \
+             mock.patch("ats_inhire._fill_if_present", side_effect=fill_present), \
+             mock.patch(
+                 "ats_inhire._salary_inhire",
+                 side_effect=lambda *a, **k: order.append("salary_ai") or "5000",
+             ):
+            ctx = ats_base.ApplyContext(
+                cfg={"candidate_name": "Ana", "candidate_email": "a@x.com",
+                     "candidate_phone": "31912345678"},
+                rules=[], resume_path="", cover_letter="",
+            )
+            res = handler.fill(page, ctx)
+        self.assertTrue(res.ok)
+        self.assertIn("nome", order)
+        self.assertIn("salary_ai", order)
+        self.assertLess(order.index("nome"), order.index("salary_ai"))
+
+    def test_absent_country_city_not_missing(self):
+        """Formulário sem país/cidade (ex. banco de talentos) não trava o fill."""
+        handler = ats_inhire.InHireHandler()
+        page = mock.MagicMock()
+        with mock.patch.object(handler, "wait_ready", return_value=True), \
+             mock.patch("ats_inhire._name_field_visible", return_value=True), \
+             mock.patch("ats_inhire._select_phone_country_code", return_value=True), \
+             mock.patch("ats_inhire._react_dropdown_present", return_value=False), \
+             mock.patch("ats_inhire._city_free_text_present", return_value=False), \
+             mock.patch("ats_inhire._salary_field_present", return_value=False), \
+             mock.patch("ats_inhire._click_visible_choice", return_value=True), \
+             mock.patch("ats_inhire._fill_diversity_step"), \
+             mock.patch("ats_inhire._prefer_english_ui"), \
+             mock.patch("ats_inhire._continue_disabled", return_value=False), \
+             mock.patch("ats_inhire._pause"), \
+             mock.patch("ats_inhire._fill_if_present"), \
+             mock.patch("ats_inhire._select_country_brazil") as sel_country, \
+             mock.patch("ats_inhire._select_react_dropdown") as sel_city:
+            ctx = ats_base.ApplyContext(
+                cfg={"candidate_name": "Ana", "candidate_email": "a@x.com",
+                     "candidate_phone": "31912345678"},
+                rules=[], resume_path="", cover_letter="",
+            )
+            res = handler.fill(page, ctx)
+        self.assertTrue(res.ok, msg=f"missing={res.missing}")
+        self.assertNotIn("pais", res.missing)
+        self.assertNotIn("cidade", res.missing)
+        sel_country.assert_not_called()
+        sel_city.assert_not_called()
+
+    def test_soft_country_city_cleared_when_continue_enabled(self):
+        handler = ats_inhire.InHireHandler()
+        page = mock.MagicMock()
+        with mock.patch.object(handler, "wait_ready", return_value=True), \
+             mock.patch("ats_inhire._name_field_visible", return_value=True), \
+             mock.patch("ats_inhire._select_phone_country_code", return_value=True), \
+             mock.patch("ats_inhire._react_dropdown_present", return_value=True), \
+             mock.patch("ats_inhire._select_country_brazil", return_value=False), \
+             mock.patch("ats_inhire._select_react_dropdown", return_value=False), \
+             mock.patch("ats_inhire._city_free_text_present", return_value=False), \
+             mock.patch("ats_inhire._salary_field_present", return_value=False), \
+             mock.patch("ats_inhire._click_visible_choice", return_value=True), \
+             mock.patch("ats_inhire._fill_diversity_step"), \
+             mock.patch("ats_inhire._prefer_english_ui"), \
+             mock.patch("ats_inhire._continue_disabled", return_value=False), \
+             mock.patch("ats_inhire._pause"), \
+             mock.patch("ats_inhire._fill_if_present"):
+            ctx = ats_base.ApplyContext(
+                cfg={"candidate_name": "Ana", "candidate_email": "a@x.com",
+                     "candidate_phone": "31912345678"},
+                rules=[], resume_path="", cover_letter="",
+            )
+            res = handler.fill(page, ctx)
+        self.assertTrue(res.ok, msg=f"missing={res.missing}")
+        self.assertNotIn("pais", res.missing)
+        self.assertNotIn("cidade", res.missing)
 
     def test_detect_obstacles_captcha(self):
         page = mock.MagicMock()
@@ -101,6 +199,9 @@ class FillOutcomeTests(unittest.TestCase):
     def test_wait_ready_false_when_absent(self):
         page = mock.MagicMock()
         page.locator.return_value.first.wait_for.side_effect = RuntimeError("timeout")
+        empty = mock.MagicMock()
+        empty.count.return_value = 0
+        page.get_by_role.return_value = empty
         self.assertFalse(ats_inhire.InHireHandler().wait_ready(page, timeout_ms=1))
 
 

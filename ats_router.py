@@ -84,7 +84,8 @@ def copilot_rescue(page, context, cfg: dict, ai: dict, *, reason: str) -> tuple[
             return "solved", detail, active
         if state == ABORTED:
             progress_from_ai(ai)(f"copiloto abortou: {str(detail)[:160]}")
-            return "aborted", detail, None
+            # Página ainda aberta → revisão humana; None → fechou de verdade.
+            return "aborted", detail, active
         return "unavailable", detail, page
     except Exception as exc:
         LOG.warning("copiloto falhou (%s); seguindo sem ele.", exc)
@@ -176,6 +177,17 @@ def run_ats_flow(
                 return OUTCOME_ASSISTED, f"copiloto destravou {host}; voce enviou (assistido)."
             return OUTCOME_TIMEOUT, f"copiloto destravou {host}; sem confirmacao de envio."
         if state == "aborted":
+            handoff = cpage if cpage is not None else page
+            try:
+                still_open = handoff is not None and not handoff.is_closed()
+            except Exception:
+                still_open = False
+            if still_open:
+                progress(f"copiloto sem automação em {host} — aguardando você")
+                outcome = wait_for_human(handoff, minutes=human_wait)
+                if outcome == "submitted":
+                    return OUTCOME_ASSISTED, f"copiloto abortou em {host}; voce enviou (assistido)."
+                return OUTCOME_TIMEOUT, f"copiloto abortou em {host}; sem confirmacao de envio."
             return OUTCOME_UNAUTOMATED, note
         detail = (
             f"NO_HANDLER: apply externo em {host} — nenhum driver ATS instalado. "
@@ -221,6 +233,16 @@ def run_ats_flow(
         state, note, cpage = copilot_rescue(page, context, cfg, ai_stuck,
                                            reason="formulario travado — " + fill_note.strip(" ()"))
         if state == "aborted":
+            handoff = cpage if cpage is not None else page
+            try:
+                still_open = handoff is not None and not handoff.is_closed()
+            except Exception:
+                still_open = False
+            if still_open:
+                progress("copiloto sem automação — aguardando você no Chrome")
+                return _assisted_finish(
+                    instance, handoff, handler_cls, fill_note + f" ({note})", human_wait, ctx
+                )
             return OUTCOME_UNAUTOMATED, note
         if state == "submitted":
             progress("copiloto enviou após travamento")

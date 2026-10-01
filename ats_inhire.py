@@ -83,26 +83,98 @@ def _salary_inhire(page, cfg: dict[str, str], ctx) -> str:
 def _prefer_english_ui(page) -> None:
     """Country list uses 'Brazil (BR)' in English; prefer that for reliable matching."""
     try:
-        selects = page.locator("select")
-        for i in range(selects.count()):
-            sel = selects.nth(i)
-            try:
-                options = sel.locator("option").all_inner_texts()
-            except Exception:
-                continue
-            joined = " ".join(options).casefold()
-            if "english" in joined or any(o.strip().casefold() == "en" for o in options):
+        # Só vale a pena se houver seletor de idioma nativo — evita varrer o DOM.
+        lang = page.locator(
+            "select[name*='lang' i], select[id*='lang' i], select[aria-label*='language' i]"
+        )
+        if not lang.count():
+            selects = page.locator("select")
+            # Cap: páginas InHire costumam ter 0–2 <select>; não varrer dezenas.
+            limit = min(int(selects.count()), 4)
+            for i in range(limit):
+                sel = selects.nth(i)
                 try:
-                    sel.select_option(value="en")
+                    options = sel.locator("option").all_inner_texts()
                 except Exception:
+                    continue
+                joined = " ".join(options).casefold()
+                if "english" in joined or any(o.strip().casefold() == "en" for o in options):
                     try:
-                        sel.select_option(label="English")
+                        sel.select_option(value="en")
                     except Exception:
-                        continue
-                _pause(1.0, 1.8)
+                        try:
+                            sel.select_option(label="English")
+                        except Exception:
+                            continue
+                    _pause(0.35, 0.7)
+                    return
+            return
+        sel = lang.first
+        try:
+            sel.select_option(value="en")
+        except Exception:
+            try:
+                sel.select_option(label="English")
+            except Exception:
                 return
+        _pause(0.35, 0.7)
     except Exception as exc:
         LOG.info("InHire language switch skipped: %s", exc)
+
+
+def _salary_field_present(page) -> bool:
+    try:
+        loc = page.locator("#salaryExpectation, input[name='salaryExpectation']").first
+        return bool(loc.count() and loc.is_visible(timeout=400))
+    except Exception:
+        return False
+
+
+def _name_field_visible(page) -> bool:
+    try:
+        return bool(
+            page.locator(NAME_FIELD_SELECTOR).first.is_visible(timeout=500)
+        )
+    except Exception:
+        return False
+
+
+def _react_dropdown_present(page, matcher: str) -> bool:
+    """True se existe dropdown React visível cujo texto casa com ``matcher``."""
+    try:
+        dd = page.locator('[aria-label="Dropdown select"]').filter(
+            has_text=re.compile(matcher, re.I)
+        )
+        for i in range(min(int(dd.count()), 8)):
+            try:
+                if dd.nth(i).is_visible(timeout=300):
+                    return True
+            except Exception:
+                continue
+        all_dd = page.locator('[aria-label="Dropdown select"]')
+        for i in range(min(int(all_dd.count()), 12)):
+            try:
+                node = all_dd.nth(i)
+                if not node.is_visible(timeout=300):
+                    continue
+                text = node.inner_text(timeout=500) or ""
+            except Exception:
+                continue
+            if re.search(matcher, text, re.I):
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _city_free_text_present(page) -> bool:
+    try:
+        loc = page.locator(
+            "#district, input[name='district'], input[name='districtBr']"
+        ).first
+        return bool(loc.count() and loc.is_visible(timeout=400))
+    except Exception:
+        return False
 
 
 def _select_country_brazil(page) -> bool:
@@ -638,8 +710,30 @@ class InHireHandler(BaseATSHandler):
         return super().can_handle(url) or "inhire.app" in (url or "").casefold()
 
     def wait_ready(self, page, timeout_ms: int = 15000) -> bool:
+        """Pronto se o form (#name) apareceu OU se dá para clicar em Candidatar-se."""
         try:
-            page.locator(NAME_FIELD_SELECTOR).first.wait_for(state="visible", timeout=timeout_ms)
+            page.locator(NAME_FIELD_SELECTOR).first.wait_for(
+                state="visible", timeout=min(timeout_ms, 4000)
+            )
+            return True
+        except Exception:
+            pass
+        # Landing da vaga: botão de candidatura ainda não abriu o form.
+        for label in ("Candidatar-se", "Apply", "Candidatar", "Apply for the job"):
+            try:
+                btn = page.get_by_role(
+                    "button", name=re.compile(rf"^{re.escape(label)}$", re.I)
+                )
+                if btn.count() and btn.first.is_visible(timeout=400):
+                    return True
+            except Exception:
+                continue
+        # Última tentativa: esperar o nome até o timeout restante.
+        remaining = max(500, int(timeout_ms) - 4000)
+        try:
+            page.locator(NAME_FIELD_SELECTOR).first.wait_for(
+                state="visible", timeout=remaining
+            )
             return True
         except Exception:
             return False
@@ -665,21 +759,40 @@ class InHireHandler(BaseATSHandler):
         filled: list[str] = []
         missing: list[str] = []
         try:
-            _prefer_english_ui(page)
+            form_open = _name_field_visible(page)
+            # Idioma só importa se houver país na UI inglesa ("Brazil (BR)").
+            if _react_dropdown_present(
+                page,
+                r"Select a country|Country of origin|Selecione o pa[ií]s|country|pa[ií]s",
+            ):
+                _prefer_english_ui(page)
 
-            for label in ("Candidatar-se para a vaga", "Candidatar-se", "Candidatar", "Apply", "Apply for the job"):
-                btn = page.get_by_role("button", name=re.compile(rf"^{re.escape(label)}$", re.I))
-                try:
-                    if btn.count() and btn.first.is_visible(timeout=400):
-                        btn.first.click(timeout=4000)
-                        _pause(0.8, 1.4)
-                        break
-                except Exception:
-                    continue
+            if not form_open:
+                for label in (
+                    "Candidatar-se para a vaga",
+                    "Candidatar-se",
+                    "Candidatar",
+                    "Apply",
+                    "Apply for the job",
+                ):
+                    btn = page.get_by_role(
+                        "button", name=re.compile(rf"^{re.escape(label)}$", re.I)
+                    )
+                    try:
+                        if btn.count() and btn.first.is_visible(timeout=300):
+                            btn.first.click(timeout=4000)
+                            _pause(0.4, 0.8)
+                            break
+                    except Exception:
+                        continue
 
-            if not self.wait_ready(page, timeout_ms=15000):
-                return FillResult(ok=False, filled=filled, missing=["form"],
-                                  error="Formulario InHire nao apareceu (campo nome).")
+                if not self.wait_ready(page, timeout_ms=10000):
+                    return FillResult(
+                        ok=False,
+                        filled=filled,
+                        missing=["form"],
+                        error="Formulario InHire nao apareceu (campo nome).",
+                    )
 
             name = (cfg.get("candidate_name") or "").strip()
             email = (cfg.get("candidate_email") or "").strip()
@@ -689,16 +802,15 @@ class InHireHandler(BaseATSHandler):
             linkedin = _linkedin_profile_value(cfg)
             cpf = format_cpf(cfg.get("candidate_cpf") or "")
 
-            # Pretensão: moeda inferida do placeholder real do campo (R$ → BRL,
-            # $ → USD). BRL ja vem com o multiplicador PJ aplicado por salary_for.
-            salary = _salary_inhire(page, cfg, ctx)
-
+            # Preenche identidade imediatamente — salary/IA vem depois se o campo existir.
             _fill_if_present(page, "#name, input[name='name']", name)
             filled.append("nome")
             # CPF — so se configurado; o campo mascarado aceita '123.456.789-01'.
             if cpf:
                 _fill_if_present(
-                    page, "input[name='document.value'], #cpf, input[name='cpf'], input[placeholder*='000.000']", cpf
+                    page,
+                    "input[name='document.value'], #cpf, input[name='cpf'], input[placeholder*='000.000']",
+                    cpf,
                 )
                 filled.append("cpf")
             _fill_if_present(page, "#email, input[name='email']", email)
@@ -712,36 +824,57 @@ class InHireHandler(BaseATSHandler):
             _fill_if_present(page, "#linkedinUsername, input[name='linkedinUsername']", linkedin)
             filled.append("linkedin")
 
-            # Country of origin — always type/select "Brazil" (English list).
-            if _select_country_brazil(page):
-                filled.append("pais")
-            else:
-                missing.append("pais")
+            # País/cidade só contam como missing se o campo existir na página.
+            # Formulários sem esses campos (ex.: banco de talentos) não devem
+            # disparar copiloto/abort.
+            country_matcher = (
+                r"Select a country|Country of origin|Selecione o pa[ií]s|"
+                r"country|pa[ií]s"
+            )
+            if _react_dropdown_present(page, country_matcher):
+                if _select_country_brazil(page):
+                    filled.append("pais")
+                else:
+                    missing.append("pais")
+                _pause(0.25, 0.5)
 
-            # City dropdown enables after country.
-            _pause(0.5, 1.0)
-            if _select_react_dropdown(
-                page,
-                matcher=r"Enter your city|Informe sua cidade|City|cidade",
-                option_query=city,
-                option_regex=re.escape(city),
-            ):
-                filled.append("cidade")
-            else:
-                # Only touch free-text city if enabled.
+            city_matcher = r"Enter your city|Informe sua cidade|City|cidade"
+            if _react_dropdown_present(page, city_matcher):
+                if _select_react_dropdown(
+                    page,
+                    matcher=city_matcher,
+                    option_query=city,
+                    option_regex=re.escape(city),
+                ):
+                    filled.append("cidade")
+                else:
+                    missing.append("cidade")
+            elif _city_free_text_present(page):
                 try:
-                    city_input = page.locator("#district, input[name='district'], input[name='districtBr']").first
-                    if city_input.count() and city_input.is_enabled(timeout=800):
+                    city_input = page.locator(
+                        "#district, input[name='district'], input[name='districtBr']"
+                    ).first
+                    if city_input.is_enabled(timeout=800):
                         city_input.fill(city)
                         filled.append("cidade")
                     else:
                         missing.append("cidade")
                 except Exception:
                     missing.append("cidade")
+            else:
+                # Sem cidade na UI — não espera o dropdown habilitar.
+                pass
 
-            if salary:
-                _fill_if_present(page, "#salaryExpectation, input[name='salaryExpectation']", salary)
-                filled.append("pretensao")
+            # Pretensão só se o campo existir; IA depois dos campos básicos.
+            if _salary_field_present(page):
+                salary = _salary_inhire(page, cfg, ctx)
+                if salary:
+                    _fill_if_present(
+                        page,
+                        "#salaryExpectation, input[name='salaryExpectation']",
+                        salary,
+                    )
+                    filled.append("pretensao")
 
             if resume_path:
                 try:
@@ -793,6 +926,10 @@ class InHireHandler(BaseATSHandler):
             # copiloto de IA assume (override total) em vez de ir pro humano.
             if _continue_disabled(page):
                 missing.append("continuar-registro")
+            else:
+                # Botão avançar habilitado: país/cidade ausentes ou falhos não
+                # bloqueiam (campo opcional / formulário sem esses passos).
+                missing = [m for m in missing if m not in {"pais", "cidade"}]
             return FillResult(ok=not missing, filled=filled, missing=missing)
         except Exception as exc:
             return FillResult(ok=False, filled=filled, missing=missing, error=str(exc))

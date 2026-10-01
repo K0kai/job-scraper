@@ -399,14 +399,14 @@ def _open_external_apply_target(page, context, apply_btn):
             target.wait_for_load_state("domcontentloaded", timeout=45000)
         except Exception:
             pass
-        _human_pause(1.5, 3.0)
+        _human_pause(0.6, 1.2)
         return target
     except Exception:
         try:
             apply_btn.click(timeout=8000, delay=random.randint(40, 140))
         except Exception:
             pass
-        _human_pause(2.0, 4.0)
+        _human_pause(0.8, 1.5)
         for p in context.pages:
             try:
                 if p not in before and p != page:
@@ -445,7 +445,7 @@ def _handle_external_ats(
     )
 
     # O redirect passa por linkedin.com/me/events antes do host final: poll curto.
-    deadline = time.monotonic() + 10
+    deadline = time.monotonic() + 6
     current = page.url or ""
     while time.monotonic() < deadline:
         try:
@@ -456,7 +456,7 @@ def _handle_external_ats(
             break
         if current and "linkedin.com" not in current:
             break
-        _human_pause(0.7, 1.2)
+        _human_pause(0.25, 0.45)
     else:
         # URL ainda no LinkedIn? varre abas (popup abriu fora daqui).
         for p in context.pages:

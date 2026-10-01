@@ -944,8 +944,8 @@ def copilot_takeover(page, context, *, reason: str, cfg: dict, ai: dict,
             no_progress_streak += 1
             if should_abort_for_stagnation(no_progress_streak):
                 _fail_open_ask()
-                return abort_close(
-                    active, context, "copiloto estagnou (respostas irregulares)"
+                return abort_leave_open(
+                    active, "copiloto estagnou (respostas irregulares)"
                 )
             continue
 
@@ -998,7 +998,7 @@ def copilot_takeover(page, context, *, reason: str, cfg: dict, ai: dict,
                 history.append(f"turn {turn}: ask sem pergunta")
                 no_progress_streak += 1
                 if should_abort_for_stagnation(no_progress_streak):
-                    return abort_close(active, context, "copiloto estagnou (ask vazio)")
+                    return abort_leave_open(active, "copiloto estagnou (ask vazio)")
                 continue
             # Currículo já no painel → sobe o PDF, não pergunta.
             if looks_like_resume_ask(question) and resume_path:
@@ -1081,7 +1081,7 @@ def copilot_takeover(page, context, *, reason: str, cfg: dict, ai: dict,
             history.append(f"turn {turn}: batch vazio")
             no_progress_streak += 1
             if should_abort_for_stagnation(no_progress_streak):
-                return abort_close(active, context, "copiloto estagnou (batch vazio)")
+                return abort_leave_open(active, "copiloto estagnou (batch vazio)")
             continue
 
         turn_progressed = False
@@ -1154,8 +1154,8 @@ def copilot_takeover(page, context, *, reason: str, cfg: dict, ai: dict,
 
         if not turn_progressed and should_abort_for_stagnation(no_progress_streak):
             _fail_open_ask()
-            return abort_close(
-                active, context, "copiloto estagnou sem progresso — abortando cedo"
+            return abort_leave_open(
+                active, "copiloto estagnou sem progresso — abortando cedo"
             )
 
     # Esgotou turnos
@@ -1183,18 +1183,22 @@ def copilot_takeover(page, context, *, reason: str, cfg: dict, ai: dict,
         except Exception:
             detail = "snapshot final falhou"
         if allow_submit:
-            # Sem bot para retomar — aborta com nota (não fingir sucesso).
+            # Sem bot para retomar — deixa Chrome aberto p/ revisão/envio.
             _fail_open_ask()
-            return abort_close(
+            return abort_leave_open(
                 active,
-                context,
                 f"site sem driver: esgotou turnos sem concluir o envio ({detail})",
             )
         LOG.info("copiloto: turnos esgotados com progresso — handoff ao bot (%s)", detail)
         return SOLVED, f"copiloto parcial com progresso; bot retoma ({detail})", active
 
     _fail_open_ask()
-    return abort_close(active, context, "copiloto esgotou os turnos sem destravar")
+    return abort_leave_open(active, "copiloto esgotou os turnos sem destravar")
+
+
+def abort_leave_open(page, why: str) -> tuple[str, str, object]:
+    """Abort sem fechar o Chrome — o fluxo assistido/revisão assume a página."""
+    return ABORTED, f"{COPILOT_FAIL_PREFIX} nao foi possivel automatizar o fluxo - {why[:200]}", page
 
 
 def abort_close(page, context, why: str) -> tuple[str, str, object]:
@@ -1228,6 +1232,7 @@ __all__ = [
     "SUBMITTED",
     "UNAVAILABLE",
     "abort_close",
+    "abort_leave_open",
     "action_signature",
     "build_copilot_prompt",
     "call_ai_with_rate_limit_retry",

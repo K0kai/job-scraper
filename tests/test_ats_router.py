@@ -192,6 +192,23 @@ class FailureTests(unittest.TestCase):
         self.assertIn(outcome, (ats_router.OUTCOME_TIMEOUT, ats_router.OUTCOME_ASSISTED))
         self.assertIn("telefone", detail)
 
+    def test_copilot_abort_leaves_open_for_human(self):
+        cls = make_handler_cls(
+            "stuck", ("stuck.example.com",),
+            fill_result=ats_base.FillResult(ok=False, missing=["pais", "cidade"]),
+        )
+        ats_base.register(cls)
+        page = FakePage("https://stuck.example.com/x")
+        with mock.patch.object(
+            ats_router,
+            "copilot_rescue",
+            return_value=("aborted", "COPILOT_UNAUTOMATED: estagnou", page),
+        ), mock.patch.object(ats_router, "wait_for_human", return_value="submitted") as wait:
+            outcome, detail = ats_router.run_ats_flow(page, None, human_wait=1, **CTX)
+        self.assertEqual(outcome, ats_router.OUTCOME_ASSISTED)
+        wait.assert_called_once()
+        self.assertIn("pais", detail)
+
     def test_closed_page_fails(self):
         cls = make_handler_cls("ghost", ("ghost.example.com",))
         ats_base.register(cls)
