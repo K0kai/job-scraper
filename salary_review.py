@@ -12,14 +12,20 @@ LOG = logging.getLogger("job-scraper")
 
 _SALARY_POLICY_RULES = """
 Salary review policy (offshore / remote-from-Brazil candidate):
-- Panel salary_brl / salary_usd are MONTHLY expectations.
+- Panel salary_brl / salary_usd are MONTHLY expectations for the candidate's
+  normal mid-level target — NOT a hard floor for every role.
 - Match the field's pay period (year / month / hour) and currency.
-- Floor: never go below the candidate's Brazilian monthly expectation converted
-  to the field currency+period (use the bot proposal as the floor baseline).
-- Prefer the panel USD remote anchor when present.
-- Target: typically a bit below local market for that country/role (~10–20%
-  under local), because foreign employers hire abroad for cost — but stay
-  ABOVE the Brazil floor. Do not dump to local minimum wage.
+- Role tier (from job title/description):
+  * intern / estágio / trainee: MUST lower an unrealistic panel proposal.
+    Going BELOW the panel monthly expectation is required when the figure would
+    look absurd for an internship (e.g. R$2000+ monthly for BR estágio). Prefer
+    a realistic stipend/band for that market; do not invent luxury figures.
+  * junior / entry-level: MAY lower below the panel floor when the proposal is
+    clearly high for the role; stay plausible for junior pay in that country.
+  * mid+ / standard: Floor = Brazilian monthly expectation converted to the
+    field currency+period. Prefer panel USD remote anchor when present. Target
+    a bit below local market (~10–20%) for offshore hires, but stay ABOVE the
+    Brazil floor. Do not dump to local minimum wage.
 - If the field is a select with options, pick the closest option text.
 - If period/currency/market is too unclear to choose safely, action=ask.
 """.strip()
@@ -177,15 +183,24 @@ def needs_salary_ai_review(
     proposal: dict,
     *,
     options: list[str] | None = None,
+    job_text: str = "",
+    field_hint: str = "",
 ) -> bool:
-    """Só chama IA quando período é ambíguo, há faixas select, ou moeda 'de mercado'."""
+    """Chama IA quando período ambíguo, select, moeda de mercado, ou intern/junior."""
+    from salary_policy import detect_role_tier
+
     period = str(proposal.get("period") or "unknown").casefold()
     currency = str(proposal.get("currency") or "").upper()
+    tier = str(proposal.get("tier") or "").casefold()
+    if not tier or tier == "standard":
+        tier = detect_role_tier(field_hint, job_text)
     if options:
         return True
     if period == "unknown":
         return True
-    # BRL/USD com período claro: FX+normalização bastam (economiza 1 chamada)
+    if tier in {"intern", "junior"}:
+        return True
+    # BRL/USD mid+ com período claro: FX+normalização bastam
     if currency in {"BRL", "USD"}:
         return False
     return True
@@ -200,12 +215,14 @@ def finalize_salary_value(
     ai: dict[str, Any] | None = None,
     fallback: str = "",
 ) -> str:
-    """Proposta do bot + review só quando necessário."""
+    """Proposta do bot + review quando necessário (sempre para intern/junior)."""
     from salary_policy import propose_salary
 
     prop = propose_salary(cfg, field_hint=field_hint, job_text=job_text)
     proposed = str(prop.get("formatted") or fallback or "")
-    if not needs_salary_ai_review(prop, options=options):
+    if not needs_salary_ai_review(
+        prop, options=options, job_text=job_text, field_hint=field_hint
+    ):
         return proposed.strip()
     final, _meta = review_salary_value(
         proposed_formatted=proposed,

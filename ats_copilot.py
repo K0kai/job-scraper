@@ -125,11 +125,14 @@ Rules:
   explicitly names them.
   Current company / employer: use RESUME EXCERPT "Current employer" or PANEL
   PROFILE; do NOT use JOB.company (that is the hiring company).
-  For salary fields: panel salary_brl/usd are MONTHLY; convert FX and match the
-  field period (year/month/hour). Aim a bit below local market for that country
-  (~10–20%) because remote-from-abroad hiring is cost-sensitive, but NEVER below
-  the Brazil floor (converted). Prefer panel USD remote anchor when present.
-  Do not put N/A if a base salary exists.
+  For salary fields: panel salary_brl/usd are MONTHLY mid-level targets.
+  Convert FX and match the field period (year/month/hour).
+  If the job is internship/estágio/trainee/junior/entry-level and the panel
+  figure is unrealistic, LOWER it (including BELOW the panel floor) to a
+  plausible stipend/junior band for that market — never invent luxury pay.
+  For mid+ roles: stay above Brazil floor (converted) and a bit under local
+  market (~10–20%) for offshore hires; prefer panel USD remote anchor when
+  present. Do not put N/A if a base salary exists.
   If a required field is still missing, prefer `ask` (human answers in the web
   panel; Chrome stays open) over `abort`. Only `abort` when the human
   cancelled/timed out, or for legal consent you must not sign. Never invent.
@@ -198,9 +201,10 @@ def panel_profile_block(cfg: dict | None) -> str:
             lines.append(f"{label}: {value}")
     if any(str(cfg.get(k) or "").strip() for k in ("salary_expectation_brl", "salary_expectation_usd")):
         lines.append(
-            "salary_note: panel amounts are MONTHLY; convert FX; match field period "
-            "(year/month/hour); stay above Brazil floor and slightly under local market "
-            "for offshore/remote hires; prefer salary_usd when present"
+            "salary_note: panel amounts are MONTHLY mid-level targets; convert FX; "
+            "match field period; for intern/junior LOWER unrealistic figures "
+            "(may go below panel); for mid+ stay above Brazil floor and slightly "
+            "under local market; prefer salary_usd when present"
         )
     return "\n".join(lines)
 

@@ -68,6 +68,29 @@ class ReviewSalaryValueTests(unittest.TestCase):
             needs_salary_ai_review({"period": "month", "currency": "COP"}, options=None)
         )
 
+    def test_intern_junior_always_review_even_brl(self) -> None:
+        from salary_review import needs_salary_ai_review
+
+        self.assertTrue(
+            needs_salary_ai_review(
+                {"period": "month", "currency": "BRL", "tier": "intern"},
+                job_text="Estágio em engenharia de software",
+            )
+        )
+        self.assertTrue(
+            needs_salary_ai_review(
+                {"period": "month", "currency": "BRL"},
+                job_text="Vaga de estágio remunerado",
+                field_hint="Pretensão salarial",
+            )
+        )
+        self.assertFalse(
+            needs_salary_ai_review(
+                {"period": "month", "currency": "BRL", "tier": "standard"},
+                job_text="Software Engineer Pleno",
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
