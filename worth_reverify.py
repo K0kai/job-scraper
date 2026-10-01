@@ -166,7 +166,11 @@ class LinkedInLivenessSession:
         self._lock_held = False
 
     def __enter__(self) -> "LinkedInLivenessSession":
-        from browser_engine import persistent_launch_kwargs, resolve_sync_playwright
+        from browser_engine import (
+            BACKGROUND_RUN_ARGS,
+            persistent_launch_kwargs,
+            resolve_sync_playwright,
+        )
         from linkedin_apply import _LINKEDIN_LOCK, _LOCK_WAIT_SECONDS, default_profile_dir
 
         profile = (self.cfg.get("linkedin_chrome_profile") or "").strip() or default_profile_dir(
@@ -185,6 +189,7 @@ class LinkedInLivenessSession:
                 headless=False,
                 viewport={"width": 1280, "height": 900},
                 locale="en-US",
+                args=list(BACKGROUND_RUN_ARGS),
             )
             try:
                 self._context = self._playwright.chromium.launch_persistent_context(

@@ -58,6 +58,25 @@ class PersistentLaunchKwargsTests(unittest.TestCase):
         self.assertEqual(kw["args"].count("--disable-blink-features=AutomationControlled"), 1)
         self.assertIn("--no-sandbox", kw["args"])
 
+    def test_background_run_args_disable_throttling(self):
+        import browser_engine
+
+        for arg in (
+            "--disable-background-timer-throttling",
+            "--disable-backgrounding-occluded-windows",
+            "--disable-renderer-backgrounding",
+            "--disable-features=CalculateNativeWinOcclusion",
+        ):
+            self.assertIn(arg, browser_engine.BACKGROUND_RUN_ARGS)
+
+        kw = browser_engine.persistent_launch_kwargs(
+            profile="/tmp/p",
+            headless=False,
+            args=list(browser_engine.BACKGROUND_RUN_ARGS),
+        )
+        for arg in browser_engine.BACKGROUND_RUN_ARGS:
+            self.assertIn(arg, kw["args"])
+
 
 FAKE_BUTTONS = [
     {"index": 0, "text": "Sign in", "aria": "", "visible": True, "tag": "button"},

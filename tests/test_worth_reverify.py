@@ -235,7 +235,22 @@ class ReverifyBatchTests(unittest.TestCase):
                 return "unknown", "login wall"
             return "active", "ok"
 
-        with mock.patch.object(worth_reverify, "check_job_liveness", side_effect=fake_check):
+        class FakeSession:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def check_url(self, url):
+                return fake_check({"url": url})
+
+        with mock.patch.object(worth_reverify, "check_job_liveness", side_effect=fake_check), mock.patch.object(
+            worth_reverify, "LinkedInLivenessSession", FakeSession
+        ):
             summary = worth_reverify.reverify_worth_jobs(self._connect)
 
         self.assertEqual(summary["checked"], 3)

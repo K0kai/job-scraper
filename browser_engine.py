@@ -57,6 +57,15 @@ def engine_install_hint(cfg: dict[str, str] | None) -> str:
 
 STEALTH_ARG = "--disable-blink-features=AutomationControlled"
 
+# Windows (e outros) throttlam timers/JS em janelas sem foco; LinkedIn SPA para.
+# Usado na reverificação para rodar atrás de outras janelas sem “travar”.
+BACKGROUND_RUN_ARGS = (
+    "--disable-background-timer-throttling",
+    "--disable-backgrounding-occluded-windows",
+    "--disable-renderer-backgrounding",
+    "--disable-features=CalculateNativeWinOcclusion",
+)
+
 
 def _is_root() -> bool:
     return hasattr(os, "geteuid") and os.geteuid() == 0
