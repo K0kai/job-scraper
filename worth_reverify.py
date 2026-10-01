@@ -127,6 +127,37 @@ def page_has_load_error(body: str) -> bool:
     return bool(LOAD_ERROR_RE.search(body or ""))
 
 
+def read_liveness_text(page) -> str:
+    """Prefere o card principal da vaga (evita Easy Apply de similares)."""
+    try:
+        snippet = page.evaluate(
+            """() => {
+              const sels = [
+                '.job-details-jobs-unified-top-card',
+                '.jobs-unified-top-card',
+                '.jobs-details-top-card',
+                '.jobs-details__main-content',
+                'main'
+              ];
+              for (const s of sels) {
+                const el = document.querySelector(s);
+                if (el && el.innerText && el.innerText.trim().length > 20) {
+                  return el.innerText.slice(0, 12000);
+                }
+              }
+              return (document.body && document.body.innerText || '').slice(0, 12000);
+            }"""
+        )
+        if isinstance(snippet, str) and snippet.strip():
+            return snippet
+    except Exception:
+        pass
+    try:
+        return page.content() or ""
+    except Exception:
+        return ""
+
+
 def wait_page_liveness_signal(
     page,
     *,
@@ -134,9 +165,14 @@ def wait_page_liveness_signal(
     poll_ms: int = DEFAULT_POLL_MS,
     should_abort: AbortFn | None = None,
 ) -> tuple[str, str]:
-    """Espera sinal claro (ativa/inativa) no HTML; senão timeout → unknown."""
+    """Espera sinal claro (ativa/inativa) no HTML; senão timeout → unknown.
+
+    Inativa retorna na hora. Ativa só no fim do prazo — no LinkedIn o Easy Apply
+    de vagas similares costuma aparecer antes do banner de vaga fechada.
+    """
     deadline = time.monotonic() + max(0.05, timeout_ms / 1000.0)
     last_detail = "sem leitura"
+    saw_active = False
     while True:
         if should_abort and should_abort():
             return UNKNOWN, "abortado"
@@ -146,7 +182,7 @@ def wait_page_liveness_signal(
             return UNKNOWN, "login/authwall LinkedIn"
         body = ""
         try:
-            body = page.content() or ""
+            body = read_liveness_text(page)
         except Exception as exc:
             last_detail = f"content: {exc}"
             body = ""
@@ -156,9 +192,13 @@ def wait_page_liveness_signal(
         if verdict == INACTIVE:
             return INACTIVE, "browser: vaga fechada"
         if verdict == ACTIVE:
-            return ACTIVE, "browser: candidatura disponível"
-        last_detail = "HTML ainda sem sinal claro"
+            saw_active = True
+            last_detail = "sinal de candidatura (aguardando possível fechamento)"
+        else:
+            last_detail = "HTML ainda sem sinal claro"
         if time.monotonic() >= deadline:
+            if saw_active:
+                return ACTIVE, "browser: candidatura disponível"
             return UNKNOWN, f"timeout esperando sinal ({last_detail})"
         try:
             page.wait_for_timeout(max(1, int(poll_ms)))

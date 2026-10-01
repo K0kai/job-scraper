@@ -100,6 +100,31 @@ class BrowserWaitTests(unittest.TestCase):
         )
         self.assertEqual(verdict, "active")
 
+    def test_wait_prefers_late_closed_banner_over_early_easy_apply(self) -> None:
+        """LinkedIn hidrata Easy Apply de similares antes do banner 'fechada'."""
+
+        class FakePage:
+            def __init__(self):
+                self.n = 0
+                self.url = "https://www.linkedin.com/jobs/view/3"
+
+            def content(self):
+                self.n += 1
+                if self.n < 4:
+                    return '<html><button>Easy Apply</button> similares</html>'
+                return (
+                    "<html>No longer accepting applicants"
+                    "<button>Easy Apply</button></html>"
+                )
+
+            def wait_for_timeout(self, ms):
+                return None
+
+        verdict, _detail = worth_reverify.wait_page_liveness_signal(
+            FakePage(), timeout_ms=5_000, poll_ms=1
+        )
+        self.assertEqual(verdict, "inactive")
+
     def test_wait_returns_unknown_on_linkedin_load_error(self) -> None:
         class FakePage:
             url = "https://www.linkedin.com/jobs/view/9"
