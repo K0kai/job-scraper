@@ -68,23 +68,115 @@ Available actions (args in parentheses):
   js       (code="<inline JS, no return stmt, use `document`>")
   info     ()                                                        # ask for a fresh page snapshot
   done     ()                                                        # unblocked; hand back to caller
+  ask      (question="<what data is missing>")                       # pause; human answers in the panel
   abort    (reason="<why it cannot be automated>")                   # give up -> yellow note
 
 Rules:
 - NEVER emit a click whose target text matches submit/apply/finalizar/enviar. The
   caller handles the real submission; you only unblock the flow.
 - Prefer `field`/`button` indices from the page snapshot; they are stable handles.
-- Fill what you can from CANDIDATE FACTS + RESUME DOSSIER. For diversity/identity
-  questions use only values you are explicitly given; if a legal consent box is
-  the only blocker, use `abort` (we never sign terms for the person).
+- Fill what you can from CANDIDATE FACTS + PANEL PROFILE + RESUME EXCERPT. Prefer
+  PANEL PROFILE for city/salary/contact; prefer RESUME EXCERPT for education /
+  location_notes / work_authorization. If a required field is still missing, prefer
+  `ask` (human answers in the web panel; Chrome stays open) over `abort`. Only
+  `abort` when the human cancelled/timed out, or for legal consent you must not sign.
+  Never invent.
+- For diversity/identity questions use only values you are explicitly given; if a
+  legal consent box is the only blocker, use `abort` (we never sign terms for the
+  person).
 - When the flow looks unblocked (a Continue/Next is now clickable, required fields
   are filled), emit `done`.
 """.strip()
+
+_PANEL_PROFILE_FIELDS: tuple[tuple[str, str], ...] = (
+    ("candidate_name", "name"),
+    ("candidate_email", "email"),
+    ("candidate_phone", "phone"),
+    ("candidate_linkedin", "linkedin"),
+    ("candidate_city", "city"),
+    ("candidate_cpf", "cpf"),
+    ("salary_expectation_brl", "salary_brl"),
+    ("salary_expectation_usd", "salary_usd"),
+    ("candidate_contract_type", "contract_type"),
+)
 
 
 # ---------------------------------------------------------------------------
 # Partes puras (testaveis sem navegador)
 # ---------------------------------------------------------------------------
+
+def panel_profile_block(cfg: dict | None) -> str:
+    """Campos estruturados do painel para o prompt (omite vazios)."""
+    cfg = cfg or {}
+    lines = []
+    for key, label in _PANEL_PROFILE_FIELDS:
+        value = str(cfg.get(key) or "").strip()
+        if value:
+            lines.append(f"{label}: {value}")
+    return "\n".join(lines)
+
+
+def copilot_resume_excerpt(
+    resume_json: str,
+    resume_summary: str = "",
+    *,
+    budget: int = 2000,
+) -> str:
+    """Extrato priorizado: location/auth/education antes de skills/experiência."""
+    budget = max(200, int(budget))
+    data = None
+    raw = (resume_json or "").strip()
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                data = parsed
+        except (json.JSONDecodeError, ValueError, TypeError):
+            data = None
+    if data is None:
+        return _clip(resume_summary or resume_json, budget)
+
+    parts: list[str] = []
+
+    def _add(title: str, value: object, *, item_limit: int | None = None) -> None:
+        if isinstance(value, list):
+            items = [str(v).strip() for v in value if str(v).strip()]
+            if item_limit is not None:
+                items = items[:item_limit]
+            if items:
+                parts.append(title + ":\n- " + "\n- ".join(_clip(i, 220) for i in items))
+        else:
+            text = str(value or "").strip()
+            if text:
+                parts.append(f"{title}:\n{_clip(text, 400)}")
+
+    _add("Location notes", data.get("location_notes"))
+    _add("Work authorization", data.get("work_authorization_notes"))
+    _add("Education", data.get("education"), item_limit=8)
+    headline = str(data.get("headline") or "").strip()
+    seniority = str(data.get("seniority") or "").strip()
+    years = str(data.get("years_of_experience") or "").strip()
+    if headline or seniority or years:
+        bits = [b for b in (headline, f"seniority={seniority}" if seniority else "", f"years={years}" if years else "") if b]
+        parts.append("Profile: " + " | ".join(bits))
+    skills = data.get("technical_skills") or data.get("skills") or []
+    tools = data.get("tools") or []
+    skill_items = [str(v).strip() for v in (list(skills) + list(tools)) if str(v).strip()][:12]
+    if skill_items:
+        parts.append("Skills: " + ", ".join(skill_items))
+    experience = data.get("experience")
+    if isinstance(experience, list) and experience:
+        exp_lines = []
+        for item in experience[:3]:
+            exp_lines.append(_clip(item if isinstance(item, str) else json.dumps(item, ensure_ascii=False), 280))
+        if exp_lines:
+            parts.append("Recent experience:\n- " + "\n- ".join(exp_lines))
+
+    text = "\n\n".join(parts).strip()
+    if not text:
+        return _clip(resume_summary or resume_json, budget)
+    return text if len(text) <= budget else text[: budget - 1] + "…"
+
 
 def extract_action(text: str) -> dict | None:
     """Extrai o PRIMEIRO objeto JSON do texto da IA. None = resposta invalida."""
@@ -142,6 +234,7 @@ def build_copilot_prompt(
     buttons: list[dict],
     page_text: str,
     history: list[str],
+    panel_profile: str = "",
 ) -> str:
     """Prompt compacto com contexto total + snapshot da pagina + historico."""
     job = job or {}
@@ -159,12 +252,13 @@ def build_copilot_prompt(
         if b.get("visible")
     ][:30]
     hist = "\n".join(f"  - {h}" for h in history[-8:]) or "  (nenhuma ainda)"
-    dossier = _clip(resume_json or resume_summary, 1600)
+    excerpt = copilot_resume_excerpt(resume_json, resume_summary, budget=2000)
     return (
         ACTION_VOCAB
         + "\n\n=== STUCK BECAUSE ===\n" + _clip(reason, 300)
         + "\n\n=== CANDIDATE FACTS ===\n" + (_clip(facts, 1200) or "(none)")
-        + "\n\n=== RESUME DOSSIER (already analyzed) ===\n" + (dossier or "(none)")
+        + "\n\n=== PANEL PROFILE ===\n" + (_clip(panel_profile, 800) or "(none)")
+        + "\n\n=== RESUME EXCERPT (prioritized) ===\n" + (excerpt or "(none)")
         + "\n\n=== JOB ===\n"
         + f"title={_clip(job.get('title'), 120)} | company={_clip(job.get('company'), 80)}\n"
         + _clip(job.get("description"), 1200)
@@ -359,6 +453,7 @@ def copilot_takeover(page, context, *, reason: str, cfg: dict, ai: dict,
                 reason=reason, facts=facts, resume_summary=resume_summary,
                 resume_json=resume_json, job=job, url=url, fields=fields,
                 buttons=buttons, page_text=page_text, history=history,
+                panel_profile=panel_profile_block(cfg),
             )
             raw = call_ai_text(prompt=prompt, provider=provider, model=model,
                                api_key=api_key, max_output_tokens=700, temperature=0.1)
@@ -384,6 +479,49 @@ def copilot_takeover(page, context, *, reason: str, cfg: dict, ai: dict,
             return SOLVED, f"destravado pelo copiloto ({why})", active
         if action == "abort":
             return abort_close(active, context, why or "a IA nao conseguiu automatizar")
+        if action == "ask":
+            question = str(args.get("question") or why or "").strip()
+            connect_fn = ai.get("connect_fn")
+            if not question:
+                history.append(f"turn {turn}: ask sem pergunta")
+                continue
+            if not callable(connect_fn):
+                return abort_close(active, context, "ask sem connect_fn — " + question[:120])
+            from copilot_asks import (
+                STATUS_ANSWERED,
+                STATUS_CANCELLED,
+                create_ask,
+                load_facts,
+                wait_for_answer,
+            )
+
+            job_id = None
+            try:
+                job_id = int((job or {}).get("id")) if (job or {}).get("id") is not None else None
+            except (TypeError, ValueError):
+                job_id = None
+            now = str(ai.get("now_iso") or "")
+            try:
+                ask_id = create_ask(connect_fn, job_id=job_id, question=question, now_iso=now or "now")
+            except Exception as exc:
+                return abort_close(active, context, f"falha ao criar ask: {exc}")
+            wait_min = 12
+            try:
+                wait_min = int(str(cfg.get("linkedin_human_wait_minutes") or "12"))
+            except ValueError:
+                wait_min = 12
+            wait_min = max(3, min(45, wait_min))
+            LOG.info("copiloto: perguntando no painel (ask #%s): %s", ask_id, question[:120])
+            status, answer = wait_for_answer(connect_fn, ask_id, minutes=wait_min)
+            if status != STATUS_ANSWERED:
+                label = "cancelado" if status == STATUS_CANCELLED else "timeout"
+                return abort_close(
+                    active, context, f"humano {label} a pergunta do copiloto: {question[:120]}"
+                )
+            lang = str((job or {}).get("language") or "en")
+            facts = load_facts(connect_fn, lang) or (facts + f"\n{question}: {answer}").strip()
+            history.append(f"turn {turn}: ask -> answered ({_clip(answer, 80)})")
+            continue
         if action == "click" and target_is_submit(click_target_label(args, fields, buttons)):
             history.append(f"turn {turn}: recusado clique em botao de envio ({why})")
             continue
@@ -429,9 +567,11 @@ __all__ = [
     "abort_close",
     "build_copilot_prompt",
     "click_target_label",
+    "copilot_resume_excerpt",
     "copilot_takeover",
     "exec_action",
     "extract_action",
+    "panel_profile_block",
     "resolve_selector",
     "snapshot_page",
     "target_is_submit",

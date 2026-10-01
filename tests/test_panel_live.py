@@ -19,6 +19,12 @@ class ResumeStatusLiveTests(unittest.TestCase):
         payload = app.live_payload()
         self.assertIn("resume_status", payload)
         self.assertIn("jobs_hash", payload)
+        self.assertIn("copilot_ask", payload)
+        self.assertIn("copilot_ask_sound", payload)
+        self.assertIn("copilot_ask_sound_volume", payload)
+        self.assertIsInstance(payload["copilot_ask_sound"], bool)
+        self.assertGreaterEqual(payload["copilot_ask_sound_volume"], 0.0)
+        self.assertLessEqual(payload["copilot_ask_sound_volume"], 1.0)
         for lang in ("pt", "en"):
             part = payload["resume_status"][lang]
             self.assertIn("meta_html", part)

@@ -148,6 +148,9 @@ DEFAULT_SETTINGS = {
     "linkedin_min_gap_minutes": "3",
     "linkedin_human_wait_minutes": "12",
     "linkedin_login_wait_minutes": "25",
+    # Som no painel quando o copiloto pede um dado (Web Audio)
+    "copilot_ask_sound": "1",
+    "copilot_ask_sound_volume": "0.55",
     # Perfil de diversidade (identidade NUNCA vem de IA; 'not_informed' = não informar)
     "candidate_gender": "not_informed",
     "candidate_race": "not_informed",
@@ -309,6 +312,9 @@ def initialize() -> None:
           created_at TEXT NOT NULL,
           updated_at TEXT NOT NULL
         )""")
+        from copilot_asks import ensure_table as ensure_copilot_asks
+
+        ensure_copilot_asks(db)
         decision_cols = {row["name"] for row in db.execute("PRAGMA table_info(ai_decisions)")}
         if "resume_language" not in decision_cols:
             db.execute("ALTER TABLE ai_decisions ADD COLUMN resume_language TEXT NOT NULL DEFAULT ''")
@@ -2928,6 +2934,10 @@ def live_payload(
     linkedin_filter = linkedin_filter_panel_html()
     usage = usage_dashboard_html()
     next_in = next_run_countdown_seconds(status.get("next_run_at"))
+    from copilot_asks import get_pending_ask
+
+    pending_ask = get_pending_ask(connect)
+    cfg_live = settings()
     return {
         "state": status["state"],
         "state_label": state_label_for(status["state"]),
@@ -2957,11 +2967,25 @@ def live_payload(
         "linkedin_filter_hash": _live_hash(linkedin_filter),
         "usage_html": usage,
         "usage_hash": _live_hash(usage),
+        "copilot_ask": pending_ask,
+        "copilot_ask_sound": (cfg_live.get("copilot_ask_sound") or "1") == "1",
+        "copilot_ask_sound_volume": _copilot_ask_volume(cfg_live),
     }
 
 
 def _live_hash(text: str) -> str:
     return hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:16]
+
+
+def _copilot_ask_volume(cfg: dict[str, str] | None) -> float:
+    raw = (cfg or {}).get("copilot_ask_sound_volume") or "0.55"
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 0.55
+    if value > 1.0:
+        value = value / 100.0
+    return max(0.0, min(1.0, value))
 
 
 def resume_status_parts(lang: str) -> dict[str, str]:
@@ -3262,8 +3286,10 @@ color:#c9c9d1;border:1px solid var(--line);border-radius:10px;padding:12px;max-h
 .modal[hidden]{display:none!important}
 .modal-backdrop{position:absolute;inset:0;background:rgba(0,0,0,.55)}
 .modal-dialog{position:relative;z-index:1;width:min(420px,100%);background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:22px 22px 18px;box-shadow:0 16px 48px rgba(0,0,0,.45)}
+.modal-dialog.modal-dialog-ask{width:min(520px,100%)}
 .modal-dialog h3{margin:0 0 10px;font-size:16px;color:var(--white)}
 .modal-dialog .hint{margin:0 0 18px}
+.modal-dialog textarea{width:100%;min-height:96px;margin:0 0 14px;resize:vertical}
 .modal-dialog .actions{display:flex;justify-content:flex-end;gap:10px;margin:0}
 .worth-pager{display:inline-flex;align-items:center;gap:8px;flex-shrink:0;margin-left:4px}
 .worth-pager-btns{display:inline-flex;align-items:center;gap:6px}
@@ -3362,7 +3388,7 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
 
 <div id="tab-ia" class="tab-panel"><section class="panel"><h2>IA &amp; integrações</h2><form method="post" action="/ai-settings"><div class="form-grid"><label>Provedor de IA<select name="ai_provider"><option value="gemini" {'selected' if cfg.get('ai_provider') == 'gemini' else ''}>Gemini</option><option value="openai" {'selected' if cfg.get('ai_provider') == 'openai' else ''}>OpenAI</option></select></label><label>Modelo<input name="ai_model" value="{esc(cfg.get('ai_model','gemini-2.5-flash'))}"></label><label>Motor de navegador<select name="browser_engine"><option value="pydoll" {'selected' if cfg.get('browser_engine','pydoll') == 'pydoll' else ''}>Pydoll (CDP, stealth — padrão)</option><option value="playwright" {'selected' if cfg.get('browser_engine','pydoll') == 'playwright' else ''}>Playwright (fallback)</option></select></label><label>Chave de IA (vazio mantém a salva)<input type="password" name="api_key" autocomplete="new-password"></label><label>Adzuna App ID<input name="adzuna_app_id" value=""></label><label>Adzuna API key<input type="password" name="adzuna_app_key" value=""></label><label>Token Apify<input type="password" name="apify_token" value="" autocomplete="new-password"></label></div><label style="margin-top:14px">Fatos profissionais em português<textarea name="candidate_facts_pt" rows="3">{esc(cfg.get('candidate_facts_pt',''))}</textarea></label><label style="margin-top:12px">Professional facts in English<textarea name="candidate_facts_en" rows="3">{esc(cfg.get('candidate_facts_en',''))}</textarea></label><p class="hint">Chaves vão para o cofre do sistema. Os fatos alimentam a IA nas perguntas abertas e de opções.</p><button style="margin-top:14px">Salvar IA e integrações</button></form></section><section class="panel"><h2>Regras de formulário (navegador)</h2><form method="post" action="/profile-settings">{rules_panel}<p class="hint">Modo <code>salary</code> escolhe automaticamente BRL×USD pela moeda do campo e aplica o multiplicador PJ ao valor BRL quando a contratação preferida é PJ; "Valor fixo" só é usado como desempate. No modo <code>select</code>, coloque em "Valor fixo" o texto da opção preferida. Perguntas abertas sem regra usam a IA.</p><button>Salvar regras</button></form></section></div>
 
-<div id="tab-automacao" class="tab-panel"><section class="panel"><h2>Automação &amp; LinkedIn</h2><form method="post" action="/automation-settings"><label style="margin:0 0 12px;display:flex;gap:8px;align-items:flex-start"><input type="checkbox" name="auto_apply" value="1" {'checked' if cfg.get('auto_apply') == '1' else ''} style="width:auto;margin-top:3px"> <span>Ativar triagem e candidatura automáticas (e-mail SMTP, depois formulário público)</span></label><label style="margin:0 0 12px;display:flex;gap:8px;align-items:flex-start"><input type="checkbox" name="linkedin_easy_apply" value="1" {'checked' if cfg.get('linkedin_easy_apply') == '1' else ''} style="width:auto;margin-top:3px"> <span>Easy Apply LinkedIn <em>assistido</em> (preenche; <strong>você</strong> clica Enviar — o robô nunca envia sozinho)</span></label><label style="margin:0 0 18px;display:flex;gap:8px;align-items:flex-start"><input type="checkbox" name="linkedin_risk_ack" value="1" {'checked' if cfg.get('linkedin_risk_ack') == '1' else ''} style="width:auto;margin-top:3px"> <span>Li e aceito: automação no LinkedIn pode violar os termos deles e gerar restrição/banimento; uso por minha conta e risco</span></label><div class="form-grid"><label>Score mínimo (%)<input name="minimum_match_score" type="number" min="0" max="100" value="{esc(cfg.get('minimum_match_score','80'))}"></label><label>Workers da fila (vagas em paralelo)<input name="queue_max_workers" type="number" min="1" max="8" value="{esc(cfg.get('queue_max_workers','3'))}"></label><label>Máx. tentativas por job<input name="queue_max_attempts" type="number" min="1" max="200" value="{esc(cfg.get('queue_max_attempts','40'))}"></label><label>TTL da fila (horas)<input name="queue_ttl_hours" type="number" min="1" max="168" value="{esc(cfg.get('queue_ttl_hours','24'))}"></label><label>Intervalo mínimo entre Easy Apply (min, 1–30)<input name="linkedin_min_gap_minutes" type="number" min="1" max="30" value="{esc(cfg.get('linkedin_min_gap_minutes','3'))}"></label><label>Tempo para você revisar/enviar (min)<input name="linkedin_human_wait_minutes" type="number" min="3" max="45" value="{esc(cfg.get('linkedin_human_wait_minutes','12'))}"></label><label>Tempo para login manual (min)<input name="linkedin_login_wait_minutes" type="number" min="5" max="60" value="{esc(cfg.get('linkedin_login_wait_minutes','25'))}"></label><label>Perfil Chrome dedicado<input name="linkedin_chrome_profile" value="{esc(cfg.get('linkedin_chrome_profile') or '')}" placeholder="{esc(default_profile_dir(ROOT))}"></label></div><p class="hint">LinkedIn assistido: Easy Apply <em>ou</em> Apply externo (ex.: InHire) — no máximo 1 Easy Apply por vez na fila, só intervalo mínimo entre ações (sem limite diário), checkpoint/captcha com você. Sem o aceite de risco, Easy Apply não roda. PCD e demais dados de diversidade ficam em Perfil.</p><button style="margin-top:14px">Salvar automação</button></form></section></div>
+<div id="tab-automacao" class="tab-panel"><section class="panel"><h2>Automação &amp; LinkedIn</h2><form method="post" action="/automation-settings"><label style="margin:0 0 12px;display:flex;gap:8px;align-items:flex-start"><input type="checkbox" name="auto_apply" value="1" {'checked' if cfg.get('auto_apply') == '1' else ''} style="width:auto;margin-top:3px"> <span>Ativar triagem e candidatura automáticas (e-mail SMTP, depois formulário público)</span></label><label style="margin:0 0 12px;display:flex;gap:8px;align-items:flex-start"><input type="checkbox" name="linkedin_easy_apply" value="1" {'checked' if cfg.get('linkedin_easy_apply') == '1' else ''} style="width:auto;margin-top:3px"> <span>Easy Apply LinkedIn <em>assistido</em> (preenche; <strong>você</strong> clica Enviar — o robô nunca envia sozinho)</span></label><label style="margin:0 0 18px;display:flex;gap:8px;align-items:flex-start"><input type="checkbox" name="linkedin_risk_ack" value="1" {'checked' if cfg.get('linkedin_risk_ack') == '1' else ''} style="width:auto;margin-top:3px"> <span>Li e aceito: automação no LinkedIn pode violar os termos deles e gerar restrição/banimento; uso por minha conta e risco</span></label><div class="form-grid"><label>Score mínimo (%)<input name="minimum_match_score" type="number" min="0" max="100" value="{esc(cfg.get('minimum_match_score','80'))}"></label><label>Workers da fila (vagas em paralelo)<input name="queue_max_workers" type="number" min="1" max="8" value="{esc(cfg.get('queue_max_workers','3'))}"></label><label>Máx. tentativas por job<input name="queue_max_attempts" type="number" min="1" max="200" value="{esc(cfg.get('queue_max_attempts','40'))}"></label><label>TTL da fila (horas)<input name="queue_ttl_hours" type="number" min="1" max="168" value="{esc(cfg.get('queue_ttl_hours','24'))}"></label><label>Intervalo mínimo entre Easy Apply (min, 1–30)<input name="linkedin_min_gap_minutes" type="number" min="1" max="30" value="{esc(cfg.get('linkedin_min_gap_minutes','3'))}"></label><label>Tempo para você revisar/enviar (min)<input name="linkedin_human_wait_minutes" type="number" min="3" max="45" value="{esc(cfg.get('linkedin_human_wait_minutes','12'))}"></label><label>Tempo para login manual (min)<input name="linkedin_login_wait_minutes" type="number" min="5" max="60" value="{esc(cfg.get('linkedin_login_wait_minutes','25'))}"></label><label>Perfil Chrome dedicado<input name="linkedin_chrome_profile" value="{esc(cfg.get('linkedin_chrome_profile') or '')}" placeholder="{esc(default_profile_dir(ROOT))}"></label><label>Volume do som do copiloto (0–100)<input name="copilot_ask_sound_volume" type="number" min="0" max="100" value="{esc(str(int(round(_copilot_ask_volume(cfg) * 100))))}"></label></div><label style="margin:12px 0 18px;display:flex;gap:8px;align-items:flex-start"><input type="checkbox" name="copilot_ask_sound" value="1" {'checked' if cfg.get('copilot_ask_sound', '1') == '1' else ''} style="width:auto;margin-top:3px"> <span>Tocar som de notificação no painel quando o copiloto pedir um dado</span></label><p class="hint">LinkedIn assistido: Easy Apply <em>ou</em> Apply externo (ex.: InHire) — no máximo 1 Easy Apply por vez na fila, só intervalo mínimo entre ações (sem limite diário), checkpoint/captcha com você. Sem o aceite de risco, Easy Apply não roda. PCD e demais dados de diversidade ficam em Perfil.</p><button style="margin-top:14px">Salvar automação</button></form></section></div>
 
 <div id="tab-smtp" class="tab-panel"><section class="panel"><h2>SMTP</h2><form method="post" action="/smtp-settings"><div class="form-grid"><label>Host<input name="smtp_host" value="{esc(cfg.get('smtp_host',''))}"></label><label>Porta<input name="smtp_port" type="number" value="{esc(cfg.get('smtp_port','587'))}"></label><label>Usuário<input name="smtp_user" value="{esc(cfg.get('smtp_user',''))}"></label><label>Remetente (From)<input name="smtp_from" value="{esc(cfg.get('smtp_from',''))}"></label><label>Senha (vazio mantém)<input type="password" name="smtp_password" autocomplete="new-password"></label><label>TLS<select name="smtp_use_tls"><option value="1" {'selected' if cfg.get('smtp_use_tls','1')=='1' else ''}>Sim (STARTTLS)</option><option value="0" {'selected' if cfg.get('smtp_use_tls')=='0' else ''}>Não</option></select></label></div><div class="actions"><button>Salvar SMTP</button></div></form><form method="post" action="/smtp-test" style="margin-top:8px"><button class="subtle" type="submit">Enviar e-mail de teste</button></form></section></div>
 
@@ -3376,6 +3402,20 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
     <div class="actions">
       <button type="button" class="subtle" id="worth-ignore-all-no">Cancelar</button>
       <button type="button" class="stop" id="worth-ignore-all-yes">Confirmar</button>
+    </div>
+  </div>
+</div>
+
+<div id="copilot-ask-modal" class="modal" hidden>
+  <div class="modal-backdrop"></div>
+  <div class="modal-dialog modal-dialog-ask" role="dialog" aria-modal="true" aria-labelledby="copilot-ask-title">
+    <h3 id="copilot-ask-title">Copiloto precisa de um dado</h3>
+    <p class="hint" id="copilot-ask-question"></p>
+    <p class="hint" style="margin-top:-8px">A resposta será salva em <strong>Fatos do candidato</strong> (PT e EN). O Chrome da candidatura fica aberto.</p>
+    <textarea id="copilot-ask-answer" placeholder="Sua resposta…"></textarea>
+    <div class="actions">
+      <button type="button" class="subtle" id="copilot-ask-cancel">Cancelar</button>
+      <button type="button" id="copilot-ask-submit">Enviar</button>
     </div>
   </div>
 </div>
@@ -3436,6 +3476,78 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
       if (target) target.click();
     }}
   }} catch (e) {{}}
+  var lastCopilotAskId = null;
+  var copilotAskSoundOn = true;
+  var copilotAskSoundVol = 0.55;
+  function playCopilotAskSound(volume) {{
+    try {{
+      var Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!Ctx) return;
+      var ctx = new Ctx();
+      var now = ctx.currentTime;
+      var gain = ctx.createGain();
+      gain.gain.setValueAtTime(0.0001, now);
+      gain.gain.exponentialRampToValueAtTime(Math.max(0.001, Math.min(1, volume || 0.55)), now + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.55);
+      gain.connect(ctx.destination);
+      [880, 1174].forEach(function (freq, i) {{
+        var osc = ctx.createOscillator();
+        osc.type = "sine";
+        osc.frequency.value = freq;
+        osc.connect(gain);
+        osc.start(now + i * 0.12);
+        osc.stop(now + 0.45 + i * 0.12);
+      }});
+      setTimeout(function () {{ try {{ ctx.close(); }} catch (e) {{}} }}, 900);
+    }} catch (e) {{}}
+  }}
+  function syncCopilotAsk(data) {{
+    if (typeof data.copilot_ask_sound !== "undefined") {{
+      copilotAskSoundOn = !!data.copilot_ask_sound;
+    }}
+    if (typeof data.copilot_ask_sound_volume === "number") {{
+      copilotAskSoundVol = data.copilot_ask_sound_volume;
+    }}
+    var modal = document.getElementById("copilot-ask-modal");
+    var qEl = document.getElementById("copilot-ask-question");
+    var aEl = document.getElementById("copilot-ask-answer");
+    if (!modal || !qEl) return;
+    var ask = data.copilot_ask || null;
+    if (ask && ask.id) {{
+      var isNew = lastCopilotAskId !== ask.id;
+      qEl.textContent = ask.question || "";
+      modal.hidden = false;
+      if (isNew) {{
+        if (aEl) aEl.value = "";
+        lastCopilotAskId = ask.id;
+        if (copilotAskSoundOn) playCopilotAskSound(copilotAskSoundVol);
+        try {{ aEl && aEl.focus(); }} catch (e) {{}}
+      }}
+    }} else {{
+      modal.hidden = true;
+      lastCopilotAskId = null;
+    }}
+  }}
+  function postCopilotAsk(path, extra) {{
+    var fd = new FormData();
+    if (lastCopilotAskId) fd.append("id", String(lastCopilotAskId));
+    if (extra) {{
+      Object.keys(extra).forEach(function (k) {{ fd.append(k, extra[k]); }});
+    }}
+    return fetch(path, {{
+      method: "POST",
+      body: fd,
+      headers: {{ Accept: "application/json", "X-Requested-With": "fetch" }},
+      credentials: "same-origin"
+    }})
+      .then(function (r) {{ return r.json().then(function (data) {{ return {{ okHttp: r.ok, data: data }}; }}); }})
+      .then(function (res) {{
+        var data = res.data || {{}};
+        showNotice(data.notice || (data.ok ? "OK" : "Falha"), data.kind || (data.ok ? "success" : "error"));
+        refresh();
+      }})
+      .catch(function () {{ showNotice("Falha de comunicação com o painel.", "error"); }});
+  }}
   var appliedHashes = {{}};
   var worthPage = 1;
   var worthMinMatch = 0;
@@ -3759,6 +3871,7 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
             logsEl.scrollTop = stickBottom ? 0 : savedTop;
           }}
         }}
+        syncCopilotAsk(data);
       }})
       .catch(function () {{}})
       .then(function () {{
@@ -3771,6 +3884,21 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
         }}
       }});
   }}
+  document.addEventListener("click", function (ev) {{
+    if (ev.target && ev.target.id === "copilot-ask-submit") {{
+      var aEl = document.getElementById("copilot-ask-answer");
+      var answer = aEl ? String(aEl.value || "").trim() : "";
+      if (!answer) {{
+        showNotice("Digite a resposta.", "warning");
+        return;
+      }}
+      postCopilotAsk("/copilot-ask-answer", {{ answer: answer }});
+      return;
+    }}
+    if (ev.target && ev.target.id === "copilot-ask-cancel") {{
+      postCopilotAsk("/copilot-ask-cancel", {{}});
+    }}
+  }});
   var noticeTimer = null;
   var PROCESS_PATHS = {{
     "/upload-resume": 1,
@@ -3787,7 +3915,9 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
     "/worth-easy-apply": 1,
     "/worth-reverify": 1,
     "/job-status": 1,
-    "/worth-ignore-all": 1
+    "/worth-ignore-all": 1,
+    "/copilot-ask-answer": 1,
+    "/copilot-ask-cancel": 1
   }};
   function noticeClass(kind) {{
     return {{
@@ -4109,10 +4239,19 @@ class Handler(BaseHTTPRequestHandler):
                 form["linkedin_easy_apply"] = "0"
             if "linkedin_risk_ack" not in form:
                 form["linkedin_risk_ack"] = "0"
+            if "copilot_ask_sound" not in form:
+                form["copilot_ask_sound"] = "0"
             # Assisted-only: strip legacy flags if present in form posts.
             form.pop("linkedin_stop_before_submit", None)
             form.pop("linkedin_max_per_day", None)
             form.pop("inhire_pcd", None)
+            try:
+                vol = float(form.get("copilot_ask_sound_volume") or "55")
+                if vol > 1.0:
+                    vol = vol / 100.0
+                form["copilot_ask_sound_volume"] = f"{max(0.0, min(1.0, vol)):.2f}"
+            except ValueError:
+                form["copilot_ask_sound_volume"] = "0.55"
             save_settings(form)
             log_event(
                 "info",
@@ -4248,6 +4387,33 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/worth-reverify":
             note = enqueue_worth_reverify()
             self.respond_notice(note, notice_kind="info")
+        elif path == "/copilot-ask-answer":
+            ask_id = int(form["id"]) if form.get("id", "").isdigit() else 0
+            answer = (form.get("answer") or "").strip()
+            if not ask_id or not answer:
+                self.respond_notice("Informe a resposta.", notice_kind="warning", ok=False)
+                return
+            from copilot_asks import answer_ask
+
+            ok = answer_ask(connect, ask_id, answer, now_iso=now_iso())
+            if ok:
+                log_event("info", "copilot", f"Ask #{ask_id} respondida no painel.")
+                self.respond_notice("Resposta enviada ao copiloto e salva nos fatos.")
+            else:
+                self.respond_notice("Pergunta já respondida ou expirada.", notice_kind="warning", ok=False)
+        elif path == "/copilot-ask-cancel":
+            ask_id = int(form["id"]) if form.get("id", "").isdigit() else 0
+            if not ask_id:
+                self.respond_notice("Pergunta inválida.", notice_kind="error", ok=False)
+                return
+            from copilot_asks import cancel_ask
+
+            ok = cancel_ask(connect, ask_id)
+            if ok:
+                log_event("info", "copilot", f"Ask #{ask_id} cancelada no painel.")
+                self.respond_notice("Pergunta cancelada — o copiloto vai abortar.", notice_kind="warning")
+            else:
+                self.respond_notice("Pergunta já fechada.", notice_kind="info")
         elif path == "/notes":
             if form.get("id", "").isdigit():
                 with connect() as db:
