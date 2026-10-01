@@ -3210,10 +3210,69 @@ PAGE_CSS = """*{box-sizing:border-box}
 --ink:#ededf0;--muted:#8a8a93;--muted2:#5c5c66;--accent:#e5484d;--accent2:#ff6369;
 --ok:#4ea36b;--info:#3f6f9e;--warn:#b98a3a;--err:#c2544d;--white:#fff}
 html,body{height:100%}
+
+/* Scrollbar customização — preto não muito escuro e setas pretas nos extremos */
+/* Preto não tão escuro para a thumb */
+:root {
+  --scrollbar-thumb: #242428; /* preto suave */
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--scrollbar-thumb) var(--bg); /* preto suave + bg */
+}
+/* Webkit scrollbar (Chrome, Edge, Safari) */
+*::-webkit-scrollbar {
+  width: 9px;
+  height: 9px;
+  background: var(--bg);
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--scrollbar-thumb); /* preto suave */
+  border-radius: 8px;
+  border: 2px solid var(--bg);
+  min-height: 30px;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--accent); /* tom mais forte do vermelho no hover, mantido para consistência */
+}
+*::-webkit-scrollbar-corner {
+  background: var(--scrollbar-thumb); /* preto suave */
+}
+*::-webkit-scrollbar-track {
+  background: var(--bg);
+  border-radius: 8px;
+}
+/* Setas pretas nos extremos das barras de rolagem */
+*::-webkit-scrollbar-button:single-button {
+  background: #000 !important;      /* seta preta */
+  border: none;
+  width: 9px;
+  height: 9px;
+  display: block;
+}
+/* Mantém as setas pretas no hover e ativo */
+*::-webkit-scrollbar-button:single-button:hover,
+*::-webkit-scrollbar-button:single-button:active {
+  background: #000 !important;
+}
+/* Garante que o símbolo das setas (pseudo-elemento) seja preto */
+*::-webkit-scrollbar-button:single-button:vertical:decrement,
+*::-webkit-scrollbar-button:single-button:vertical:increment,
+*::-webkit-scrollbar-button:single-button:horizontal:decrement,
+*::-webkit-scrollbar-button:single-button:horizontal:increment {
+  background-color: #000 !important;
+  border: none;
+}
+/* Remove os ícones padrão para forçar aparência preta, opcional */
+*::-webkit-scrollbar-button:single-button:before {
+  display: none;
+}
+
 body{margin:0;background:var(--bg);color:var(--ink);
 font:14.5px/1.55 ui-sans-serif,Inter,Segoe UI,Arial,sans-serif;-webkit-font-smoothing:antialiased}
 .shell{display:grid;grid-template-columns:248px 1fr;min-height:100vh}
-.sidebar{background:#0c0c0e;border-right:1px solid var(--line);display:flex;flex-direction:column;
+.sidebar{background:#0c0c0e;border-right:1px solid var(--line);display:flex;flex-direction:column;overflow-y:auto;
 position:sticky;top:0;height:100vh;padding:20px 14px;gap:18px}
 .brand strong{display:block;font-size:15px;letter-spacing:.02em;color:var(--white)}
 .brand small{display:block;color:var(--muted2);font-size:11.5px;margin-top:4px;font-weight:500}
@@ -3294,6 +3353,23 @@ border:1px solid var(--line2);background:var(--panel2)}
 .resume-card{border:1px solid var(--line);border-radius:12px;padding:16px;background:var(--panel2)}
 .resume-dossier summary{color:var(--muted)}
 .resume-dossier-scroll{background:#0e0e10}
+/* WARNING PILL FIX: ensure pills don't get clipped/cut on wrap */
+.warning-pill {
+  background: #3a2f00;
+  border: 1px solid #e8c33f;
+  color: #ffd54a;
+  font-weight: 700;
+  padding: 3px 8px;
+  border-radius: 6px;
+  display: inline-block;
+  box-sizing: border-box;
+  max-width: 100vw;
+  width: max-content;
+  white-space: normal !important;
+  overflow-wrap: break-word;
+  word-break: break-word;
+  font-size: 13px;
+  vertical-align: middle;
 .log-console{font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:#08080a;
 color:#c9c9d1;border:1px solid var(--line);border-radius:10px;padding:12px;max-height:600px;overflow:auto}
 .log-line{display:grid;grid-template-columns:128px 66px 104px 1fr;gap:10px;padding:5px 0;border-bottom:1px solid #141417}
