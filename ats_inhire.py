@@ -10,7 +10,7 @@ import re
 import time
 
 from ats_base import BaseATSHandler, FillResult, register
-from form_rules import detect_contract_regime, detect_salary_currency, format_cpf, job_context_text, salary_for
+from form_rules import format_cpf, job_context_text
 
 LOG = logging.getLogger("job-scraper")
 
@@ -54,8 +54,7 @@ def _salary_inhire(page, cfg: dict[str, str], ctx) -> str:
     """Pretensão para o campo de salário do InHire.
 
     A moeda é inferida do placeholder real do campo (R$ 0.000,00 → BRL,
-    '$' → USD); sem campo/mostrador, 'auto' cai no preferido do painel. O BRL
-    já sai multiplicado quando a contratação preferida é PJ (ver salary_for).
+    '$' → USD); período + review de IA quando disponível.
     """
     hint = ""
     try:
@@ -66,15 +65,16 @@ def _salary_inhire(page, cfg: dict[str, str], ctx) -> str:
             )
     except Exception:
         hint = ""
-    currency = detect_salary_currency(hint, preferred=cfg.get("salary_currency_preference", ""))
-    # Regime CLT×PJ detectado na vaga/página vence a preferência do painel.
     job = (ctx.ai or {}).get("job") if ctx.ai else None
-    regime = detect_contract_regime(hint, job_context_text(job))
-    value = salary_for(cfg, currency, regime=regime)
-    if not value and currency != "BRL":
-        value = salary_for(cfg, "BRL", regime=regime)
-    if not value:  # legado: algum campo livre ainda alimenta ctx.salary
-        value = (ctx.salary or cfg.get("linkedin_salary_expectation") or "").strip()
+    from salary_review import finalize_salary_value
+
+    value = finalize_salary_value(
+        cfg,
+        field_hint=hint,
+        job_text=job_context_text(job),
+        ai=ctx.ai if isinstance(getattr(ctx, "ai", None), dict) else None,
+        fallback=(ctx.salary or cfg.get("linkedin_salary_expectation") or "").strip(),
+    )
     return value
 
 

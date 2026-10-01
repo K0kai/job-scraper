@@ -349,8 +349,36 @@ def apply_via_browser(
             if not locator:
                 continue
             mode = str(rule["mode"])
+            if mode == "salary":
+                from salary_review import finalize_salary_value
+
+                value = finalize_salary_value(
+                    cfg,
+                    field_hint=field_hint,
+                    job_text=job_context_text(job),
+                    options=list(control.get("options") or []),
+                    ai={
+                        "provider": provider,
+                        "model": model,
+                        "api_key": api_key,
+                        "facts": facts,
+                        "job": job,
+                        "connect_fn": connect_fn,
+                        "now_iso": now_iso,
+                    },
+                    fallback=str(value),
+                ) or str(value)
             if mode == "file" or ctype == "file":
                 locator.set_input_files(resume_path)
+            elif mode == "salary" and tag == "select":
+                options = control.get("options") or []
+                preferred = str(rule.get("value") or "").strip() or str(value)
+                chosen = pick_select_option(list(options), preferred) or pick_select_option(
+                    list(options), str(value)
+                )
+                if not chosen:
+                    return f"Nenhuma opção de select compatível para {rule['key']} (valor: {value})"
+                locator.select_option(label=chosen)
             elif tag == "select" or mode == "select":
                 options = control.get("options") or []
                 preferred = str(rule.get("value") or "").strip() or str(value)

@@ -3291,6 +3291,12 @@ color:#c9c9d1;border:1px solid var(--line);border-radius:10px;padding:12px;max-h
 .modal-dialog .hint{margin:0 0 18px}
 .modal-dialog textarea{width:100%;min-height:96px;margin:0 0 14px;resize:vertical}
 .modal-dialog .actions{display:flex;justify-content:flex-end;gap:10px;margin:0}
+.copilot-ask-waiting{display:flex;flex-direction:column;align-items:center;gap:12px;margin:0 0 14px;padding:16px 8px;border:1px dashed var(--line);border-radius:10px;background:rgba(0,0,0,.18)}
+.copilot-ask-waiting[hidden]{display:none!important}
+.copilot-ask-waiting .hint{margin:0;text-align:center}
+.copilot-ask-spinner{width:28px;height:28px;border:3px solid var(--line);border-top-color:var(--accent,#9ec9ff);border-radius:50%;animation:copilot-spin .8s linear infinite}
+@keyframes copilot-spin{to{transform:rotate(360deg)}}
+.modal-dialog-ask.is-busy textarea{opacity:.65}
 .worth-pager{display:inline-flex;align-items:center;gap:8px;flex-shrink:0;margin-left:4px}
 .worth-pager-btns{display:inline-flex;align-items:center;gap:6px}
 .worth-table th button.worth-sort-th{background:none;border:0;color:inherit;font:inherit;font-weight:700;letter-spacing:.08em;text-transform:uppercase;cursor:pointer;padding:0;display:inline-flex;align-items:center;gap:4px}
@@ -3412,6 +3418,10 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
     <h3 id="copilot-ask-title">Copiloto precisa de um dado</h3>
     <p class="hint" id="copilot-ask-question"></p>
     <p class="hint" style="margin-top:-8px">A resposta será salva em <strong>Fatos do candidato</strong> (PT e EN). O Chrome da candidatura fica aberto.</p>
+    <div id="copilot-ask-waiting" class="copilot-ask-waiting" hidden>
+      <div class="copilot-ask-spinner" aria-hidden="true"></div>
+      <p id="copilot-ask-hint" class="hint">Aguardando a IA…</p>
+    </div>
     <textarea id="copilot-ask-answer" placeholder="Sua resposta…"></textarea>
     <div class="actions">
       <button type="button" class="subtle" id="copilot-ask-cancel">Cancelar</button>
@@ -3501,6 +3511,26 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
       setTimeout(function () {{ try {{ ctx.close(); }} catch (e) {{}} }}, 900);
     }} catch (e) {{}}
   }}
+  function setCopilotAskBusy(busy, hint) {{
+    var dialog = document.querySelector("#copilot-ask-modal .modal-dialog-ask");
+    var aEl = document.getElementById("copilot-ask-answer");
+    var submit = document.getElementById("copilot-ask-submit");
+    var cancel = document.getElementById("copilot-ask-cancel");
+    var wait = document.getElementById("copilot-ask-waiting");
+    var hintEl = document.getElementById("copilot-ask-hint");
+    if (dialog) dialog.classList.toggle("is-busy", !!busy);
+    if (wait) wait.hidden = !busy;
+    if (aEl) aEl.disabled = !!busy;
+    if (submit) {{
+      submit.disabled = !!busy;
+      submit.hidden = !!busy;
+    }}
+    if (cancel) {{
+      cancel.disabled = !!busy;
+      cancel.hidden = !!busy;
+    }}
+    if (hintEl) hintEl.textContent = hint || (busy ? "Aguardando a IA…" : "");
+  }}
   function syncCopilotAsk(data) {{
     if (typeof data.copilot_ask_sound !== "undefined") {{
       copilotAskSoundOn = !!data.copilot_ask_sound;
@@ -3515,15 +3545,19 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
     var ask = data.copilot_ask || null;
     if (ask && ask.id) {{
       var isNew = lastCopilotAskId !== ask.id;
+      var busy = ask.status === "awaiting_ai";
       qEl.textContent = ask.question || "";
       modal.hidden = false;
       if (isNew) {{
-        if (aEl) aEl.value = "";
+        if (aEl && !busy) aEl.value = "";
         lastCopilotAskId = ask.id;
-        if (copilotAskSoundOn) playCopilotAskSound(copilotAskSoundVol);
-        try {{ aEl && aEl.focus(); }} catch (e) {{}}
+        if (copilotAskSoundOn && !busy) playCopilotAskSound(copilotAskSoundVol);
+        try {{ if (!busy) aEl && aEl.focus(); }} catch (e) {{}}
       }}
+      if (busy && aEl && ask.answer) aEl.value = ask.answer;
+      setCopilotAskBusy(busy, ask.hint || (busy ? "Aguardando a IA…" : ""));
     }} else {{
+      setCopilotAskBusy(false, "");
       modal.hidden = true;
       lastCopilotAskId = null;
     }}
@@ -3544,9 +3578,15 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
       .then(function (res) {{
         var data = res.data || {{}};
         showNotice(data.notice || (data.ok ? "OK" : "Falha"), data.kind || (data.ok ? "success" : "error"));
+        if (path === "/copilot-ask-answer" && data.ok === false) {{
+          setCopilotAskBusy(false, "");
+        }}
         refresh();
       }})
-      .catch(function () {{ showNotice("Falha de comunicação com o painel.", "error"); }});
+      .catch(function () {{
+        if (path === "/copilot-ask-answer") setCopilotAskBusy(false, "");
+        showNotice("Falha de comunicação com o painel.", "error");
+      }});
   }}
   var appliedHashes = {{}};
   var worthPage = 1;
@@ -3892,6 +3932,7 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
         showNotice("Digite a resposta.", "warning");
         return;
       }}
+      setCopilotAskBusy(true, "Aguardando a IA…");
       postCopilotAsk("/copilot-ask-answer", {{ answer: answer }});
       return;
     }}
@@ -4398,7 +4439,7 @@ class Handler(BaseHTTPRequestHandler):
             ok = answer_ask(connect, ask_id, answer, now_iso=now_iso())
             if ok:
                 log_event("info", "copilot", f"Ask #{ask_id} respondida no painel.")
-                self.respond_notice("Resposta enviada ao copiloto e salva nos fatos.")
+                self.respond_notice("Resposta enviada — aguardando a IA (o modal fica aberto).")
             else:
                 self.respond_notice("Pergunta já respondida ou expirada.", notice_kind="warning", ok=False)
         elif path == "/copilot-ask-cancel":

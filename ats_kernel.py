@@ -234,11 +234,23 @@ def _apply_field(page, field: dict, rule: dict | None, ctx: ApplyContext) -> tup
             return (key, False)
     value = prepare_text_value(rule, str(value), field_hint)
     if mode == "salary":
+        from salary_review import finalize_salary_value
+
+        value = finalize_salary_value(
+            ctx.cfg,
+            field_hint=field_hint,
+            job_text=job_context_text((ctx.ai or {}).get("job")),
+            options=list(field.get("options") or []),
+            ai=ctx.ai if isinstance(ctx.ai, dict) else None,
+            fallback=str(value),
+        ) or str(value)
         # input de texto: digita no formato da moeda inferida. select nativo
         # (faixas): tenta casar; sem opcao compativel → humano decide.
         if field.get("tag") == "select":
             preferred = str(rule.get("value") or "").strip() or str(value)
             if safe_select(page, sel, field.get("options") or [], preferred):
+                return (key, True)
+            if str(value).strip() and safe_select(page, sel, field.get("options") or [], str(value)):
                 return (key, True)
             return (key, False)
         if safe_fill(page, sel, str(value)):

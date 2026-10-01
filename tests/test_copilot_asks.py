@@ -35,15 +35,34 @@ class CopilotAsksDbTests(unittest.TestCase):
         self.assertIsNotNone(pending)
         self.assertEqual(pending["id"], ask_id)
         self.assertEqual(pending["question"], "Qual seu GPA?")
+        self.assertEqual(pending["status"], copilot_asks.STATUS_PENDING)
 
         ok = copilot_asks.answer_ask(
             self._connect, ask_id, "3.8 / 4.0", now_iso="2026-10-01T12:01:00+00:00"
         )
         self.assertTrue(ok)
-        self.assertIsNone(copilot_asks.get_pending_ask(self._connect))
+        panel = copilot_asks.get_pending_ask(self._connect)
+        self.assertIsNotNone(panel)
+        self.assertEqual(panel["status"], copilot_asks.STATUS_AWAITING_AI)
         facts = copilot_asks.load_facts(self._connect, "pt")
         self.assertIn("Qual seu GPA?: 3.8 / 4.0", facts)
         self.assertIn("GPA", copilot_asks.load_facts(self._connect, "en"))
+
+        self.assertTrue(copilot_asks.complete_ask(self._connect, ask_id))
+        self.assertIsNone(copilot_asks.get_pending_ask(self._connect))
+
+    def test_hint_and_fail_ask(self) -> None:
+        ask_id = copilot_asks.create_ask(
+            self._connect, job_id=1, question="Visa?", now_iso="t0"
+        )
+        self.assertTrue(copilot_asks.answer_ask(self._connect, ask_id, "yes", now_iso="t1"))
+        copilot_asks.set_ask_hint(self._connect, ask_id, "Rate limit — nova tentativa em ~90s")
+        panel = copilot_asks.get_pending_ask(self._connect)
+        self.assertEqual(panel["hint"], "Rate limit — nova tentativa em ~90s")
+        self.assertTrue(copilot_asks.fail_ask(self._connect, ask_id))
+        self.assertIsNone(copilot_asks.get_pending_ask(self._connect))
+        row = copilot_asks.get_ask(self._connect, ask_id)
+        self.assertEqual(row["status"], copilot_asks.STATUS_FAILED_AI)
 
     def test_wait_returns_on_answer(self) -> None:
         ask_id = copilot_asks.create_ask(
@@ -73,7 +92,7 @@ class CopilotAsksDbTests(unittest.TestCase):
             sleep_fn=advance_sleep,
             monotonic_fn=mono,
         )
-        self.assertEqual(status, copilot_asks.STATUS_ANSWERED)
+        self.assertEqual(status, copilot_asks.STATUS_AWAITING_AI)
         self.assertEqual(answer, "UFMG")
 
     def test_cancel_then_wait(self) -> None:

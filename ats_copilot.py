@@ -40,6 +40,8 @@ UNAVAILABLE = "unavailable"  # IA nao configurada: segue o comportamento antigo 
 
 MAX_TURNS = 12  # cada turno = 1 chamada de IA + 1 acao; trava = bug, nao paciencia
 _TURN_PAUSE = (0.6, 1.6)
+#: teto de espera acumulada em retries de rate-limit (429/quota) no mesmo takeover
+AI_RATE_LIMIT_BUDGET_SECONDS = 600
 
 #: nunca clicados pelo copiloto - envio de candidatura fica com a politica do handler
 _SUBMIT_BLOCK_RE = re.compile(
@@ -77,10 +79,14 @@ Rules:
 - Prefer `field`/`button` indices from the page snapshot; they are stable handles.
 - Fill what you can from CANDIDATE FACTS + PANEL PROFILE + RESUME EXCERPT. Prefer
   PANEL PROFILE for city/salary/contact; prefer RESUME EXCERPT for education /
-  location_notes / work_authorization. If a required field is still missing, prefer
-  `ask` (human answers in the web panel; Chrome stays open) over `abort`. Only
-  `abort` when the human cancelled/timed out, or for legal consent you must not sign.
-  Never invent.
+  location_notes / work_authorization. For salary fields: panel salary_brl/usd are
+  MONTHLY; convert FX and match the field period (year/month/hour). Aim a bit below
+  local market for that country (~10–20%) because remote-from-abroad hiring is
+  cost-sensitive, but NEVER below the Brazil floor (converted). Prefer panel USD
+  remote anchor when present. Do not put N/A if a base salary exists.
+  If a required field is still missing, prefer `ask` (human answers in the web
+  panel; Chrome stays open) over `abort`. Only `abort` when the human
+  cancelled/timed out, or for legal consent you must not sign. Never invent.
 - For diversity/identity questions use only values you are explicitly given; if a
   legal consent box is the only blocker, use `abort` (we never sign terms for the
   person).
@@ -113,6 +119,12 @@ def panel_profile_block(cfg: dict | None) -> str:
         value = str(cfg.get(key) or "").strip()
         if value:
             lines.append(f"{label}: {value}")
+    if any(str(cfg.get(k) or "").strip() for k in ("salary_expectation_brl", "salary_expectation_usd")):
+        lines.append(
+            "salary_note: panel amounts are MONTHLY; convert FX; match field period "
+            "(year/month/hour); stay above Brazil floor and slightly under local market "
+            "for offshore/remote hires; prefer salary_usd when present"
+        )
     return "\n".join(lines)
 
 
@@ -417,6 +429,69 @@ def exec_action(page, context, action: str, args: dict, fields: list[dict]) -> t
 
 
 # ---------------------------------------------------------------------------
+# Retry de rate-limit (preserva history/facts no mesmo takeover)
+# ---------------------------------------------------------------------------
+
+def call_ai_with_rate_limit_retry(
+    *,
+    call_fn,
+    prompt: str,
+    provider: str,
+    model: str,
+    api_key: str,
+    history: list[str],
+    turn: int,
+    connect_fn=None,
+    open_ask_id: int | None = None,
+    budget_seconds: float = AI_RATE_LIMIT_BUDGET_SECONDS,
+    sleep_fn=time.sleep,
+    monotonic_fn=time.monotonic,
+    backoff_fn=None,
+) -> str:
+    """Chama a IA; em 429/quota espera e repete sem limpar o contexto.
+
+    Auth (401/403 sem rate-limit) propaga AiUnavailableError na hora.
+    """
+    from job_queue import backoff_seconds, is_rate_limit_error
+
+    if backoff_fn is None:
+        backoff_fn = backoff_seconds
+
+    deadline = monotonic_fn() + max(1.0, float(budget_seconds))
+    attempt = 0
+    while True:
+        try:
+            return call_fn(
+                prompt=prompt,
+                provider=provider,
+                model=model,
+                api_key=api_key,
+                max_output_tokens=700,
+                temperature=0.1,
+            )
+        except AiUnavailableError as exc:
+            if not is_rate_limit_error(exc):
+                raise
+            remaining = deadline - monotonic_fn()
+            if remaining <= 1:
+                raise
+            attempt += 1
+            delay = int(backoff_fn(attempt, rate_limited=True))
+            delay = max(1, min(delay, int(remaining)))
+            history.append(f"turn {turn}: rate-limit, retry {attempt} em ~{delay}s")
+            LOG.warning("copiloto: rate-limit (tentativa %s), espera %ss", attempt, delay)
+            if open_ask_id is not None and callable(connect_fn):
+                from copilot_asks import set_ask_hint
+
+                set_ask_hint(
+                    connect_fn,
+                    open_ask_id,
+                    f"Rate limit — nova tentativa em ~{delay}s",
+                )
+            sleep_fn(delay)
+
+
+# ---------------------------------------------------------------------------
 # Loop principal
 # ---------------------------------------------------------------------------
 
@@ -439,8 +514,18 @@ def copilot_takeover(page, context, *, reason: str, cfg: dict, ai: dict,
     resume_json = str(ai.get("resume_json") or "")
     history: list[str] = []
     active = page
+    open_ask_id: int | None = None
+    connect_fn = ai.get("connect_fn")
 
     from ai_client import call_ai_text
+
+    def _fail_open_ask() -> None:
+        nonlocal open_ask_id
+        if open_ask_id is not None and callable(connect_fn):
+            from copilot_asks import fail_ask
+
+            fail_ask(connect_fn, open_ask_id)
+            open_ask_id = None
 
     for turn in range(max_turns):
         try:
@@ -455,13 +540,30 @@ def copilot_takeover(page, context, *, reason: str, cfg: dict, ai: dict,
                 buttons=buttons, page_text=page_text, history=history,
                 panel_profile=panel_profile_block(cfg),
             )
-            raw = call_ai_text(prompt=prompt, provider=provider, model=model,
-                               api_key=api_key, max_output_tokens=700, temperature=0.1)
+            raw = call_ai_with_rate_limit_retry(
+                call_fn=call_ai_text,
+                prompt=prompt,
+                provider=provider,
+                model=model,
+                api_key=api_key,
+                history=history,
+                turn=turn,
+                connect_fn=connect_fn if callable(connect_fn) else None,
+                open_ask_id=open_ask_id,
+            )
         except AiUnavailableError as exc:
+            _fail_open_ask()
             return abort_close(active, context, f"IA indisponivel no meio do fluxo: {exc}")
         except Exception as exc:
             LOG.debug("copilot turn %d erro: %s", turn, exc)
+            _fail_open_ask()
             return abort_close(active, context, f"erro do copiloto: {exc}")
+
+        if open_ask_id is not None and callable(connect_fn):
+            from copilot_asks import complete_ask
+
+            complete_ask(connect_fn, open_ask_id)
+            open_ask_id = None
 
         act = extract_action(raw)
         if not act:
@@ -481,13 +583,13 @@ def copilot_takeover(page, context, *, reason: str, cfg: dict, ai: dict,
             return abort_close(active, context, why or "a IA nao conseguiu automatizar")
         if action == "ask":
             question = str(args.get("question") or why or "").strip()
-            connect_fn = ai.get("connect_fn")
             if not question:
                 history.append(f"turn {turn}: ask sem pergunta")
                 continue
             if not callable(connect_fn):
                 return abort_close(active, context, "ask sem connect_fn — " + question[:120])
             from copilot_asks import (
+                STATUS_AWAITING_AI,
                 STATUS_ANSWERED,
                 STATUS_CANCELLED,
                 create_ask,
@@ -513,7 +615,7 @@ def copilot_takeover(page, context, *, reason: str, cfg: dict, ai: dict,
             wait_min = max(3, min(45, wait_min))
             LOG.info("copiloto: perguntando no painel (ask #%s): %s", ask_id, question[:120])
             status, answer = wait_for_answer(connect_fn, ask_id, minutes=wait_min)
-            if status != STATUS_ANSWERED:
+            if status not in {STATUS_AWAITING_AI, STATUS_ANSWERED}:
                 label = "cancelado" if status == STATUS_CANCELLED else "timeout"
                 return abort_close(
                     active, context, f"humano {label} a pergunta do copiloto: {question[:120]}"
@@ -521,6 +623,7 @@ def copilot_takeover(page, context, *, reason: str, cfg: dict, ai: dict,
             lang = str((job or {}).get("language") or "en")
             facts = load_facts(connect_fn, lang) or (facts + f"\n{question}: {answer}").strip()
             history.append(f"turn {turn}: ask -> answered ({_clip(answer, 80)})")
+            open_ask_id = ask_id
             continue
         if action == "click" and target_is_submit(click_target_label(args, fields, buttons)):
             history.append(f"turn {turn}: recusado clique em botao de envio ({why})")
@@ -535,6 +638,7 @@ def copilot_takeover(page, context, *, reason: str, cfg: dict, ai: dict,
         LOG.info("copiloto: %s", history[-1])
         time.sleep(random.uniform(*_TURN_PAUSE))
 
+    _fail_open_ask()
     return abort_close(active, context, "copiloto esgotou os turnos sem destravar")
 
 
@@ -560,12 +664,14 @@ def abort_close(page, context, why: str) -> tuple[str, str, object]:
 __all__ = [
     "ABORTED",
     "ACTION_VOCAB",
+    "AI_RATE_LIMIT_BUDGET_SECONDS",
     "COPILOT_FAIL_PREFIX",
     "MAX_TURNS",
     "SOLVED",
     "UNAVAILABLE",
     "abort_close",
     "build_copilot_prompt",
+    "call_ai_with_rate_limit_retry",
     "click_target_label",
     "copilot_resume_excerpt",
     "copilot_takeover",

@@ -9,9 +9,13 @@ from typing import Callable
 LOG = logging.getLogger("job-scraper")
 
 STATUS_PENDING = "pending"
+STATUS_AWAITING_AI = "awaiting_ai"
 STATUS_ANSWERED = "answered"
 STATUS_EXPIRED = "expired"
 STATUS_CANCELLED = "cancelled"
+STATUS_FAILED_AI = "failed_ai"
+
+PANEL_OPEN_STATUSES = (STATUS_PENDING, STATUS_AWAITING_AI)
 
 ConnectFn = Callable[[], sqlite3.Connection]
 
@@ -24,10 +28,15 @@ def ensure_table(db: sqlite3.Connection) -> None:
           question TEXT NOT NULL,
           status TEXT NOT NULL DEFAULT 'pending',
           answer TEXT NOT NULL DEFAULT '',
+          hint TEXT NOT NULL DEFAULT '',
           created_at TEXT NOT NULL,
           answered_at TEXT NOT NULL DEFAULT ''
         )"""
     )
+    try:
+        db.execute("ALTER TABLE copilot_asks ADD COLUMN hint TEXT NOT NULL DEFAULT ''")
+    except sqlite3.OperationalError:
+        pass
 
 
 def create_ask(
@@ -42,26 +51,29 @@ def create_ask(
         raise ValueError("pergunta vazia")
     with connect_fn() as db:
         ensure_table(db)
-        # Uma pendente por vez: expira as anteriores.
+        # Uma aberta por vez: expira pending e awaiting_ai anteriores.
         db.execute(
-            "UPDATE copilot_asks SET status=? WHERE status=?",
-            (STATUS_EXPIRED, STATUS_PENDING),
+            f"UPDATE copilot_asks SET status=? WHERE status IN ({','.join('?' * len(PANEL_OPEN_STATUSES))})",
+            (STATUS_EXPIRED, *PANEL_OPEN_STATUSES),
         )
         cur = db.execute(
-            """INSERT INTO copilot_asks(job_id, question, status, answer, created_at, answered_at)
-               VALUES (?,?,?,?,?,?)""",
-            (job_id, q, STATUS_PENDING, "", now_iso, ""),
+            """INSERT INTO copilot_asks(job_id, question, status, answer, hint, created_at, answered_at)
+               VALUES (?,?,?,?,?,?,?)""",
+            (job_id, q, STATUS_PENDING, "", "", now_iso, ""),
         )
         return int(cur.lastrowid)
 
 
 def get_pending_ask(connect_fn: ConnectFn) -> dict | None:
+    """Ask visível no painel: pending (editável) ou awaiting_ai (spinner)."""
     with connect_fn() as db:
         ensure_table(db)
         row = db.execute(
-            """SELECT id, job_id, question, status, answer, created_at
-               FROM copilot_asks WHERE status=? ORDER BY id DESC LIMIT 1""",
-            (STATUS_PENDING,),
+            f"""SELECT id, job_id, question, status, answer, hint, created_at
+               FROM copilot_asks
+               WHERE status IN ({','.join('?' * len(PANEL_OPEN_STATUSES))})
+               ORDER BY id DESC LIMIT 1""",
+            PANEL_OPEN_STATUSES,
         ).fetchone()
     if not row:
         return None
@@ -71,6 +83,7 @@ def get_pending_ask(connect_fn: ConnectFn) -> dict | None:
         "question": row["question"],
         "status": row["status"],
         "answer": row["answer"],
+        "hint": row["hint"] or "",
         "created_at": row["created_at"],
     }
 
@@ -79,7 +92,7 @@ def get_ask(connect_fn: ConnectFn, ask_id: int) -> dict | None:
     with connect_fn() as db:
         ensure_table(db)
         row = db.execute(
-            """SELECT id, job_id, question, status, answer, created_at, answered_at
+            """SELECT id, job_id, question, status, answer, hint, created_at, answered_at
                FROM copilot_asks WHERE id=?""",
             (ask_id,),
         ).fetchone()
@@ -126,12 +139,41 @@ def answer_ask(
         if not row or row["status"] != STATUS_PENDING:
             return False
         db.execute(
-            "UPDATE copilot_asks SET status=?, answer=?, answered_at=? WHERE id=?",
-            (STATUS_ANSWERED, text, now_iso, ask_id),
+            """UPDATE copilot_asks SET status=?, answer=?, hint=?, answered_at=? WHERE id=?""",
+            (STATUS_AWAITING_AI, text, "", now_iso, ask_id),
         )
         question = row["question"]
     append_facts_both(connect_fn, question=question, answer=text)
     return True
+
+
+def set_ask_hint(connect_fn: ConnectFn, ask_id: int, hint: str) -> None:
+    with connect_fn() as db:
+        ensure_table(db)
+        db.execute(
+            "UPDATE copilot_asks SET hint=? WHERE id=? AND status=?",
+            ((hint or "").strip()[:240], ask_id, STATUS_AWAITING_AI),
+        )
+
+
+def complete_ask(connect_fn: ConnectFn, ask_id: int) -> bool:
+    with connect_fn() as db:
+        ensure_table(db)
+        cur = db.execute(
+            "UPDATE copilot_asks SET status=?, hint=? WHERE id=? AND status=?",
+            (STATUS_ANSWERED, "", ask_id, STATUS_AWAITING_AI),
+        )
+        return cur.rowcount > 0
+
+
+def fail_ask(connect_fn: ConnectFn, ask_id: int) -> bool:
+    with connect_fn() as db:
+        ensure_table(db)
+        cur = db.execute(
+            "UPDATE copilot_asks SET status=?, hint=? WHERE id=? AND status=?",
+            (STATUS_FAILED_AI, "", ask_id, STATUS_AWAITING_AI),
+        )
+        return cur.rowcount > 0
 
 
 def cancel_ask(connect_fn: ConnectFn, ask_id: int) -> bool:
@@ -169,16 +211,16 @@ def wait_for_answer(
     sleep_fn=time.sleep,
     monotonic_fn=time.monotonic,
 ) -> tuple[str, str]:
-    """Espera answered/cancelled/expired. Retorna (status, answer)."""
+    """Espera awaiting_ai/answered/cancelled/expired. Retorna (status, answer)."""
     deadline = monotonic_fn() + max(0.5, float(minutes)) * 60.0
     while monotonic_fn() < deadline:
         row = get_ask(connect_fn, ask_id)
         if not row:
             return STATUS_EXPIRED, ""
         st = row["status"]
-        if st == STATUS_ANSWERED:
-            return STATUS_ANSWERED, row.get("answer") or ""
-        if st in {STATUS_CANCELLED, STATUS_EXPIRED}:
+        if st in {STATUS_AWAITING_AI, STATUS_ANSWERED}:
+            return st, row.get("answer") or ""
+        if st in {STATUS_CANCELLED, STATUS_EXPIRED, STATUS_FAILED_AI}:
             return st, ""
         sleep_fn(poll_s)
     expire_ask(connect_fn, ask_id)
@@ -187,17 +229,22 @@ def wait_for_answer(
 
 __all__ = [
     "STATUS_ANSWERED",
+    "STATUS_AWAITING_AI",
     "STATUS_CANCELLED",
     "STATUS_EXPIRED",
+    "STATUS_FAILED_AI",
     "STATUS_PENDING",
     "answer_ask",
     "append_facts_both",
     "cancel_ask",
+    "complete_ask",
     "create_ask",
     "ensure_table",
     "expire_ask",
+    "fail_ask",
     "get_ask",
     "get_pending_ask",
     "load_facts",
+    "set_ask_hint",
     "wait_for_answer",
 ]

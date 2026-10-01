@@ -704,10 +704,31 @@ def _fill_modal_step(
             continue
 
         mode = str(rule["mode"])
+        if mode == "salary":
+            from salary_review import finalize_salary_value
+
+            value = finalize_salary_value(
+                cfg,
+                field_hint=field_hint,
+                job_text=job_context_text(job),
+                options=list(control.get("options") or []),
+                ai=ai_ctx if isinstance(ai_ctx, dict) else None,
+                fallback=str(value),
+            ) or str(value)
         try:
             if mode == "file" or ctype == "file":
                 locator.set_input_files(resume_path)
                 _human_pause(0.5, 1.2)
+            elif mode == "salary" and tag == "select":
+                options = control.get("options") or []
+                preferred = str(rule.get("value") or "").strip() or str(value)
+                chosen = pick_select_option(list(options), preferred) or pick_select_option(
+                    list(options), str(value)
+                )
+                if not chosen:
+                    return f"Select sem opção compatível para {rule['key']} (valor: {value})"
+                locator.select_option(label=chosen)
+                _human_pause(0.3, 0.8)
             elif tag == "select" or mode == "select":
                 options = control.get("options") or []
                 # faixa de select: texto digitado na regra vence; senao casa o

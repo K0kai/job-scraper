@@ -91,12 +91,13 @@ def resolve_rule_value(rule: sqlite3.Row | dict, cfg: dict[str, str], *, cover_l
     if mode == "file":
         return resume_path
     if mode == "salary":
-        currency = detect_salary_currency(field_hint, preferred=cfg.get("salary_currency_preference", ""))
-        regime = detect_contract_regime(field_hint, job_text)
-        value = salary_for(cfg, currency, regime=regime)
-        if not value and currency == "USD":  # so temos BRL configurado
-            value = salary_for(cfg, "BRL", regime=regime)
-        return value or str(rule["value"] or "")
+        from salary_policy import propose_salary
+
+        prop = propose_salary(cfg, field_hint=field_hint, job_text=job_text)
+        value = str(prop.get("formatted") or "")
+        if not value:
+            value = str(rule["value"] or "")
+        return value
     value_from = str(rule["value_from"] or "").strip()
     if value_from:
         return cfg.get(value_from, "") or str(rule["value"] or "")
@@ -104,31 +105,49 @@ def resolve_rule_value(rule: sqlite3.Row | dict, cfg: dict[str, str], *, cover_l
 
 
 # ---------------------------------------------------------------------------
-# Expectativa salarial — BRL × USD escolhidos pela moeda inferida do campo/vaga
+# Expectativa salarial — BRL/USD nativos; outras moedas via FX (API + cache)
 # ---------------------------------------------------------------------------
 
 #: ordem importa: explicito no hint > preferência do painel > padrão BRL.
 #: BRL primeiro — "R$ 0.000,00" tem '$', mas o R antes decide.
 _USD_HINT_RE = re.compile(r"\busd\b|u\.s\.d|\bdollar|\bd[eé]llar|us\$|us-?d[oó]lar|(?<!R)\$", re.I)
 _BRL_HINT_RE = re.compile(r"\bbrl\b|\br\$\b|reais|\breal\b|brazilian\s+real", re.I)
+_OTHER_CURRENCY_HINTS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("COP", re.compile(r"\bcop\b|colombian\s+peso|pesos?\s+colomb", re.I)),
+    ("EUR", re.compile(r"\beur\b|\beuro\b|€", re.I)),
+    ("GBP", re.compile(r"\bgbp\b|\bpound\b|£|british\s+pound", re.I)),
+    ("MXN", re.compile(r"\bmxn\b|mexican\s+peso|pesos?\s+mexican|pesos?\s+mx", re.I)),
+    ("ARS", re.compile(r"\bars\b|argentine\s+peso|pesos?\s+argentin", re.I)),
+    ("CLP", re.compile(r"\bclp\b|chilean\s+peso|pesos?\s+chilen", re.I)),
+    ("PEN", re.compile(r"\bpen\b|\bsol(?:es)?\b|peruvian", re.I)),
+    ("CAD", re.compile(r"\bcad\b|canadian\s+dollar", re.I)),
+    ("AUD", re.compile(r"\baud\b|australian\s+dollar", re.I)),
+)
 
 
 def detect_salary_currency(*hints: str, preferred: str = "") -> str:
-    """'USD' | 'BRL' a partir do texto do campo/vaga (label, placeholder, name).
+    """Código ISO da moeda a partir do texto do campo/vaga.
 
-    Placeholder 'R$ 0.000,00' → BRL; '$'/'USD'/'annual' → USD. Sem evidência,
-    respeita a preferência do painel; senão BRL (candidatura majoritariamente BR).
+    'R$' → BRL; 'pesos colombianos' → COP; '$'/'USD' → USD. Sem evidência,
+    respeita a preferência do painel; senão BRL.
     """
     hay = " ".join(h for h in hints if h)
     if _BRL_HINT_RE.search(hay):
         return "BRL"
+    for code, pattern in _OTHER_CURRENCY_HINTS:
+        if pattern.search(hay):
+            return code
     if _USD_HINT_RE.search(hay):
         return "USD"
     pref = (preferred or "").strip().casefold()
-    if pref in {"usd", "dollar", "dólar", "dolares", "dinheiro"}:
-        return "USD"
-    if pref in {"brl", "real", "reais"}:
-        return "BRL"
+    pref_map = {
+        "usd": "USD", "dollar": "USD", "dólar": "USD", "dolares": "USD", "dinheiro": "USD",
+        "brl": "BRL", "real": "BRL", "reais": "BRL",
+        "cop": "COP", "eur": "EUR", "euro": "EUR", "gbp": "GBP", "mxn": "MXN",
+        "ars": "ARS", "clp": "CLP", "pen": "PEN", "cad": "CAD", "aud": "AUD",
+    }
+    if pref in pref_map:
+        return pref_map[pref]
     return "BRL"
 
 
@@ -234,26 +253,67 @@ def job_context_text(job: dict | None, page_text: str = "") -> str:
     return " ".join(p for p in parts if p)
 
 
-def salary_for(cfg: dict[str, str], currency: str, *, regime: str | None = None) -> str:
-    """Pretensão do painel na moeda pedida. BRL = base CLT.
+def format_money(amount: float, currency: str) -> str:
+    """Formata valor arredondado com símbolo/código da moeda."""
+    code = (currency or "USD").upper()
+    n = max(0, int(round(amount)))
+    if code == "BRL":
+        return f"R$ {n:,}".replace(",", ".")
+    if code == "USD":
+        return f"$ {n:,}"
+    if code == "EUR":
+        return f"€ {n:,}".replace(",", " ")
+    if code == "GBP":
+        return f"£ {n:,}"
+    if code == "COP":
+        return f"COP {n:,}".replace(",", ".")
+    return f"{code} {n:,}"
 
-    `regime` (detecção da vaga) vence a preferência do painel: 'PJ' aplica o
-    multiplicador, 'CLT' não aplica. `regime=None` cai na preferência do painel.
-    USD ignora o multiplicador. Vazio = não configurado.
+
+def salary_for(cfg: dict[str, str], currency: str, *, regime: str | None = None) -> str:
+    """Pretensão do painel na moeda pedida.
+
+    BRL/USD: campos nativos (BRL aplica multiplicador PJ). Outras moedas: FX
+    automático (USD do painel → alvo; se só BRL, BRL → alvo via API).
     """
-    if currency == "USD":
+    code = (currency or "BRL").upper().strip() or "BRL"
+    if code == "USD":
         raw = (cfg.get("salary_expectation_usd") or "").strip()
         return format_usd(raw) if raw else ""
-    raw = (cfg.get("salary_expectation_brl") or "").strip()
-    if not raw:
+    if code == "BRL":
+        raw = (cfg.get("salary_expectation_brl") or "").strip()
+        if not raw:
+            return ""
+        base = _parse_amount(raw)
+        if base is None or base <= 0:
+            return format_brl(raw)
+        contractor = (regime == "PJ") if regime else _prefers_contractor(cfg)
+        if contractor:
+            base = base * _pj_multiplier(cfg)
+        return format_brl(str(base))
+
+    from fx_rates import convert_amount
+
+    usd_raw = (cfg.get("salary_expectation_usd") or "").strip()
+    brl_raw = (cfg.get("salary_expectation_brl") or "").strip()
+    amount = None
+    src = "USD"
+    if usd_raw:
+        amount = _parse_amount(usd_raw)
+        src = "USD"
+    elif brl_raw:
+        amount = _parse_amount(brl_raw)
+        src = "BRL"
+        if amount and amount > 0:
+            contractor = (regime == "PJ") if regime else _prefers_contractor(cfg)
+            if contractor:
+                amount = amount * _pj_multiplier(cfg)
+    if amount is None or amount <= 0:
         return ""
-    base = _parse_amount(raw)
-    if base is None or base <= 0:
-        return format_brl(raw)
-    contractor = (regime == "PJ") if regime else _prefers_contractor(cfg)
-    if contractor:
-        base = base * _pj_multiplier(cfg)
-    return format_brl(str(base))
+    converted = convert_amount(amount, src, code, cfg=cfg)
+    if converted is None or converted <= 0:
+        return ""
+    return format_money(converted, code)
 
 
 def format_cpf(value: str) -> str:
