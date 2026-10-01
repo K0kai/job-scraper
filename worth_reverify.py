@@ -19,12 +19,15 @@ ACTIVE = "active"
 UNKNOWN = "unknown"
 
 INACTIVE_RE = re.compile(
-    # LinkedIn EN: "applicants"; ATS/copy: "applications".
-    r"no\s+longer\s+accepting\s+(?:applications?|applicants?)|"
+    # LinkedIn EN: "applicants" / "applications" / "candidates".
+    r"no\s+longer\s+accept\w*\s+(?:applications?|applicants?|candidates?)|"
+    r"no\s+longer\s+open|"
     r"this\s+job\s+is\s+no\s+longer\s+available|"
     r"job\s+has\s+been\s+filled|"
     r"position\s+has\s+been\s+filled|"
-    # LinkedIn PT / ATS BR.
+    # LinkedIn PT banner real: "Não aceita mais candidaturas" (figcaption closed-job).
+    r"n[aã]o\s+aceita\s+mais\s+candidaturas|"
+    r"closed-job(?:__flavor)?|"
     r"esta\s+vaga\s+n[aã]o\s+est[aá]\s+mais\s+aceitando|"
     r"esta\s+vaga\s+n[aã]o\s+est[aá]\s+mais\s+dispon[ií]vel|"
     r"vaga\s+(encerrada|expirada|indispon[ií]vel)|"
@@ -64,10 +67,42 @@ DEFAULT_POLL_MS = 500
 # que o SPA LinkedIn costuma hidratar depois do Easy Apply de similares.
 ACTIVE_CONFIRM_GRACE_MS = 5_000
 
+LINKEDIN_JOB_ID_RE = re.compile(
+    r"linkedin\.com/(?:[\w.-]+/)?jobs/view/(?:[\w%-]*?-)?(\d+)",
+    re.I,
+)
+# Controles de candidatura no HTML guest (mais estáveis que o texto do botão).
+GUEST_APPLY_MARKERS = (
+    "public_jobs_apply-link-onsite",
+    "public_jobs_apply-link-offsite",
+    "job-details-topcard-apply-modal",
+    "topcard-apply",
+)
+
 
 def needs_browser_check(url: str) -> bool:
     host = (urlparse(url or "").netloc or "").casefold()
     return "linkedin.com" in host
+
+
+def extract_linkedin_job_id(url: str) -> str | None:
+    raw = (url or "").strip()
+    if not raw:
+        return None
+    m = LINKEDIN_JOB_ID_RE.search(raw)
+    if m:
+        return m.group(1)
+    try:
+        from urllib.parse import parse_qs, urlparse as _up
+
+        qs = parse_qs(_up(raw).query or "")
+        for key in ("currentJobId", "jobId", "trkJobId"):
+            vals = qs.get(key) or []
+            if vals and str(vals[0]).isdigit():
+                return str(vals[0])
+    except Exception:
+        pass
+    return None
 
 
 def classify_http(status: int, body: str) -> str:
@@ -85,10 +120,19 @@ def classify_http(status: int, body: str) -> str:
     return UNKNOWN
 
 
-def fetch_url_text(url: str, *, timeout: float = 20.0) -> tuple[int, str]:
+def fetch_url_text(
+    url: str,
+    *,
+    timeout: float = 20.0,
+    accept_language: str = "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+) -> tuple[int, str]:
     req = Request(
         url,
-        headers={"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml"},
+        headers={
+            "User-Agent": USER_AGENT,
+            "Accept": "text/html,application/xhtml+xml",
+            "Accept-Language": accept_language,
+        },
         method="GET",
     )
     try:
@@ -124,6 +168,29 @@ def check_http_liveness(url: str, *, timeout: float = 20.0) -> tuple[str, str]:
         return UNKNOWN, "falha de rede"
     verdict = classify_http(status, body)
     return verdict, f"HTTP {status}"
+
+
+def check_linkedin_guest_liveness(job_id: str, *, timeout: float = 20.0) -> tuple[str, str]:
+    """Checa vaga LinkedIn via endpoint guest (sem login). Preferível ao SPA."""
+    jid = str(job_id or "").strip()
+    if not jid.isdigit():
+        return UNKNOWN, "guest: job id inválido"
+    url = f"https://www.linkedin.com/jobs-guest/jobs/api/jobPosting/{jid}"
+    status, body = fetch_url_text(url, timeout=timeout)
+    if status == 0:
+        return UNKNOWN, "guest: falha de rede"
+    if status in {404, 410, 451}:
+        return INACTIVE, f"guest HTTP {status}"
+    if status >= 500 or status in {401, 403}:
+        return UNKNOWN, f"guest HTTP {status}"
+    verdict = classify_http(status, body)
+    if verdict == INACTIVE:
+        return INACTIVE, "guest: vaga fechada"
+    if any(marker in body for marker in GUEST_APPLY_MARKERS):
+        return ACTIVE, "guest: candidatura disponível"
+    if verdict == ACTIVE:
+        return ACTIVE, "guest: sinal de candidatura"
+    return UNKNOWN, f"guest HTTP {status} sem sinal claro"
 
 
 def page_has_load_error(body: str) -> bool:
@@ -359,6 +426,21 @@ def check_job_liveness(
         return UNKNOWN, "sem URL"
 
     if needs_browser_check(url):
+        job_id = extract_linkedin_job_id(url)
+        if job_id:
+            try:
+                guest_verdict, guest_detail = check_linkedin_guest_liveness(
+                    job_id, timeout=http_timeout
+                )
+            except Exception as exc:
+                guest_verdict, guest_detail = UNKNOWN, f"guest: {exc}"
+            if guest_verdict in {INACTIVE, ACTIVE}:
+                return guest_verdict, guest_detail
+            LOG.info(
+                "worth-reverify: guest inconclusivo job #%s (%s); caindo p/ browser",
+                job.get("id"),
+                guest_detail,
+            )
         if browser_session is not None:
             return browser_session.check_url(url)
         # Fallback isolado (testes / chamada avulsa): abre sessão só para esta URL.

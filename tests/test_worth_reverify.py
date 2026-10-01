@@ -52,6 +52,19 @@ class ClassifyHttpTests(unittest.TestCase):
             "inactive",
         )
 
+    def test_pt_nao_aceita_mais_candidaturas_is_inactive(self) -> None:
+        # Texto real do banner LinkedIn PT (não "não estamos mais aceitando").
+        body = (
+            '<figcaption class="closed-job__flavor--closed">'
+            "Não aceita mais candidaturas</figcaption>"
+            "<button>Candidatura simplificada</button>"
+        )
+        self.assertEqual(worth_reverify.classify_http(200, body), "inactive")
+
+    def test_closed_job_css_marker_is_inactive(self) -> None:
+        body = '<figure class="closed-job closed-job__flavor topcard__flavor-row"></figure>'
+        self.assertEqual(worth_reverify.classify_http(200, body), "inactive")
+
     def test_apply_signal_is_active(self) -> None:
         body = '<button>Easy Apply</button> Apply now for this role'
         self.assertEqual(worth_reverify.classify_http(200, body), "active")
@@ -62,6 +75,58 @@ class ClassifyHttpTests(unittest.TestCase):
     def test_linkedin_host_prefers_browser_even_if_http_active(self) -> None:
         self.assertTrue(worth_reverify.needs_browser_check("https://www.linkedin.com/jobs/view/123"))
         self.assertFalse(worth_reverify.needs_browser_check("https://boards.greenhouse.io/acme/jobs/1"))
+
+
+class LinkedInGuestTests(unittest.TestCase):
+    def test_extract_job_id_from_view_url(self) -> None:
+        self.assertEqual(
+            worth_reverify.extract_linkedin_job_id(
+                "https://www.linkedin.com/jobs/view/2000000000/"
+            ),
+            "2000000000",
+        )
+        self.assertEqual(
+            worth_reverify.extract_linkedin_job_id(
+                "https://www.linkedin.com/jobs/view/acme-dev-4192503234?refId=x"
+            ),
+            "4192503234",
+        )
+
+    def test_guest_closed_pt_banner(self) -> None:
+        html = (
+            '<figure class="closed-job">'
+            '<figcaption class="closed-job__flavor--closed">'
+            "Não aceita mais candidaturas</figcaption></figure>"
+        )
+        with mock.patch.object(
+            worth_reverify, "fetch_url_text", return_value=(200, html)
+        ):
+            verdict, detail = worth_reverify.check_linkedin_guest_liveness("2000000000")
+        self.assertEqual(verdict, "inactive")
+        self.assertIn("fechada", detail)
+
+    def test_guest_active_apply_marker(self) -> None:
+        html = '<a class="public_jobs_apply-link-onsite topcard-apply" href="#">Apply</a>'
+        with mock.patch.object(
+            worth_reverify, "fetch_url_text", return_value=(200, html)
+        ):
+            verdict, _detail = worth_reverify.check_linkedin_guest_liveness("4192503234")
+        self.assertEqual(verdict, "active")
+
+    def test_check_job_prefers_guest_over_browser(self) -> None:
+        job = {"id": 1, "url": "https://www.linkedin.com/jobs/view/2000000000"}
+        with mock.patch.object(
+            worth_reverify,
+            "check_linkedin_guest_liveness",
+            return_value=("inactive", "guest: vaga fechada"),
+        ) as guest, mock.patch.object(
+            worth_reverify, "LinkedInLivenessSession"
+        ) as session_cls:
+            verdict, detail = worth_reverify.check_job_liveness(job)
+        self.assertEqual(verdict, "inactive")
+        self.assertIn("guest", detail)
+        guest.assert_called_once()
+        session_cls.assert_not_called()
 
 
 class BrowserWaitTests(unittest.TestCase):
@@ -319,6 +384,8 @@ class ReverifyBatchTests(unittest.TestCase):
 
         with mock.patch.object(
             worth_reverify, "LinkedInLivenessSession", FakeSession
+        ), mock.patch.object(
+            worth_reverify, "check_linkedin_guest_liveness", return_value=("unknown", "guest skip")
         ), mock.patch.object(
             worth_reverify, "check_http_liveness", return_value=("unknown", "HTTP 999")
         ):
