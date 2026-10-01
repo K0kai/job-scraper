@@ -2425,23 +2425,49 @@ def queue_html(limit: int = 100) -> str:
 
 
 WORTH_PAGE_SIZE = 15
-WORTH_SORT_MATCH = "match"  # alias: match DESC (default)
+WORTH_SORT_NONE = ""
 WORTH_SORT_MATCH_ASC = "match_asc"
-WORTH_SORT_SEEN_DESC = "seen_desc"
+WORTH_SORT_MATCH_DESC = "match_desc"
 WORTH_SORT_SEEN_ASC = "seen_asc"
+WORTH_SORT_SEEN_DESC = "seen_desc"
+WORTH_SORT_POSTED_ASC = "posted_asc"
+WORTH_SORT_POSTED_DESC = "posted_desc"
+# Legado do select antigo.
+WORTH_SORT_MATCH = WORTH_SORT_MATCH_DESC
 WORTH_SORTS = {
-    WORTH_SORT_MATCH,
+    WORTH_SORT_NONE,
     WORTH_SORT_MATCH_ASC,
-    WORTH_SORT_SEEN_DESC,
+    WORTH_SORT_MATCH_DESC,
     WORTH_SORT_SEEN_ASC,
+    WORTH_SORT_SEEN_DESC,
+    WORTH_SORT_POSTED_ASC,
+    WORTH_SORT_POSTED_DESC,
 }
+WORTH_SORT_COLS = ("match", "seen", "posted")
 
 
 def normalize_worth_sort(sort: str | None) -> str:
     raw = (sort or "").strip().casefold()
-    if raw in {"match_desc", "score_desc"}:
-        return WORTH_SORT_MATCH
-    return raw if raw in WORTH_SORTS else WORTH_SORT_MATCH
+    if raw in {"match", "score_desc"}:
+        return WORTH_SORT_MATCH_DESC
+    if raw in WORTH_SORTS:
+        return raw
+    return WORTH_SORT_NONE
+
+
+def cycle_worth_sort(column: str, current: str | None) -> str:
+    """none → asc → desc → none (só uma coluna por vez)."""
+    col = (column or "").strip().casefold()
+    if col not in WORTH_SORT_COLS:
+        return WORTH_SORT_NONE
+    cur = normalize_worth_sort(current)
+    asc = f"{col}_asc"
+    desc = f"{col}_desc"
+    if cur == asc:
+        return desc
+    if cur == desc:
+        return WORTH_SORT_NONE
+    return asc
 
 
 def worth_order_sql(sort: str | None) -> str:
@@ -2452,7 +2478,28 @@ def worth_order_sql(sort: str | None) -> str:
         return "jobs.first_seen_at ASC, jobs.id DESC"
     if kind == WORTH_SORT_MATCH_ASC:
         return "COALESCE(match_score, 0) ASC, jobs.id DESC"
-    return "COALESCE(match_score, 0) DESC, jobs.id DESC"
+    if kind == WORTH_SORT_MATCH_DESC:
+        return "COALESCE(match_score, 0) DESC, jobs.id DESC"
+    if kind == WORTH_SORT_POSTED_ASC:
+        return (
+            "(CASE WHEN IFNULL(jobs.posted_at,'')='' THEN 1 ELSE 0 END) ASC, "
+            "jobs.posted_at ASC, jobs.id DESC"
+        )
+    if kind == WORTH_SORT_POSTED_DESC:
+        return (
+            "(CASE WHEN IFNULL(jobs.posted_at,'')='' THEN 1 ELSE 0 END) ASC, "
+            "jobs.posted_at DESC, jobs.id DESC"
+        )
+    return "jobs.id DESC"
+
+
+def _worth_sort_indicator(sort: str, column: str) -> str:
+    kind = normalize_worth_sort(sort)
+    if kind == f"{column}_asc":
+        return " ↑"
+    if kind == f"{column}_desc":
+        return " ↓"
+    return ""
 
 
 def _parse_worth_day(raw: str | None) -> datetime | None:
@@ -2512,7 +2559,7 @@ def worth_html(
     page: int = 1,
     page_size: int = WORTH_PAGE_SIZE,
     min_match: int = 0,
-    sort: str = WORTH_SORT_MATCH,
+    sort: str = WORTH_SORT_NONE,
     date_from: str = "",
     date_to: str = "",
 ) -> str:
@@ -2522,7 +2569,6 @@ def worth_html(
     sort = normalize_worth_sort(sort)
     date_from = (date_from or "").strip()
     date_to = (date_to or "").strip()
-    # Se from > to, troca para não devolver lista vazia por engano.
     if date_from and date_to and date_from > date_to:
         date_from, date_to = date_to, date_from
     offset = (page - 1) * page_size
@@ -2559,74 +2605,8 @@ def worth_html(
             [*params, page_size, offset],
         ).fetchall()
 
-    sort_opts = [
-        (WORTH_SORT_MATCH, "Match (maior → menor)"),
-        (WORTH_SORT_MATCH_ASC, "Match (menor → maior)"),
-        (WORTH_SORT_SEEN_DESC, "Encontrada (mais recente)"),
-        (WORTH_SORT_SEEN_ASC, "Encontrada (mais antiga)"),
-    ]
-    sort_html = "".join(
-        f'<option value="{esc(value)}"{" selected" if value == sort else ""}>{esc(label)}</option>'
-        for value, label in sort_opts
-    )
-    filter_bar = (
-        '<div class="worth-filters actions" style="margin:0 0 12px;align-items:flex-end;flex-wrap:wrap">'
-        '<label style="margin:0">Match mínimo (%)'
-        f'<input type="number" id="worth-min-match" min="0" max="100" step="1" value="{min_match}" '
-        'style="width:88px;margin-top:4px"></label>'
-        '<label style="margin:0">Ordenar'
-        f'<select id="worth-sort" style="margin-top:4px;min-width:200px">{sort_html}</select></label>'
-        '<label style="margin:0">Encontrada de'
-        f'<input type="date" id="worth-date-from" value="{esc(date_from)}" style="margin-top:4px"></label>'
-        '<label style="margin:0">até'
-        f'<input type="date" id="worth-date-to" value="{esc(date_to)}" style="margin-top:4px"></label>'
-        '<button type="button" class="subtle" id="worth-apply-filter">Filtrar</button>'
-        "".join(
-            f'<button type="button" class="subtle worth-match-preset" data-worth-min-match="{n}">'
-            f'{"Todos" if n == 0 else f"{n}+"}</button>'
-            for n in (0, 70, 80, 90)
-        )
-        + '<span class="worth-ignore-all-wrap" style="margin-left:auto">'
-        '<button type="button" class="subtle" id="worth-ignore-all">Ignorar todas</button>'
-        '<span id="worth-ignore-all-confirm" hidden style="display:none;align-items:center;gap:8px;flex-wrap:wrap">'
-        '<span class="hint" style="margin:0;color:#ffd54a">Tem certeza? Isso ignora todas as vagas em Vale a pena olhar.</span>'
-        '<button type="button" class="stop" id="worth-ignore-all-yes">Confirmar</button>'
-        '<button type="button" class="subtle" id="worth-ignore-all-no">Cancelar</button>'
-        "</span></span>"
-        + "</div>"
-    )
-
-    def _filter_note() -> str:
-        bits: list[str] = []
-        if min_match > 0:
-            bits.append(f"match ≥ {min_match}")
-        if date_from or date_to:
-            bits.append(f"encontrada {date_from or '…'} → {date_to or '…'}")
-        if sort == WORTH_SORT_SEEN_DESC:
-            bits.append("ordem: encontrada ↓")
-        elif sort == WORTH_SORT_SEEN_ASC:
-            bits.append("ordem: encontrada ↑")
-        elif sort == WORTH_SORT_MATCH_ASC:
-            bits.append("ordem: match ↑")
-        elif sort == WORTH_SORT_MATCH:
-            bits.append("ordem: match ↓")
-        return (" · " + " · ".join(bits)) if bits else ""
-
-    if total == 0:
-        empty = (
-            '<div data-worth-current="1">'
-            '<p class="hint">Nenhuma vaga neste filtro. '
-            + (
-                "Ajuste match, datas ou limpe o filtro."
-                if min_match > 0 or date_from or date_to
-                else "Quando houver bom match mas LinkedIn, falha de formulário/e-mail, a vaga aparece aqui."
-            )
-            + "</p></div>"
-        )
-        return filter_bar + empty
-
-    pages = max(1, (total + page_size - 1) // page_size)
-    if page > pages:
+    pages = max(1, (total + page_size - 1) // page_size) if total else 1
+    if total and page > pages:
         page = pages
         offset = (page - 1) * page_size
         with connect() as db:
@@ -2641,14 +2621,91 @@ def worth_html(
                 [*params, page_size, offset],
             ).fetchall()
 
-    cards = []
+    def _th(col: str, label: str) -> str:
+        ind = _worth_sort_indicator(sort, col)
+        active = " worth-sort-active" if ind else ""
+        return (
+            f'<th><button type="button" class="worth-sort-th{active}" '
+            f'data-worth-sort-col="{esc(col)}">{esc(label)}'
+            f'<span class="worth-sort-ind">{esc(ind)}</span></button></th>'
+        )
+
+    filter_bits: list[str] = [
+        '<div class="worth-filters">',
+        '<label class="worth-filter-item">Match mín. %'
+        f'<input type="number" id="worth-min-match" min="0" max="100" step="1" value="{min_match}"></label>',
+        '<label class="worth-filter-item">De'
+        f'<input type="date" id="worth-date-from" value="{esc(date_from)}"></label>',
+        '<label class="worth-filter-item">Até'
+        f'<input type="date" id="worth-date-to" value="{esc(date_to)}"></label>',
+        '<button type="button" class="subtle" id="worth-apply-filter">Aplicar</button>',
+    ]
+    for n in (0, 70, 80, 90):
+        label = "Todos" if n == 0 else f"{n}+"
+        filter_bits.append(
+            f'<button type="button" class="subtle worth-match-preset" data-worth-min-match="{n}">{label}</button>'
+        )
+    filter_bits.append(
+        '<span class="worth-ignore-all-wrap">'
+        '<button type="button" class="subtle" id="worth-ignore-all">Ignorar todas</button>'
+        '<span id="worth-ignore-all-confirm" hidden class="worth-ignore-confirm">'
+        '<span class="hint" style="margin:0;color:#ffd54a">Ignorar todas?</span>'
+        '<button type="button" class="stop" id="worth-ignore-all-yes">Confirmar</button>'
+        '<button type="button" class="subtle" id="worth-ignore-all-no">Cancelar</button>'
+        "</span></span>"
+    )
+    note_bits: list[str] = []
+    if min_match > 0:
+        note_bits.append(f"match ≥ {min_match}")
+    if date_from or date_to:
+        note_bits.append(f"encontrada {date_from or '…'} → {date_to or '…'}")
+    if total:
+        start = offset + 1
+        end = offset + len(rows)
+        note_bits.insert(0, f"{start}–{end} de {total}")
+    else:
+        note_bits.insert(0, "0 vagas")
+    pager = (
+        f'<div class="worth-pager" data-worth-pages="{pages}" data-worth-current="{page}">'
+        f'<span class="hint">{esc(" · ".join(note_bits))}</span>'
+        '<span class="worth-pager-btns">'
+    )
+    if page > 1:
+        pager += f'<button type="button" class="subtle" data-worth-page="{page - 1}">‹</button>'
+    else:
+        pager += '<button type="button" class="subtle" disabled>‹</button>'
+    pager += f'<span class="hint" style="margin:0">{page}/{pages}</span>'
+    if page < pages and total:
+        pager += f'<button type="button" class="subtle" data-worth-page="{page + 1}">›</button>'
+    else:
+        pager += '<button type="button" class="subtle" disabled>›</button>'
+    pager += "</span></div>"
+    filter_bits.append(pager)
+    filter_bits.append("</div>")
+    toolbar = "".join(filter_bits)
+
+    if total == 0:
+        empty = (
+            '<div data-worth-current="1" class="table-wrap">'
+            '<p class="hint" style="padding:16px">Nenhuma vaga neste filtro. '
+            + (
+                "Ajuste match, datas ou limpe o filtro."
+                if min_match > 0 or date_from or date_to
+                else "Quando houver bom match mas LinkedIn, falha de formulário/e-mail, a vaga aparece aqui."
+            )
+            + "</p></div>"
+        )
+        return toolbar + empty
+
     cfg = settings()
     easy_on = cfg.get("linkedin_easy_apply") == "1" and cfg.get("linkedin_risk_ack") == "1"
+    body_rows: list[str] = []
     for job in rows:
         score = job["match_score"]
-        score_label = f"{int(score)}/100" if score is not None else "—"
+        score_label = f"{int(score)}" if score is not None else "—"
         desc = re.sub(r"<[^>]+>", " ", job["description"] or "")[:1200]
         letter = job["cover_letter"] or ""
+        notes = job["notes"] or ""
         linkedin = is_assisted_apply_job(dict(job))
         easy_btn = ""
         if linkedin:
@@ -2656,59 +2713,54 @@ def worth_html(
                 easy_btn = (
                     f'<form method="post" action="/worth-easy-apply" class="js-process-form" style="display:inline">'
                     f'<input type="hidden" name="id" value="{int(job["id"])}">'
-                    f'<button type="submit" class="red-accent-button" '
-                    f'title="LinkedIn Easy Apply ou Apply→InHire; você confirma envio/captcha">'
-                    f'Easy Apply</button></form>'
+                    f'<button type="submit" class="red-accent-button" title="Easy Apply">'
+                    f"Easy Apply</button></form>"
                 )
             else:
                 easy_btn = (
-                    '<button type="button" class="subtle" disabled '
-                    'title="Ative Easy Apply + aceite de risco em Perfil/IA">Easy Apply (desligado)</button>'
+                    '<button type="button" class="subtle" disabled title="Ative Easy Apply + risco">EA off</button>'
                 )
-        cards.append(
-            f'<article class="worth-card">'
-            f'<div class="worth-head"><a class="job-title" href="{esc(job["url"])}" target="_blank" rel="noreferrer">{esc(job["title"])}</a>'
-            f'<span class="analysis-badge analysis-ok">Match {esc(score_label)}</span></div>'
-            f'<p class="hint"><strong>{esc(job["company"])}</strong> · {esc(job["location"])} · {esc(job["source"])} · '
-            f'publicada {esc(format_brasilia(job["posted_at"] or job["first_seen_at"]))} · '
-            f'encontrada {esc(format_brasilia(job["first_seen_at"]))}</p>'
-            f'{_notes_html(job["notes"] or "")}'
-            f'<p><a href="{esc(job["url"])}" target="_blank" rel="noreferrer">Abrir vaga para candidatura manual</a></p>'
-            f'<details><summary>Descrição</summary><div class="description">{esc(desc)}</div></details>'
-            f'<details><summary>{"Carta pronta para copiar" if letter else "Sem carta"}</summary><div class="description">{esc(letter or "—")}</div></details>'
-            f'<div class="actions">'
-            f"{easy_btn}"
+        posted_raw = (job["posted_at"] or "").strip()
+        posted_label = format_brasilia(posted_raw) if posted_raw else "—"
+        seen_label = format_brasilia(job["first_seen_at"])
+        details = (
+            "<details class=\"worth-details\"><summary>Abrir</summary>"
+            f"{_notes_html(notes) if notes else ''}"
+            f'<p class="hint"><strong>Descrição</strong></p><div class="description">{esc(desc or "—")}</div>'
+            f'<p class="hint"><strong>Carta</strong></p><div class="description">{esc(letter or "—")}</div>'
+            "</details>"
+        )
+        body_rows.append(
+            "<tr>"
+            f'<td class="worth-match">{esc(score_label)}</td>'
+            f'<td><a class="job-title" href="{esc(job["url"])}" target="_blank" rel="noreferrer">{esc(job["title"])}</a>'
+            f'<div class="hint">{esc(job["company"])} · {esc(job["location"])}</div></td>'
+            f"<td>{esc(job['source'])}</td>"
+            f"<td>{esc(seen_label)}</td>"
+            f"<td>{esc(posted_label)}</td>"
+            f"<td>{details}</td>"
+            f'<td class="worth-actions">{easy_btn}'
             f'<form method="post" action="/job-status" class="js-process-form" style="display:inline">'
             f'<input type="hidden" name="id" value="{int(job["id"])}">'
-            f'<button class="subtle" name="status" value="applied" type="submit">Marcar como aplicada</button>'
+            f'<button class="subtle" name="status" value="applied" type="submit">Aplicada</button>'
             f'<button class="subtle" name="status" value="ignored" type="submit">Ignorar</button>'
             f'<button class="subtle" name="status" value="saved" type="submit">Salvar</button>'
-            f"</form></div></article>"
+            f"</form></td></tr>"
         )
-    start = offset + 1
-    end = offset + len(rows)
-    filter_note = _filter_note()
-    pager_bits = [
-        f'<div class="worth-pager" data-worth-pages="{pages}" data-worth-current="{page}">'
-        f'<span class="hint">Mostrando {start}–{end} de {total}{filter_note}</span>'
-        '<div class="actions" style="margin-top:0">'
-    ]
-    if page > 1:
-        pager_bits.append(
-            f'<button type="button" class="subtle" data-worth-page="{page - 1}">Anterior</button>'
-        )
-    else:
-        pager_bits.append('<button type="button" class="subtle" disabled>Anterior</button>')
-    pager_bits.append(f'<span class="hint" style="margin:0">Página {page} / {pages}</span>')
-    if page < pages:
-        pager_bits.append(
-            f'<button type="button" class="subtle" data-worth-page="{page + 1}">Próxima</button>'
-        )
-    else:
-        pager_bits.append('<button type="button" class="subtle" disabled>Próxima</button>')
-    pager_bits.append("</div></div>")
-    pager = "".join(pager_bits)
-    return filter_bar + pager + '<div class="worth-list">' + "".join(cards) + "</div>" + pager
+
+    table = (
+        '<div class="table-wrap worth-table-wrap">'
+        "<table class=\"worth-table\"><thead><tr>"
+        + _th("match", "Match")
+        + "<th>Vaga</th><th>Fonte</th>"
+        + _th("seen", "Encontrada")
+        + _th("posted", "Publicada")
+        + "<th>Detalhes</th><th>Ações</th>"
+        + "</tr></thead><tbody>"
+        + "".join(body_rows)
+        + "</tbody></table></div>"
+    )
+    return toolbar + table
 
 
 def state_label_for(state: str) -> str:
@@ -2739,7 +2791,7 @@ def live_payload(
     *,
     worth_page: int = 1,
     worth_min_match: int = 0,
-    worth_sort: str = WORTH_SORT_MATCH,
+    worth_sort: str = WORTH_SORT_NONE,
     worth_date_from: str = "",
     worth_date_to: str = "",
 ) -> dict:
@@ -3098,10 +3150,26 @@ color:#c9c9d1;border:1px solid var(--line);border-radius:10px;padding:12px;max-h
 .usage-bar{height:8px;border-radius:999px;background:#1a1a1e;overflow:hidden;margin-top:8px}
 .usage-bar-fill{height:100%;background:var(--ok);border-radius:999px}
 .usage-bar-fill.warn{background:var(--warn)}
+.worth-filters{display:flex;flex-wrap:nowrap;align-items:flex-end;gap:10px;margin:0 0 14px;overflow-x:auto;padding-bottom:2px}
+.worth-filter-item{margin:0;display:flex;flex-direction:column;gap:4px;font-size:11px;color:var(--muted2);white-space:nowrap}
+.worth-filter-item input{margin:0;min-width:0;width:118px}
+.worth-ignore-all-wrap{margin-left:auto;display:inline-flex;align-items:center;gap:8px;flex-shrink:0}
+.worth-ignore-confirm{display:inline-flex;align-items:center;gap:8px}
+.worth-pager{display:inline-flex;align-items:center;gap:8px;flex-shrink:0;margin-left:4px}
+.worth-pager-btns{display:inline-flex;align-items:center;gap:6px}
+.worth-table th button.worth-sort-th{background:none;border:0;color:inherit;font:inherit;font-weight:700;letter-spacing:.08em;text-transform:uppercase;cursor:pointer;padding:0;display:inline-flex;align-items:center;gap:4px}
+.worth-table th button.worth-sort-th:hover{color:var(--white)}
+.worth-sort-active{color:var(--white)!important}
+.worth-sort-ind{font-size:12px;opacity:.9}
+.worth-match{font-weight:700;white-space:nowrap}
+.worth-actions{white-space:nowrap}
+.worth-actions form{display:inline}
+.worth-details{font-size:12.5px}
+.worth-table-wrap{margin-top:0}
 .worth-list{display:grid;gap:14px}
 .worth-card{border:1px solid var(--line);border-radius:12px;padding:15px;background:var(--panel)}
 .worth-head{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap}
-.worth-pager{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin:8px 0 14px}
+@media(max-width:900px){.worth-filters{flex-wrap:wrap}}
 .tab-panel{display:none}
 .tab-panel.active{display:block}
 .subtle{color:var(--muted)}
@@ -3249,7 +3317,7 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
   var appliedHashes = {{}};
   var worthPage = 1;
   var worthMinMatch = 0;
-  var worthSort = "match";
+  var worthSort = "";
   var worthDateFrom = "";
   var worthDateTo = "";
   var worthForceUpdate = false;
@@ -3258,8 +3326,10 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
     if (savedPage > 0) worthPage = savedPage;
     var savedMin = parseInt(localStorage.getItem("radar-worth-min-match"), 10);
     if (!isNaN(savedMin)) worthMinMatch = Math.max(0, Math.min(100, savedMin));
-    var savedSort = localStorage.getItem("radar-worth-sort") || "";
-    if (savedSort) worthSort = savedSort;
+    var savedSort = localStorage.getItem("radar-worth-sort");
+    if (savedSort === null || typeof savedSort === "undefined") worthSort = "";
+    else if (savedSort === "match") worthSort = "match_desc";
+    else worthSort = savedSort;
     worthDateFrom = localStorage.getItem("radar-worth-date-from") || "";
     worthDateTo = localStorage.getItem("radar-worth-date-to") || "";
   }} catch (e) {{}}
@@ -3267,23 +3337,29 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
     try {{
       localStorage.setItem("radar-worth-page", String(worthPage));
       localStorage.setItem("radar-worth-min-match", String(worthMinMatch));
-      localStorage.setItem("radar-worth-sort", String(worthSort || "match"));
+      localStorage.setItem("radar-worth-sort", String(worthSort || ""));
       localStorage.setItem("radar-worth-date-from", String(worthDateFrom || ""));
       localStorage.setItem("radar-worth-date-to", String(worthDateTo || ""));
     }} catch (e) {{}}
   }}
   function readWorthFilterInputs() {{
     var minEl = document.getElementById("worth-min-match");
-    var sortEl = document.getElementById("worth-sort");
     var fromEl = document.getElementById("worth-date-from");
     var toEl = document.getElementById("worth-date-to");
     if (minEl) {{
       var val = parseInt(minEl.value, 10);
       worthMinMatch = isNaN(val) ? 0 : Math.max(0, Math.min(100, val));
     }}
-    if (sortEl && sortEl.value) worthSort = sortEl.value;
     if (fromEl) worthDateFrom = fromEl.value || "";
     if (toEl) worthDateTo = toEl.value || "";
+  }}
+  function cycleWorthSort(col) {{
+    var asc = col + "_asc";
+    var desc = col + "_desc";
+    var cur = worthSort || "";
+    if (cur === asc) worthSort = desc;
+    else if (cur === desc) worthSort = "";
+    else worthSort = asc;
   }}
   function applyWorthFilters() {{
     readWorthFilterInputs();
@@ -3385,6 +3461,14 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
         applyWorthFilters();
         return;
       }}
+      var sortBtn = ev.target.closest("[data-worth-sort-col]");
+      if (sortBtn && worthBody.contains(sortBtn)) {{
+        cycleWorthSort(sortBtn.getAttribute("data-worth-sort-col") || "");
+        worthPage = 1;
+        persistWorthState();
+        requestWorthRefresh();
+        return;
+      }}
       if (ev.target && ev.target.id === "worth-ignore-all") {{
         setWorthIgnoreConfirm(true);
         return;
@@ -3415,12 +3499,6 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
       ev.preventDefault();
       applyWorthFilters();
     }});
-    worthBody.addEventListener("change", function (ev) {{
-      if (!ev.target) return;
-      if (ev.target.id === "worth-sort") {{
-        applyWorthFilters();
-      }}
-    }});
   }}
   function refresh() {{
     if (inFlight || document.hidden) return;
@@ -3428,7 +3506,7 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
     fetch(
       "/live?worth_page=" + encodeURIComponent(worthPage)
         + "&worth_min_match=" + encodeURIComponent(worthMinMatch)
-        + "&worth_sort=" + encodeURIComponent(worthSort || "match")
+        + "&worth_sort=" + encodeURIComponent(worthSort || "")
         + "&worth_date_from=" + encodeURIComponent(worthDateFrom || "")
         + "&worth_date_to=" + encodeURIComponent(worthDateTo || ""),
       {{ headers: {{ Accept: "application/json" }} }}
@@ -3456,7 +3534,7 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
         if (typeof data.worth_min_match !== "undefined") {{
           worthMinMatch = data.worth_min_match;
         }}
-        if (data.worth_sort) worthSort = data.worth_sort;
+        if (typeof data.worth_sort !== "undefined") worthSort = data.worth_sort || "";
         if (typeof data.worth_date_from !== "undefined") worthDateFrom = data.worth_date_from || "";
         if (typeof data.worth_date_to !== "undefined") worthDateTo = data.worth_date_to || "";
         persistWorthState();
@@ -3692,12 +3770,12 @@ class Handler(BaseHTTPRequestHandler):
             qs = parse_qs(parsed.query)
             worth_page = 1
             worth_min_match = 0
-            worth_sort = WORTH_SORT_MATCH
+            worth_sort = WORTH_SORT_NONE
             worth_date_from = ""
             worth_date_to = ""
             raw_page = (qs.get("worth_page") or ["1"])[0]
             raw_min = (qs.get("worth_min_match") or ["0"])[0]
-            raw_sort = (qs.get("worth_sort") or ["match"])[0]
+            raw_sort = (qs.get("worth_sort") or [""])[0]
             worth_date_from = (qs.get("worth_date_from") or [""])[0].strip()
             worth_date_to = (qs.get("worth_date_to") or [""])[0].strip()
             try:

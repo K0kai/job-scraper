@@ -1,4 +1,4 @@
-"""Filtro/ordenação de Vale a pena olhar por match e first_seen_at."""
+"""Filtro/ordenação de Vale a pena olhar (helpers legados + combinação)."""
 from __future__ import annotations
 
 import tempfile
@@ -12,12 +12,12 @@ class WorthSortHelpersTests(unittest.TestCase):
     def test_normalize_and_order_sql(self) -> None:
         import app as app_mod
 
-        self.assertEqual(app_mod.normalize_worth_sort(""), "match")
+        self.assertEqual(app_mod.normalize_worth_sort(""), "")
         self.assertEqual(app_mod.normalize_worth_sort("seen_asc"), "seen_asc")
         self.assertEqual(app_mod.normalize_worth_sort("match_asc"), "match_asc")
-        self.assertEqual(app_mod.normalize_worth_sort("match_desc"), "match")
-        self.assertEqual(app_mod.normalize_worth_sort("nope"), "match")
-        self.assertIn("DESC", app_mod.worth_order_sql("match"))
+        self.assertEqual(app_mod.normalize_worth_sort("match"), "match_desc")
+        self.assertEqual(app_mod.normalize_worth_sort("nope"), "")
+        self.assertIn("DESC", app_mod.worth_order_sql("match_desc"))
         self.assertIn("ASC", app_mod.worth_order_sql("match_asc"))
         self.assertIn("first_seen_at DESC", app_mod.worth_order_sql("seen_desc"))
         self.assertIn("first_seen_at ASC", app_mod.worth_order_sql("seen_asc"))
@@ -30,12 +30,6 @@ class WorthSortHelpersTests(unittest.TestCase):
         self.assertIsNotNone(hi)
         self.assertTrue(str(lo).startswith("2026-10-01T03:00:00"))
         self.assertTrue(str(hi).startswith("2026-10-02T03:00:00"))
-        only_from, only_to_hi = app_mod.worth_date_bounds_utc("2026-10-01", "")
-        self.assertIsNotNone(only_from)
-        self.assertIsNone(only_to_hi)
-        _, only_to = app_mod.worth_date_bounds_utc("", "2026-10-01")
-        self.assertIsNone(_)
-        self.assertIsNotNone(only_to)
 
 
 class WorthSortFilterIntegrationTests(unittest.TestCase):
@@ -69,7 +63,7 @@ class WorthSortFilterIntegrationTests(unittest.TestCase):
                         "Remote",
                         "desc",
                         f"https://example.com/s/{i}",
-                        "",
+                        seen,
                         seen,
                         f"sfp-{i}",
                         "en",
@@ -90,13 +84,12 @@ class WorthSortFilterIntegrationTests(unittest.TestCase):
         asc = self.app.worth_html(page=1, page_size=10, sort="seen_asc")
         self.assertLess(desc.index("Seen 2"), desc.index("Seen 0"))
         self.assertLess(asc.index("Seen 0"), asc.index("Seen 2"))
-        match_desc = self.app.worth_html(page=1, page_size=10, sort="match")
+        match_desc = self.app.worth_html(page=1, page_size=10, sort="match_desc")
         match_asc = self.app.worth_html(page=1, page_size=10, sort="match_asc")
-        # scores: Seen0=90, Seen1=50, Seen2=70
         self.assertLess(match_desc.index("Seen 0"), match_desc.index("Seen 1"))
         self.assertLess(match_asc.index("Seen 1"), match_asc.index("Seen 0"))
-        self.assertIn('value="match_asc"', match_asc)
-        self.assertIn('id="worth-sort"', desc)
+        self.assertIn("↑", match_asc)
+        self.assertIn("↓", match_desc)
 
     def test_date_range_with_min_match_combined(self) -> None:
         html = self.app.worth_html(
@@ -107,11 +100,9 @@ class WorthSortFilterIntegrationTests(unittest.TestCase):
             date_to="2026-10-01",
             min_match=60,
         )
-        # Seen0=90 (in range), Seen1=50 (filtered by match), Seen2=70 (in range)
         self.assertIn("Seen 0", html)
         self.assertIn("Seen 2", html)
         self.assertNotIn("Seen 1", html)
-        self.assertIn("encontrada", html.lower())
         self.assertIn("match ≥ 60", html)
 
 

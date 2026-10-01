@@ -38,10 +38,10 @@ class WorthPaginationTests(unittest.TestCase):
 
         page1 = app_mod.worth_html(page=1, page_size=10)
         page2 = app_mod.worth_html(page=2, page_size=10)
-        self.assertIn("Mostrando 1–10 de 18", page1)
-        self.assertIn("Mostrando 11–18 de 18", page2)
+        self.assertIn("1–10 de 18", page1)
+        self.assertIn("11–18 de 18", page2)
         self.assertIn('data-worth-page="2"', page1)
-        self.assertIn("Worth 17", page1)  # highest id first
+        self.assertIn("Worth 17", page1)  # highest id first (default)
         self.assertIn("Worth 0", page2)
         self.assertNotIn("Worth 0", page1)
 
@@ -62,6 +62,7 @@ class WorthPaginationTests(unittest.TestCase):
         self.assertNotIn("Worth 0", filtered)
         self.assertNotIn("Worth 1", filtered)
         self.assertIn("worth-min-match", filtered)
+        self.assertIn("<table", filtered)
 
 
 if __name__ == "__main__":
