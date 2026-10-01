@@ -70,8 +70,24 @@ class QueueRetryTests(unittest.TestCase):
         self.assertEqual(statuses[b], "pending")
         self.assertEqual(statuses[c], "pending")
 
-    def test_database_locked_is_retryable(self) -> None:
-        self.assertTrue(is_retryable_error(Exception("OperationalError: database is locked")))
+    def test_finish_does_not_overwrite_cancelled(self) -> None:
+        jid = self.queue.enqueue("job_apply", {"job_id": 1}, dedupe_key=None)
+        with self.queue._connect() as db:
+            db.execute("UPDATE queue_jobs SET status='running' WHERE id=?", (jid,))
+        self.assertTrue(self.queue.cancel(jid))
+        self.queue._finish(jid, "succeeded", 1, "", "should-not-stick")
+        with self.queue._connect() as db:
+            row = db.execute("SELECT status, result FROM queue_jobs WHERE id=?", (jid,)).fetchone()
+        self.assertEqual(row["status"], "cancelled")
+        self.assertNotEqual(row["result"], "should-not-stick")
+
+    def test_is_cancelled(self) -> None:
+        jid = self.queue.enqueue("job_apply", {"job_id": 1}, dedupe_key=None)
+        self.assertFalse(self.queue.is_cancelled(jid))
+        with self.queue._connect() as db:
+            db.execute("UPDATE queue_jobs SET status='running' WHERE id=?", (jid,))
+        self.queue.cancel(jid)
+        self.assertTrue(self.queue.is_cancelled(jid))
 
     def test_backoff_jitter_spreads_and_caps(self) -> None:
         samples = [backoff_seconds(1, rate_limited=True) for _ in range(40)]

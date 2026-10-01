@@ -1110,7 +1110,21 @@ def enqueue_worth_easy_apply(job_id: int) -> str:
 def handle_worth_reverify_job(payload: dict) -> str:
     from worth_reverify import format_summary, reverify_worth_jobs
 
-    summary = reverify_worth_jobs(connect, cfg=settings(), project_root=ROOT)
+    queue_job_id = payload.get("_queue_job_id")
+    try:
+        qid = int(queue_job_id) if queue_job_id is not None else None
+    except (TypeError, ValueError):
+        qid = None
+
+    def should_abort() -> bool:
+        return bool(qid is not None and queue.is_cancelled(qid))
+
+    summary = reverify_worth_jobs(
+        connect,
+        cfg=settings(),
+        project_root=ROOT,
+        should_abort=should_abort,
+    )
     msg = format_summary(summary)
     log_event("info", "worth-reverify", msg)
     return msg

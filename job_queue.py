@@ -307,6 +307,11 @@ class JobQueue:
             log_event("warning", "queue", f"Job #{job_id} cancelado.")
         return ok
 
+    def is_cancelled(self, job_id: int) -> bool:
+        with self._connect() as db:
+            row = db.execute("SELECT status FROM queue_jobs WHERE id=?", (job_id,)).fetchone()
+        return bool(row) and str(row["status"]) == "cancelled"
+
     def retry_now(self, job_id: int) -> bool:
         now = _utc_now()
         _, max_attempts, ttl_hours = self._limits()
@@ -449,6 +454,14 @@ class JobQueue:
             payload = json.loads(row["payload"] or "{}")
         except json.JSONDecodeError:
             payload = {}
+        if not isinstance(payload, dict):
+            payload = {"_raw": payload}
+        payload = dict(payload)
+        payload["_queue_job_id"] = job_id
+        # Se cancelaram entre claim e start, não começa.
+        if self.is_cancelled(job_id):
+            log_event("warning", "queue", f"Job #{job_id} ({kind}) já cancelado; não executa.")
+            return
         handler = self.handlers.get(kind)
         if not handler:
             self._finish(job_id, "failed", attempts, f"Handler ausente para {kind}", "")
@@ -462,6 +475,9 @@ class JobQueue:
             err = f"{exc.__class__.__name__}: {exc}"
             expires = _parse_iso(str(row.get("expires_at") or ""))
             retryable = is_retryable_error(exc)
+            if self.is_cancelled(job_id):
+                log_event("warning", "queue", f"Job #{job_id} ({kind}) cancelado durante execução.")
+                return
             if retryable and attempts < max_attempts and (expires is None or now < expires):
                 delay = backoff_seconds(attempts, rate_limited=is_rate_limit_error(exc))
                 next_run = _iso(now + timedelta(seconds=delay))
@@ -483,8 +499,9 @@ class JobQueue:
     def _finish(self, job_id: int, status: str, attempts: int, last_error: str, result: str) -> None:
         now = _iso(_utc_now())
         with self._connect() as db:
+            # Não sobrescreve cancelamento/manual mid-flight.
             db.execute(
                 """UPDATE queue_jobs SET status=?, attempts=?, last_error=?, result=?, updated_at=?
-                   WHERE id=?""",
+                   WHERE id=? AND status='running'""",
                 (status, attempts, last_error, result, now, job_id),
             )

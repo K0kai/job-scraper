@@ -34,6 +34,59 @@ class ClassifyHttpTests(unittest.TestCase):
         self.assertFalse(worth_reverify.needs_browser_check("https://boards.greenhouse.io/acme/jobs/1"))
 
 
+class BrowserWaitTests(unittest.TestCase):
+    def test_wait_returns_inactive_when_closed_copy_appears(self) -> None:
+        class FakePage:
+            def __init__(self):
+                self.n = 0
+                self.url = "https://www.linkedin.com/jobs/view/1"
+
+            def content(self):
+                self.n += 1
+                if self.n < 3:
+                    return "<html>loading</html>"
+                return "<html>This job is no longer accepting applications.</html>"
+
+            def wait_for_timeout(self, ms):
+                return None
+
+        verdict, _detail = worth_reverify.wait_page_liveness_signal(
+            FakePage(), timeout_ms=5_000, poll_ms=1
+        )
+        self.assertEqual(verdict, "inactive")
+
+    def test_wait_returns_active_on_easy_apply(self) -> None:
+        class FakePage:
+            url = "https://www.linkedin.com/jobs/view/2"
+
+            def content(self):
+                return '<button aria-label="Easy Apply">Easy Apply</button>'
+
+            def wait_for_timeout(self, ms):
+                return None
+
+        verdict, _detail = worth_reverify.wait_page_liveness_signal(
+            FakePage(), timeout_ms=2_000, poll_ms=1
+        )
+        self.assertEqual(verdict, "active")
+
+    def test_wait_unknown_on_timeout(self) -> None:
+        class FakePage:
+            url = "https://www.linkedin.com/jobs/view/3"
+
+            def content(self):
+                return "<html>still loading shell</html>"
+
+            def wait_for_timeout(self, ms):
+                return None
+
+        verdict, detail = worth_reverify.wait_page_liveness_signal(
+            FakePage(), timeout_ms=5, poll_ms=1
+        )
+        self.assertEqual(verdict, "unknown")
+        self.assertIn("timeout", detail.casefold())
+
+
 class ReverifyBatchTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -93,6 +146,85 @@ class ReverifyBatchTests(unittest.TestCase):
                         "",
                     ),
                 )
+
+    def test_batch_reuses_one_browser_session_for_linkedin(self) -> None:
+        """Várias vagas LI não devem abrir/fechar Chrome por URL."""
+        with self._connect() as db:
+            db.execute("DELETE FROM jobs")
+            for i in (1, 2, 3):
+                db.execute(
+                    """INSERT INTO jobs(id,source,source_id,title,company,location,description,url,
+                       posted_at,first_seen_at,fingerprint,language,language_confidence,status,notes)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        i,
+                        "t",
+                        f"li{i}",
+                        f"T{i}",
+                        "C",
+                        "R",
+                        "d",
+                        f"https://www.linkedin.com/jobs/view/{i}",
+                        "2026-01-01",
+                        "2026-01-01",
+                        f"fp{i}",
+                        "en",
+                        1.0,
+                        "worth",
+                        "",
+                    ),
+                )
+
+        launches = {"n": 0}
+        checks = {"urls": []}
+
+        class FakeSession:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def __enter__(self):
+                launches["n"] += 1
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def check_url(self, url):
+                checks["urls"].append(url)
+                return "active", "browser"
+
+        with mock.patch.object(
+            worth_reverify, "LinkedInLivenessSession", FakeSession
+        ), mock.patch.object(
+            worth_reverify, "check_http_liveness", return_value=("unknown", "HTTP 999")
+        ):
+            summary = worth_reverify.reverify_worth_jobs(self._connect)
+
+        self.assertEqual(launches["n"], 1)
+        self.assertEqual(len(checks["urls"]), 3)
+        self.assertEqual(summary["active"], 3)
+
+    def test_batch_stops_when_aborted(self) -> None:
+        seen = []
+
+        def fake_check(job, **_kwargs):
+            seen.append(int(job["id"]))
+            return "active", "ok"
+
+        calls = {"n": 0}
+
+        def abort_after_one() -> bool:
+            calls["n"] += 1
+            return calls["n"] > 1
+
+        with mock.patch.object(worth_reverify, "check_job_liveness", side_effect=fake_check):
+            summary = worth_reverify.reverify_worth_jobs(
+                self._connect, should_abort=abort_after_one
+            )
+
+        self.assertEqual(len(seen), 1)
+        self.assertTrue(summary.get("aborted"))
+        self.assertEqual(summary["checked"], 1)
 
     def test_batch_ignores_only_clear_inactive(self) -> None:
         def fake_check(job, **_kwargs):
