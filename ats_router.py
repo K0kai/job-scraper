@@ -240,6 +240,10 @@ def run_ats_flow(
                 still_open = False
             if still_open:
                 progress("copiloto sem automação — aguardando você no Chrome")
+                try:
+                    instance.after_fill_before_wait(handoff, ctx)
+                except Exception as exc:
+                    LOG.debug("%s after_fill (abort handoff): %s", handler_cls.name, exc)
                 return _assisted_finish(
                     instance, handoff, handler_cls, fill_note + f" ({note})", human_wait, ctx
                 )
@@ -255,6 +259,13 @@ def run_ats_flow(
             page = cpage
             fill_res = FillResult(ok=True, filled=list(fill_res.filled), missing=[])
             fill_note = " (copiloto destravou)"
+
+    if fill_res.ok:
+        try:
+            progress("avançando passos internos (modais/continuar)")
+            instance.after_fill_before_wait(page, ctx)
+        except Exception as exc:
+            LOG.debug("%s after_fill_before_wait: %s", handler_cls.name, exc)
 
     obstacles = instance.detect_obstacles(page)
     # Modo auto: tenta enviar mesmo se o handler ainda não declarou auto_submit_capable,

@@ -213,5 +213,62 @@ class SuccessRegexTests(unittest.TestCase):
         self.assertIsInstance(ats_inhire.InHireHandler.success_regex, re.Pattern)
 
 
+class FormAdvanceTests(unittest.TestCase):
+    def test_advance_clicks_continuar_registro_not_enviar(self):
+        page = mock.MagicMock()
+        cont = mock.MagicMock()
+        cont.is_visible.return_value = True
+        cont.is_enabled.return_value = True
+        cont.inner_text.return_value = "Continuar registro"
+        enviar = mock.MagicMock()
+        enviar.is_visible.return_value = True
+        enviar.is_enabled.return_value = True
+        enviar.inner_text.return_value = "Enviar"
+        page.get_by_role.return_value.all.return_value = [enviar, cont]
+        with mock.patch("ats_inhire._pause"):
+            self.assertTrue(ats_inhire._click_form_advance(page))
+        cont.click.assert_called_once()
+        enviar.click.assert_not_called()
+
+    def test_drain_advances_then_answers_modal(self):
+        handler = ats_inhire.InHireHandler()
+        page = mock.MagicMock()
+        calls: list[str] = []
+
+        modal_states = [None, mock.MagicMock(), None]
+
+        def question_modal(_page):
+            return modal_states.pop(0) if modal_states else None
+
+        def watch(page, ctx):
+            calls.append("watch")
+
+        with mock.patch("ats_inhire._question_modal", side_effect=question_modal), \
+             mock.patch("ats_inhire._continue_disabled", return_value=False), \
+             mock.patch(
+                 "ats_inhire._click_form_advance",
+                 side_effect=lambda p: calls.append("advance") or True,
+             ), \
+             mock.patch.object(handler, "watch_wait", side_effect=watch), \
+             mock.patch("ats_inhire._modal_question", side_effect=["Q1?", ""]), \
+             mock.patch("ats_inhire._pause"):
+            n = ats_inhire._drain_company_question_modals(
+                handler, page, ats_base.ApplyContext(cfg={}, rules=[], resume_path="", cover_letter="")
+            )
+        self.assertGreaterEqual(n, 2)
+        self.assertEqual(calls[0], "advance")
+        self.assertIn("watch", calls)
+
+    def test_after_fill_before_wait_invokes_drain(self):
+        handler = ats_inhire.InHireHandler()
+        page = mock.MagicMock()
+        ctx = ats_base.ApplyContext(cfg={}, rules=[], resume_path="", cover_letter="")
+        with mock.patch(
+            "ats_inhire._drain_company_question_modals", return_value=2
+        ) as drain:
+            handler.after_fill_before_wait(page, ctx)
+        drain.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -535,10 +535,81 @@ def _fill_privacy_checkbox(page) -> None:
 
 _MODAL_SELECTOR = 'div[role="dialog"], [class*="modal" i], [class*="popup" i]'
 _MODAL_CONTINUE_RE = re.compile(
-    r"^(pros(?:se)?guir|continuar|next|avan(?:c|\u00e7)ar|pr\u00f3xima|responder|confirm(?:ar)?)$",
+    r"^(pros(?:se)?guir|continuar(\s+registro)?|continue(\s+registration)?|"
+    r"next|avan(?:c|\u00e7)ar|pr\u00f3xima|responder|confirm(?:ar)?)$",
     re.I,
 )
-_MODAL_SUBMIT_RE = re.compile(r"submit|enviar|candidatar|finalizar|apply|concluir", re.I)
+_MODAL_SUBMIT_RE = re.compile(
+    r"submit|enviar|candidatar|finalizar|apply|concluir",
+    re.I,
+)
+# Avanço do formulário principal (NÃO é o envio final).
+_FORM_ADVANCE_RE = re.compile(
+    r"^(continuar(\s+registro)?|continue(\s+registration)?|next|pr[oó]xima|"
+    r"pros(?:se)?guir)$",
+    re.I,
+)
+_FORM_FINAL_RE = re.compile(
+    r"enviar|submit|finalizar|candidatar(-se)?|concluir(\s+candidatura)?|"
+    r"apply(\s+now)?",
+    re.I,
+)
+
+
+def _click_form_advance(page) -> bool:
+    """Clica Continuar registro / Continue — nunca Enviar/Submit final."""
+    try:
+        buttons = page.get_by_role("button").all()
+    except Exception:
+        return False
+    for btn in buttons:
+        try:
+            if not btn.is_visible(timeout=300) or not btn.is_enabled(timeout=300):
+                continue
+            txt = (btn.inner_text(timeout=400) or "").strip()
+            if not txt:
+                continue
+            if _FORM_FINAL_RE.search(txt) and not _FORM_ADVANCE_RE.search(txt):
+                continue
+            if not _FORM_ADVANCE_RE.search(txt):
+                continue
+            btn.click(timeout=4000)
+            _pause(0.6, 1.1)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def _drain_company_question_modals(handler, page, ctx, *, max_rounds: int = 12) -> int:
+    """Avança Continuar registro e responde modais de perguntas da empresa.
+
+    Roda mesmo em modo revisão: só para no captcha/envio final (humano).
+    """
+    rounds = 0
+    advanced = False
+    for _ in range(max_rounds):
+        modal = _question_modal(page)
+        if modal is None:
+            if not advanced and not _continue_disabled(page):
+                if _click_form_advance(page):
+                    advanced = True
+                    rounds += 1
+                    _pause(0.5, 0.9)
+                    continue
+            break
+        before = _modal_question(modal)
+        handler.watch_wait(page, ctx)
+        rounds += 1
+        _pause(0.45, 0.85)
+        modal2 = _question_modal(page)
+        if modal2 is None:
+            continue
+        after = _modal_question(modal2)
+        # Mesma pergunta sem avanço → precisa de humano (captcha/campo estranho).
+        if after and after == before:
+            break
+    return rounds
 
 
 def _question_modal(page):
@@ -664,13 +735,20 @@ class InHireHandler(BaseATSHandler):
         self._last_modal_question = ""  # evita dupes entre ticks do watcher
 
     def watch_wait(self, page, ctx) -> None:
-        """Modal de perguntas da empresa que aparece APOIS da diversidade/captcha.
+        """Modal de perguntas da empresa que aparece APÓS a diversidade/captcha.
 
-        Escolha unica avanca sozinha ao marcar; multipla/texto precisa do botao
-        Prosseguir — clicamos so quando ja respondemos algo neste tick.
+        Escolha única avança sozinha ao marcar; múltipla/texto precisa do botão
+        Prosseguir — clicamos quando respondemos algo neste tick.
+        Também tenta avançar Continuar registro se o modal ainda não abriu.
         """
         modal = _question_modal(page)
         if modal is None:
+            # Form pronto e sem modal: avança para revelar perguntas da empresa.
+            try:
+                if not _continue_disabled(page):
+                    _click_form_advance(page)
+            except Exception as exc:
+                LOG.debug("InHire advance during wait: %s", exc)
             return
         question = _modal_question(modal)
         did = 0
@@ -687,21 +765,29 @@ class InHireHandler(BaseATSHandler):
             did += _answer_modal_texts(modal, ctx)
         except Exception as exc:
             LOG.debug("InHire modal texts: %s", exc)
-        if did and question and question != self._last_modal_question:
-            self._last_modal_question = question
+        if did:
+            if question:
+                self._last_modal_question = question
             # escolha UNICA avanca sozinha ao marcar (nada a clicar). Pergunta
             # multipla/escrita: clica 'Prosseguir/Continuar' se ainda houver modal.
             try:
                 btns = modal.get_by_role("button", name=_MODAL_CONTINUE_RE).all()
                 for btn in btns:
                     txt = (btn.inner_text(timeout=400) or "").strip()
-                    if _MODAL_SUBMIT_RE.search(txt):
+                    if _MODAL_SUBMIT_RE.search(txt) and not _MODAL_CONTINUE_RE.search(txt):
                         continue  # nunca finalizar/enviar
                     if btn.is_visible(timeout=400) and btn.is_enabled(timeout=400):
                         btn.click(timeout=4000)
                         break
             except Exception as exc:
                 LOG.debug("InHire modal continue: %s", exc)
+
+    def after_fill_before_wait(self, page, ctx) -> None:
+        """Mesmo em review: Continuar registro + drenar modais da empresa."""
+        n = _drain_company_question_modals(self, page, ctx)
+        if n:
+            LOG.info("InHire: avançou/drenou %s passo(s) de perguntas da empresa.", n)
+
     success_regex = SUCCESS_RE
 
     @classmethod

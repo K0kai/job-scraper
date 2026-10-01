@@ -109,6 +109,21 @@ class AutoSubmitTests(unittest.TestCase):
         outcome, detail = ats_router.run_ats_flow(page, None, human_wait=1, **CTX_AUTO)
         self.assertEqual(outcome, ats_router.OUTCOME_SUBMITTED)
 
+    def test_review_mode_runs_after_fill_before_wait(self):
+        cls = make_handler_cls("inhireish", ("inhireish.example.com",))
+        called: list[str] = []
+
+        def after(self, page, ctx):
+            called.append("after")
+
+        cls.after_fill_before_wait = after
+        ats_base.register(cls)
+        page = FakePage("https://inhireish.example.com/x")
+        with mock.patch.object(ats_router, "wait_for_human", return_value="timeout"):
+            outcome, _ = ats_router.run_ats_flow(page, None, human_wait=1, **CTX)
+        self.assertIn(outcome, (ats_router.OUTCOME_TIMEOUT, ats_router.OUTCOME_ASSISTED))
+        self.assertEqual(called, ["after"])
+
     def test_review_mode_never_auto_submits_even_if_capable(self):
         cls = make_handler_cls("fast", ("fast2.example.com",), capable=True,
                                verify="submitted")

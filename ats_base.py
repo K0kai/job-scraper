@@ -135,6 +135,14 @@ class BaseATSHandler(ABC):
         """Avanço de wizard não-padrão; False → kernel usa o botão Next genérico."""
         return False
 
+    def after_fill_before_wait(self, page, ctx: ApplyContext) -> None:
+        """Depois do fill OK, antes de submit/espera humana.
+
+        Use para avançar passos internos (ex.: Continuar registro → modal de
+        perguntas da empresa). Nunca deve clicar o envio final. No-op default.
+        """
+        return None
+
     def watch_wait(self, page, ctx: ApplyContext) -> None:
         """Durante a janela assistida, chamado a cada ~4s (via on_tick).
 
