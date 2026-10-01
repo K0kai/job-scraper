@@ -45,7 +45,7 @@ SUBMIT_RE = re.compile(r"submit\s*application|enviar\s*candidatura|submit|enviar
 ALREADY_RE = re.compile(r"applied|candidatou|já\s+se\s+candidatou", re.I)
 SUCCESS_RE = re.compile(
     r"application\s+sent|candidatura\s+enviada|your\s+application\s+was\s+sent|"
-    r"aplicação\s+enviada|submitted",
+    r"aplicação\s+enviada|application\s+submitted",
     re.I,
 )
 # Hints de logout só em SEGMENTOS de path — nunca substring no URL inteiro
@@ -783,8 +783,8 @@ def _wait_for_human_submit(page, *, minutes: int) -> str:
     """
     deadline = time.time() + max(1, minutes) * 60
     LOG.info(
-        "Assisted Easy Apply: formulário pronto. Clique em Enviar no Chrome "
-        "(até %s min). O robô NÃO envia sozinho.",
+        "Easy Apply (revisão): formulário pronto. Clique em Enviar no Chrome "
+        "(até %s min) ou aguarde confirmação se já enviou.",
         minutes,
     )
     while time.time() < deadline:
@@ -1190,6 +1190,26 @@ def apply_via_linkedin(
                 context.close()
                 return block("Não chegou à etapa de revisão.", status="failed")
 
+            from apply_mode import apply_mode_is_auto
+            from wait_human import wait_for_success_signal
+
+            if apply_mode_is_auto(cfg):
+                LOG.info("Easy Apply modo auto: tentando clicar Enviar.")
+                if _click_first_matching(page, SUBMIT_RE):
+                    _human_pause(1.0, 2.0)
+                    if wait_for_success_signal(page, timeout_s=25, success_regex=SUCCESS_RE):
+                        try:
+                            context.close()
+                        except Exception:
+                            pass
+                        return finish_ok(
+                            "auto: candidatura enviada pelo robô no Easy Apply.",
+                            status_detail="Easy Apply enviado automaticamente (sucesso confirmado na página).",
+                        )
+                    LOG.warning("Easy Apply auto: Submit clicado sem confirmação — abrindo espera humana.")
+                else:
+                    LOG.warning("Easy Apply auto: botão Enviar não encontrado — espera humana.")
+
             outcome = _wait_for_human_submit(page, minutes=human_wait)
             try:
                 context.close()
@@ -1197,18 +1217,23 @@ def apply_via_linkedin(
                 pass
 
             if outcome == "submitted":
+                prefix = "auto" if apply_mode_is_auto(cfg) else "assisted"
                 return finish_ok(
-                    "assisted: candidatura enviada por você no Chrome.",
-                    status_detail="Easy Apply enviado por você (modo assistido; robô não clicou Enviar).",
+                    f"{prefix}: candidatura enviada no Chrome.",
+                    status_detail=(
+                        "Easy Apply enviado (sucesso confirmado na página)."
+                        if apply_mode_is_auto(cfg)
+                        else "Easy Apply enviado por você (modo revisão; robô não clicou Enviar)."
+                    ),
                 )
             if outcome == "timeout":
                 return finish_ok(
-                    "dry-run: formulário preenchido; tempo esgotado sem você confirmar o envio.",
-                    status_detail="Easy Apply preenchido; timeout sem envio (robô nunca clica Enviar).",
+                    "dry-run: formulário preenchido; tempo esgotado sem confirmação de envio.",
+                    status_detail="Easy Apply preenchido; timeout sem confirmação de envio.",
                 )
             return finish_ok(
                 "dry-run: formulário preenchido; janela fechada sem confirmação de envio.",
-                status_detail="Easy Apply preenchido; modal fechado sem sucesso (robô nunca clica Enviar).",
+                status_detail="Easy Apply preenchido; modal fechado sem sucesso confirmado.",
             )
     except Exception as exc:
         try:

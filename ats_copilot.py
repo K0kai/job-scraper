@@ -839,15 +839,28 @@ def copilot_takeover(page, context, *, reason: str, cfg: dict, ai: dict,
             fail_ask(connect_fn, open_ask_id)
             open_ask_id = None
 
+    def _confirm_submit_claim(detail: str) -> tuple[str, str, object] | None:
+        """Só SUBMITTED com texto de sucesso real; clique sozinho não basta."""
+        from wait_human import wait_for_success_signal
+
+        if wait_for_success_signal(active, timeout_s=20):
+            LOG.info("copiloto: envio confirmado na pagina — %s", detail)
+            return SUBMITTED, f"copiloto enviou a candidatura ({detail})", active
+        LOG.warning("copiloto: clique de envio sem confirmacao de sucesso — %s", detail)
+        return None
+
     def _maybe_finish(buttons_now: list[dict], *, tag: str) -> tuple[str, str, object] | None:
-        """Em modo allow_submit: tenta Submit e devolve SUBMITTED se clicou."""
+        """Em modo allow_submit: tenta Submit e só confirma com sucesso na página."""
         if not allow_submit:
             return None
         ok, detail = try_heuristic_submit(active, buttons_now)
-        if ok:
-            history.append(f"{tag}: heuristic {detail}")
-            LOG.info("copiloto: enviou candidatura — %s", detail)
-            return SUBMITTED, f"copiloto enviou a candidatura ({detail})", active
+        if not ok:
+            return None
+        history.append(f"{tag}: heuristic {detail}")
+        confirmed = _confirm_submit_claim(detail)
+        if confirmed:
+            return confirmed
+        history.append(f"{tag}: submit sem confirmacao de sucesso")
         return None
 
     for turn in range(max_turns):
@@ -954,8 +967,10 @@ def copilot_takeover(page, context, *, reason: str, cfg: dict, ai: dict,
 
         if action == "done":
             if allow_submit and "submit" in why.casefold():
-                LOG.info("copiloto: concluiu envio apos %d turno(s) - %s", turn + 1, why)
-                return SUBMITTED, f"copiloto enviou a candidatura ({why})", active
+                confirmed = _confirm_submit_claim(why)
+                if confirmed:
+                    return confirmed
+                LOG.info("copiloto: done/submit sem confirmacao — %s", why)
             if allow_submit:
                 # IA disse done sem submit — tenta enviar antes de aceitar handoff vazio.
                 try:
@@ -1105,7 +1120,11 @@ def copilot_takeover(page, context, *, reason: str, cfg: dict, ai: dict,
             time.sleep(random.uniform(*_TURN_PAUSE))
 
         if clicked_submit:
-            return SUBMITTED, "copiloto enviou a candidatura (click submit)", active
+            confirmed = _confirm_submit_claim("click submit")
+            if confirmed:
+                return confirmed
+            history.append(f"turn {turn}: submit clicado sem texto de sucesso")
+            # Continua o loop — talvez precise captcha/validação; não mente "enviado".
 
         if turn_progressed:
             try:

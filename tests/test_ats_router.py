@@ -52,6 +52,14 @@ CTX = dict(
     salary="",
 )
 
+CTX_AUTO = dict(
+    cfg={"candidate_name": "Ana", "apply_mode": "auto"},
+    rules=[],
+    resume_path="/tmp/cv.pdf",
+    cover_letter="",
+    salary="",
+)
+
 
 class ReanchorTests(unittest.TestCase):
     def setUp(self):
@@ -98,8 +106,18 @@ class AutoSubmitTests(unittest.TestCase):
                                verify="submitted")
         ats_base.register(cls)
         page = FakePage("https://fast.example.com/x")
-        outcome, detail = ats_router.run_ats_flow(page, None, human_wait=1, **CTX)
+        outcome, detail = ats_router.run_ats_flow(page, None, human_wait=1, **CTX_AUTO)
         self.assertEqual(outcome, ats_router.OUTCOME_SUBMITTED)
+
+    def test_review_mode_never_auto_submits_even_if_capable(self):
+        cls = make_handler_cls("fast", ("fast2.example.com",), capable=True,
+                               verify="submitted")
+        ats_base.register(cls)
+        page = FakePage("https://fast2.example.com/x")
+        with mock.patch.object(ats_router, "wait_for_human", return_value="submitted") as wh:
+            outcome, _ = ats_router.run_ats_flow(page, None, human_wait=1, **CTX)
+        self.assertEqual(outcome, ats_router.OUTCOME_ASSISTED)
+        wh.assert_called_once()
 
     def test_capable_but_verify_unknown_falls_back_to_assisted(self):
         cls = make_handler_cls("maybe", ("maybe.example.com",), capable=True,
@@ -110,7 +128,7 @@ class AutoSubmitTests(unittest.TestCase):
         with mock.patch.object(ats_router, "_verify_now", side_effect=lambda: next(ticks)), \
              mock.patch.object(ats_router, "_verify_sleep"), \
              mock.patch.object(ats_router, "wait_for_human", return_value="timeout") as wh:
-            outcome, _ = ats_router.run_ats_flow(page, None, human_wait=1, **CTX)
+            outcome, _ = ats_router.run_ats_flow(page, None, human_wait=1, **CTX_AUTO)
         self.assertEqual(outcome, ats_router.OUTCOME_TIMEOUT)
         wh.assert_called_once()
 
@@ -120,7 +138,7 @@ class AutoSubmitTests(unittest.TestCase):
         ats_base.register(cls)
         page = FakePage("https://captchy.example.com/x")
         with mock.patch.object(ats_router, "wait_for_human", return_value="submitted") as wh:
-            outcome, _ = ats_router.run_ats_flow(page, None, human_wait=1, **CTX)
+            outcome, _ = ats_router.run_ats_flow(page, None, human_wait=1, **CTX_AUTO)
         self.assertEqual(outcome, ats_router.OUTCOME_ASSISTED)
         wh.assert_called_once()
 
@@ -131,6 +149,14 @@ class AutoSubmitTests(unittest.TestCase):
         with mock.patch.object(ats_router, "wait_for_human", return_value="submitted"):
             outcome, _ = ats_router.run_ats_flow(page, None, human_wait=1, **CTX)
         self.assertEqual(outcome, ats_router.OUTCOME_ASSISTED)
+
+    def test_auto_mode_submits_even_if_not_capable_flag(self):
+        cls = make_handler_cls("pushy", ("pushy.example.com",), capable=False,
+                               verify="submitted")
+        ats_base.register(cls)
+        page = FakePage("https://pushy.example.com/x")
+        outcome, _ = ats_router.run_ats_flow(page, None, human_wait=1, **CTX_AUTO)
+        self.assertEqual(outcome, ats_router.OUTCOME_SUBMITTED)
 
 
 class FailureTests(unittest.TestCase):
@@ -159,7 +185,8 @@ class FailureTests(unittest.TestCase):
         )
         ats_base.register(cls)
         page = FakePage("https://broken.example.com/x")
-        with mock.patch.object(ats_router, "wait_for_human", return_value="timeout"):
+        with mock.patch.object(ats_router, "copilot_rescue", return_value=("unavailable", "no ai", page)), \
+             mock.patch.object(ats_router, "wait_for_human", return_value="timeout"):
             outcome, detail = ats_router.run_ats_flow(page, None, human_wait=1, **CTX)
         # preenchimento incompleto ainda vai para humano, mas o detalhe avisa
         self.assertIn(outcome, (ats_router.OUTCOME_TIMEOUT, ats_router.OUTCOME_ASSISTED))
@@ -180,7 +207,7 @@ class FailureTests(unittest.TestCase):
         ats_base.register(cls)
         page = FakePage("https://nosub.example.com/x")
         with mock.patch.object(ats_router, "wait_for_human", return_value="submitted"):
-            outcome, _ = ats_router.run_ats_flow(page, None, human_wait=1, **CTX)
+            outcome, _ = ats_router.run_ats_flow(page, None, human_wait=1, **CTX_AUTO)
         self.assertEqual(outcome, ats_router.OUTCOME_ASSISTED)
 
 

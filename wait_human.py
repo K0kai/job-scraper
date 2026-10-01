@@ -8,8 +8,11 @@ import time
 LOG = logging.getLogger("job-scraper")
 
 DEFAULT_SUCCESS_RE = re.compile(
-    r"candidatura\s+enviada|application\s+(sent|received)|obrigad[oa]|recebemos\s+sua|"
-    r"inscri[cç][aã]o\s+enviada|thank\s+you.*application|envio\s+confirmado",
+    r"candidatura\s+enviada|application\s+(has\s+been\s+)?(sent|received|submitted)|"
+    r"obrigad[oa]\s+por\s+(sua\s+)?(candidatura|inscri[cç][aã]o|application)|"
+    r"recebemos\s+sua\s+candidatura|inscri[cç][aã]o\s+enviada|"
+    r"thank\s+you.{0,60}(for\s+)?(your\s+)?(application|applying)|"
+    r"envio\s+confirmado|we('|\u2019)?ve\s+received\s+your\s+application",
     re.I,
 )
 
@@ -20,6 +23,38 @@ def _now() -> float:
 
 def _sleep(seconds: float) -> None:
     time.sleep(seconds)
+
+
+def page_shows_success(page, success_regex: re.Pattern[str] | None = None) -> bool:
+    """True se o body atual casa com a regex de sucesso (estrita)."""
+    regex = success_regex or DEFAULT_SUCCESS_RE
+    try:
+        snip = (page.inner_text("body") or "")[:5000]
+    except Exception:
+        return False
+    return bool(regex.search(snip))
+
+
+def wait_for_success_signal(
+    page,
+    *,
+    timeout_s: float = 20,
+    success_regex: re.Pattern[str] | None = None,
+    poll_s: float = 1.5,
+) -> bool:
+    """Espera texto de sucesso real após um clique de envio. Sem match → False."""
+    regex = success_regex or DEFAULT_SUCCESS_RE
+    deadline = _now() + max(1.0, float(timeout_s))
+    while _now() < deadline:
+        if page_shows_success(page, regex):
+            return True
+        try:
+            if page.is_closed():
+                return False
+        except Exception:
+            return False
+        _sleep(poll_s)
+    return False
 
 
 def wait_for_human(page, *, minutes: int, success_regex: re.Pattern[str] | None = None, on_tick=None) -> str:
@@ -39,11 +74,10 @@ def wait_for_human(page, *, minutes: int, success_regex: re.Pattern[str] | None 
             except Exception as exc:
                 LOG.debug("on_tick falhou (seguindo a espera): %s", exc)
         try:
-            snip = (page.inner_text("body") or "")[:5000]
+            if page_shows_success(page, regex):
+                return "submitted"
         except Exception:
             return "abandoned"
-        if regex.search(snip):
-            return "submitted"
         try:
             if page.is_closed():
                 return "abandoned"

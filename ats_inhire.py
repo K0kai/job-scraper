@@ -15,8 +15,10 @@ from form_rules import format_cpf, job_context_text
 LOG = logging.getLogger("job-scraper")
 
 SUCCESS_RE = re.compile(
-    r"candidatura\s+enviada|application\s+sent|obrigad[oa]|recebemos\s+sua|"
-    r"inscri[cç][aã]o\s+enviada|sucesso|registration\s+sent|continue\s+registration",
+    r"candidatura\s+enviada|application\s+(has\s+been\s+)?sent|"
+    r"obrigad[oa]\s+por\s+(sua\s+)?candidatura|recebemos\s+sua\s+candidatura|"
+    r"inscri[cç][aã]o\s+enviada|registration\s+(has\s+been\s+)?sent|"
+    r"thank\s+you.{0,40}(for\s+)?(your\s+)?(application|applying)",
     re.I,
 )
 

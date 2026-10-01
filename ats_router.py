@@ -132,12 +132,16 @@ def run_ats_flow(
     if resume_path and not ai.get("resume_path"):
         ai["resume_path"] = resume_path
 
+    from apply_mode import apply_mode_is_auto
+
+    want_auto = apply_mode_is_auto(cfg)
+
     handler_cls = find_handler(current_url)
     if handler_cls is None:
         host = _host_of(current_url)
-        # Site sem driver: copiloto termina o fluxo (Next…Submit), não devolve ao bot.
+        # Site sem driver: em modo auto o copiloto pode Submit; em review só preenche.
         ai_finish = dict(ai)
-        ai_finish["allow_submit"] = True
+        ai_finish["allow_submit"] = want_auto
         if resume_path:
             ai_finish["resume_path"] = resume_path
         state, note, cpage = copilot_rescue(
@@ -145,7 +149,10 @@ def run_ats_flow(
             context,
             cfg,
             ai_finish,
-            reason=f"pagina de candidatura sem driver ATS instalado ({host}) — complete e envie",
+            reason=(
+                f"pagina de candidatura sem driver ATS instalado ({host}) — "
+                + ("complete e envie" if want_auto else "preencha; humano revisa/envia")
+            ),
         )
         if state == "submitted":
             try:
@@ -199,10 +206,14 @@ def run_ats_flow(
             bits.append(str(fill_res.error))
         fill_note = " (preenchimento incompleto — " + "; ".join(bits) + ")"
         # Travou: o copiloto assume com override total antes de chamar o humano.
-        state, note, cpage = copilot_rescue(page, context, cfg, ai or {},
+        ai_stuck = dict(ai or {})
+        ai_stuck["allow_submit"] = want_auto
+        state, note, cpage = copilot_rescue(page, context, cfg, ai_stuck,
                                            reason="formulario travado — " + fill_note.strip(" ()"))
         if state == "aborted":
             return OUTCOME_UNAUTOMATED, note
+        if state == "submitted":
+            return OUTCOME_SUBMITTED, note or f"{handler_cls.name}: copiloto enviou apos travamento"
         if state == "solved" and cpage is not None:
             # IA destravou (clicou Next, abriu o proximo passo). NAO re-executamos
             # instance.fill — em sites que ja avancaram (ex.: InHire) isso daria
@@ -212,7 +223,13 @@ def run_ats_flow(
             fill_note = " (copiloto destravou)"
 
     obstacles = instance.detect_obstacles(page)
-    if not obstacles and handler_cls.auto_submit_capable and fill_res.ok:
+    # Modo auto: tenta enviar mesmo se o handler ainda não declarou auto_submit_capable,
+    # desde que não haja captcha/login. Modo review: nunca auto-envia.
+    may_auto_submit = bool(
+        want_auto and fill_res.ok and not obstacles
+        and (handler_cls.auto_submit_capable or want_auto)
+    )
+    if may_auto_submit:
         submit_res = instance.submit(page)
         if submit_res.clicked:
             if _confirm_submission(instance, page):
