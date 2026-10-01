@@ -9,9 +9,11 @@ mouse, clicar, digitar, selecionar, marcar, abrir/fechar aba, rodar JS.
 
 Override total: a partir do momento em que e chamado, quem decide os proximos
 passos e a IA. Se ela declarar que destravou (`done`), devolvemos o fluxo ao
-roteador (que entao aplica a politica normal de submit - o copiloto NUNCA clica
-em botao de envio final sozinho). Se ela desistir (`abort`), ou nao houver IA,
-ou esgotar os turnos, FECHAMOS a pagina e marcamos a vaga para nota AMARELA.
+roteador (que entao aplica a politica normal de submit — no Easy Apply o
+copiloto NUNCA clica envio final). Em site **sem driver ATS**,
+``allow_submit=True`` e o copiloto deve concluir Next…Submit sozinho.
+Se ela desistir (`abort`), ou nao houver IA, ou esgotar os turnos sem progresso,
+FECHAMOS a pagina e marcamos a vaga para nota AMARELA.
 
 As partes puras (montar prompt, extrair a acao JSON, escolher o alvo de clique)
 sao separadas do executor para testarmos sem navegador.
@@ -38,20 +40,39 @@ SOLVED = "solved"      # IA destravou o fluxo; pode retomar o preenchimento/envi
 ABORTED = "aborted"    # IA desistiu (ou sem IA/esgotou turnos): fechar + nota amarela
 UNAVAILABLE = "unavailable"  # IA nao configurada: segue o comportamento antigo (humano)
 
-MAX_TURNS = 8  # folga p/ free tier: estagnação corta antes do teto cheio
-_TURN_PAUSE = (0.4, 1.0)
+MAX_TURNS = 10  # free tier: folga p/ wizards longos; estagnação / handoff cortam desperdício
+_TURN_PAUSE = (0.35, 0.9)
 #: teto de espera acumulada em retries de rate-limit (429/quota) no mesmo takeover
 AI_RATE_LIMIT_BUDGET_SECONDS = 600
 #: turnos seguidos sem progresso → abort (em vez de gastar o teto inteiro)
 STAGNATION_LIMIT = 4
 #: ações por turno (1 chamada de IA → N passos)
-MAX_STEPS_PER_TURN = 4
+MAX_STEPS_PER_TURN = 5
 
 #: nunca clicados pelo copiloto - envio de candidatura fica com a politica do handler
 _SUBMIT_BLOCK_RE = re.compile(
     r"submit|apply now|finalizar|enviar candidatura|complete application|send application",
     re.I,
 )
+#: avanço seguro (Next/Continue/Review) — bot retoma depois do handoff
+_ADVANCE_RE = re.compile(
+    r"\b(next|continue|próximo|proximo|continuar|avançar|avancar|seguinte|review|revisar|rever)\b",
+    re.I,
+)
+#: envio final (só quando allow_submit — site sem driver)
+_SUBMIT_CLICK_RE = re.compile(
+    r"submit(\s+application)?|send\s+application|complete\s+application|"
+    r"enviar(\s+a)?\s+candidatura|finalizar(\s+a)?\s+candidatura|"
+    r"^apply$|candidatar|enviar$",
+    re.I,
+)
+_PROGRESS_HINT_RE = re.compile(
+    r"-> (typed|selected|clicked|toggled|ran js)|ask -> answered",
+    re.I,
+)
+
+#: estado extra: candidatura enviada pelo copiloto (site sem handler)
+SUBMITTED = "submitted"
 
 # vocabulario de comandos oferecido a IA (tudo que o bot sabe executar)
 ACTION_VOCAB = """
@@ -64,7 +85,7 @@ Or a short batch (preferred when several fills/clicks are obvious):
 
   {"action":"batch","args":{"steps":[{"action":"...","args":{...}}, ...]}, "reason":"..."}
 
-Max 4 steps per batch. Available actions (args in parentheses):
+Max 5 steps per batch. Available actions (args in parentheses):
   click    (field=<idx> | button=<idx> | selector="<css>" | x=<int> y=<int>)
   type     (field=<idx> | selector="<css>", text="<string>")
   select   (field=<idx> | selector="<css>", value="<option text>")   # native <select>
@@ -81,9 +102,12 @@ Max 4 steps per batch. Available actions (args in parentheses):
   abort    (reason="<why it cannot be automated>")                   # give up -> yellow note
 
 Rules:
-- Be frugal: prefer ONE batch that fills/clicks everything obvious, then `done`.
+- Be frugal: prefer ONE batch that fills/clicks everything obvious, then click
+  Next/Continue/Review (never Submit) OR emit `done` so the bot resumes.
   If data is missing, `ask` immediately — do not probe with wait/scroll/mouse.
   If you cannot unblock, `abort` quickly (do not burn turns guessing).
+- After filling required fields, prefer clicking Next/Continue/Review yourself
+  in the same batch, or `done` — do not keep typing the same fields.
 - NEVER emit a click whose target text matches submit/apply/finalizar/enviar. The
   caller handles the real submission; you only unblock the flow.
 - Prefer `field`/`button` indices from the page snapshot; they are stable handles.
@@ -120,6 +144,34 @@ _PANEL_PROFILE_FIELDS: tuple[tuple[str, str], ...] = (
 # ---------------------------------------------------------------------------
 # Partes puras (testaveis sem navegador)
 # ---------------------------------------------------------------------------
+
+def _action_vocab(*, allow_submit: bool) -> str:
+    base = ACTION_VOCAB
+    if not allow_submit:
+        return base
+    extra = """
+FINISH MODE (unknown ATS — no site driver):
+- You own the FULL application end-to-end. Keep clicking Next/Continue until the
+  final Submit/Apply/Enviar candidatura, then CLICK IT.
+- After a successful submit click, emit {"action":"done","reason":"submitted"}.
+- Do NOT emit done before submitting. Do not wait for a human unless ask/abort.
+""".strip()
+    patched = base.replace(
+        "then click\n  Next/Continue/Review (never Submit) OR emit `done` so the bot resumes.",
+        "then click Next/Continue and finally Submit/Apply yourself (no bot will finish).",
+    ).replace(
+        "- NEVER emit a click whose target text matches submit/apply/finalizar/enviar. The\n"
+        "  caller handles the real submission; you only unblock the flow.",
+        "- You MAY click Submit/Apply/Enviar candidatura when the form is complete.\n"
+        "  Prefer Next/Continue until that final button appears.",
+    ).replace(
+        "- When the flow looks unblocked (a Continue/Next is now clickable, required fields\n"
+        "  are filled), emit `done`.",
+        "- When required fields are filled, advance with Next; when Submit is available,\n"
+        "  click it, then emit `done` with reason submitted.",
+    )
+    return patched + "\n" + extra
+
 
 def panel_profile_block(cfg: dict | None) -> str:
     """Campos estruturados do painel para o prompt (omite vazios)."""
@@ -297,6 +349,78 @@ def should_abort_for_stagnation(no_progress_streak: int, *, limit: int = STAGNAT
     return no_progress_streak >= max(1, int(limit))
 
 
+def history_has_progress(history: list[str]) -> bool:
+    return any(_PROGRESS_HINT_RE.search(h or "") for h in history)
+
+
+def find_advance_button_index(buttons: list[dict]) -> int | None:
+    """Índice de Next/Continue/Review visível, nunca Submit/Apply final."""
+    for b in buttons or []:
+        if not b.get("visible"):
+            continue
+        label = f"{b.get('text') or ''} {b.get('aria') or ''}".strip()
+        if not label:
+            continue
+        if target_is_submit(label) or _SUBMIT_CLICK_RE.search(label):
+            continue
+        if _ADVANCE_RE.search(label):
+            try:
+                return int(b["index"])
+            except (KeyError, TypeError, ValueError):
+                continue
+    return None
+
+
+def find_submit_button_index(buttons: list[dict]) -> int | None:
+    """Índice do botão de envio final (Submit/Apply/Enviar candidatura)."""
+    for b in buttons or []:
+        if not b.get("visible"):
+            continue
+        label = f"{b.get('text') or ''} {b.get('aria') or ''}".strip()
+        if not label:
+            continue
+        if _SUBMIT_CLICK_RE.search(label) or target_is_submit(label):
+            # evita "Easy Apply" / "Apply on company website" genéricos demais
+            if re.search(r"easy\s*apply|company\s+website|external", label, re.I):
+                continue
+            try:
+                return int(b["index"])
+            except (KeyError, TypeError, ValueError):
+                continue
+    return None
+
+
+def try_heuristic_advance(page, buttons: list[dict]) -> tuple[bool, str]:
+    """Clica Next/Continue/Review sem gastar turno de IA. Retorna (ok, detalhe)."""
+    idx = find_advance_button_index(buttons)
+    if idx is None:
+        return False, "sem botao de avanço"
+    try:
+        if click_scanned_button(page, idx):
+            return True, f"clicked advance B{idx}"
+    except Exception as exc:
+        return False, f"advance falhou: {exc}"
+    return False, "advance nao clicou"
+
+
+def try_heuristic_submit(page, buttons: list[dict]) -> tuple[bool, str]:
+    """Clica Submit/Apply final (só use com allow_submit)."""
+    idx = find_submit_button_index(buttons)
+    if idx is None:
+        return False, "sem botao de envio"
+    try:
+        if click_scanned_button(page, idx):
+            return True, f"clicked submit B{idx}"
+    except Exception as exc:
+        return False, f"submit falhou: {exc}"
+    return False, "submit nao clicou"
+
+
+def looks_ready_for_handoff(buttons: list[dict], *, had_progress: bool) -> bool:
+    """Se já avançamos campos e há Next/Review, o bot pode retomar sem mais IA."""
+    return bool(had_progress and find_advance_button_index(buttons) is not None)
+
+
 def build_copilot_prompt(
     *,
     reason: str,
@@ -310,6 +434,7 @@ def build_copilot_prompt(
     page_text: str,
     history: list[str],
     panel_profile: str = "",
+    allow_submit: bool = False,
 ) -> str:
     """Prompt compacto com contexto total + snapshot da pagina + historico."""
     job = job or {}
@@ -329,7 +454,7 @@ def build_copilot_prompt(
     hist = "\n".join(f"  - {h}" for h in history[-8:]) or "  (nenhuma ainda)"
     excerpt = copilot_resume_excerpt(resume_json, resume_summary, budget=2000)
     return (
-        ACTION_VOCAB
+        _action_vocab(allow_submit=allow_submit)
         + "\n\n=== STUCK BECAUSE ===\n" + _clip(reason, 300)
         + "\n\n=== CANDIDATE FACTS ===\n" + (_clip(facts, 1200) or "(none)")
         + "\n\n=== PANEL PROFILE ===\n" + (_clip(panel_profile, 800) or "(none)")
@@ -562,8 +687,9 @@ def copilot_takeover(page, context, *, reason: str, cfg: dict, ai: dict,
                      max_turns: int = MAX_TURNS) -> tuple[str, str, object]:
     """Override de IA. Retorna (estado, detalhe, pagina_ativa).
 
-    estado: SOLVED | ABORTED | UNAVAILABLE. Em ABORTED a pagina ja foi fechada
-    (retornamos None como pagina ativa) e `detalhe` carrega COPILOT_FAIL_PREFIX.
+    estado: SOLVED | SUBMITTED | ABORTED | UNAVAILABLE.
+    Com ``ai['allow_submit']=True`` (site sem driver) o copiloto pode clicar
+    Submit e concluir a candidatura; sem isso, só desbloqueia e devolve ao bot.
     """
     provider = str(ai.get("provider") or "")
     model = str(ai.get("model") or "")
@@ -571,6 +697,7 @@ def copilot_takeover(page, context, *, reason: str, cfg: dict, ai: dict,
     if not (provider and model and api_key):
         return UNAVAILABLE, "copiloto indisponivel (sem IA configurada)", page
 
+    allow_submit = bool(ai.get("allow_submit"))
     facts = str(ai.get("facts") or "")
     job = ai.get("job") or {}
     resume_summary = str(ai.get("resume_summary") or "")
@@ -592,6 +719,17 @@ def copilot_takeover(page, context, *, reason: str, cfg: dict, ai: dict,
             fail_ask(connect_fn, open_ask_id)
             open_ask_id = None
 
+    def _maybe_finish(buttons_now: list[dict], *, tag: str) -> tuple[str, str, object] | None:
+        """Em modo allow_submit: tenta Submit e devolve SUBMITTED se clicou."""
+        if not allow_submit:
+            return None
+        ok, detail = try_heuristic_submit(active, buttons_now)
+        if ok:
+            history.append(f"{tag}: heuristic {detail}")
+            LOG.info("copiloto: enviou candidatura — %s", detail)
+            return SUBMITTED, f"copiloto enviou a candidatura ({detail})", active
+        return None
+
     for turn in range(max_turns):
         try:
             fields, buttons, page_text = snapshot_page(active)
@@ -599,11 +737,33 @@ def copilot_takeover(page, context, *, reason: str, cfg: dict, ai: dict,
                 url = active.url or ""
             except Exception:
                 url = ""
+            # Site com driver: handoff cedo. Site desconhecido: tenta Submit, senão segue.
+            if looks_ready_for_handoff(buttons, had_progress=history_has_progress(history)):
+                if allow_submit:
+                    finished = _maybe_finish(buttons, tag=f"turn {turn}")
+                    if finished:
+                        return finished
+                    ok, detail = try_heuristic_advance(active, buttons)
+                    if ok:
+                        history.append(f"turn {turn}: heuristic {detail}")
+                        LOG.info("copiloto: %s", history[-1])
+                        no_progress_streak = 0
+                        time.sleep(random.uniform(*_TURN_PAUSE))
+                        continue
+                else:
+                    ok, detail = try_heuristic_advance(active, buttons)
+                    if ok:
+                        history.append(f"turn {turn}: heuristic {detail}")
+                        LOG.info("copiloto: avanço heurístico + handoff — %s", detail)
+                    else:
+                        LOG.info("copiloto: handoff ao bot (página pronta) — %s", detail)
+                    return SOLVED, f"destravado (handoff; {detail})", active
             prompt = build_copilot_prompt(
                 reason=reason, facts=facts, resume_summary=resume_summary,
                 resume_json=resume_json, job=job, url=url, fields=fields,
                 buttons=buttons, page_text=page_text, history=history,
                 panel_profile=panel_profile_block(cfg),
+                allow_submit=allow_submit,
             )
             raw = call_ai_with_rate_limit_retry(
                 call_fn=call_ai_text,
@@ -648,6 +808,22 @@ def copilot_takeover(page, context, *, reason: str, cfg: dict, ai: dict,
         why = str(act.get("reason") or "")[:160]
 
         if action == "done":
+            if allow_submit and "submit" in why.casefold():
+                LOG.info("copiloto: concluiu envio apos %d turno(s) - %s", turn + 1, why)
+                return SUBMITTED, f"copiloto enviou a candidatura ({why})", active
+            if allow_submit:
+                # IA disse done sem submit — tenta enviar antes de aceitar handoff vazio.
+                try:
+                    _f, buttons_now, _t = snapshot_page(active)
+                except Exception:
+                    buttons_now = buttons
+                finished = _maybe_finish(buttons_now, tag=f"turn {turn}")
+                if finished:
+                    return finished
+                ok, detail = try_heuristic_advance(active, buttons_now)
+                if ok:
+                    history.append(f"turn {turn}: heuristic {detail} (pos-done)")
+                    continue
             LOG.info("copiloto: destravou apos %d turno(s) - %s", turn + 1, why)
             return SOLVED, f"destravado pelo copiloto ({why})", active
         if action == "abort":
@@ -710,13 +886,13 @@ def copilot_takeover(page, context, *, reason: str, cfg: dict, ai: dict,
             continue
 
         turn_progressed = False
+        clicked_submit = False
         for step in steps:
             step_action = str(step.get("action") or "").strip().lower()
             step_args = step.get("args") if isinstance(step.get("args"), dict) else {}
             step_why = str(step.get("reason") or why)[:160]
-            if step_action == "click" and target_is_submit(
-                click_target_label(step_args, fields, buttons)
-            ):
+            label = click_target_label(step_args, fields, buttons)
+            if step_action == "click" and target_is_submit(label) and not allow_submit:
                 history.append(
                     f"turn {turn}: recusado clique em botao de envio ({step_why})"
                 )
@@ -735,6 +911,13 @@ def copilot_takeover(page, context, *, reason: str, cfg: dict, ai: dict,
                 f"-> {desc} | {step_why}"
             )
             LOG.info("copiloto: %s", history[-1])
+            if (
+                allow_submit
+                and step_action == "click"
+                and (target_is_submit(label) or _SUBMIT_CLICK_RE.search(label or ""))
+                and "clicked" in (desc or "").casefold()
+            ):
+                clicked_submit = True
             if is_no_progress_outcome(step_action, desc):
                 no_progress_streak += 1
             else:
@@ -743,11 +926,65 @@ def copilot_takeover(page, context, *, reason: str, cfg: dict, ai: dict,
             last_sig = sig
             time.sleep(random.uniform(*_TURN_PAUSE))
 
+        if clicked_submit:
+            return SUBMITTED, "copiloto enviou a candidatura (click submit)", active
+
+        if turn_progressed:
+            try:
+                _fields2, buttons2, _text2 = snapshot_page(active)
+            except Exception:
+                buttons2 = buttons
+            if allow_submit:
+                finished = _maybe_finish(buttons2, tag=f"turn {turn}")
+                if finished:
+                    return finished
+            ok, detail = try_heuristic_advance(active, buttons2)
+            if ok:
+                history.append(f"turn {turn}: heuristic {detail}")
+                LOG.info("copiloto: %s", history[-1])
+                no_progress_streak = 0
+                time.sleep(random.uniform(*_TURN_PAUSE))
+
         if not turn_progressed and should_abort_for_stagnation(no_progress_streak):
             _fail_open_ask()
             return abort_close(
                 active, context, "copiloto estagnou sem progresso — abortando cedo"
             )
+
+    # Esgotou turnos
+    if history_has_progress(history):
+        try:
+            _f, buttons_end, _t = snapshot_page(active)
+            if allow_submit:
+                finished = _maybe_finish(buttons_end, tag="final")
+                if finished:
+                    return finished
+            ok, detail = try_heuristic_advance(active, buttons_end)
+            if ok:
+                history.append(f"final: heuristic {detail}")
+                LOG.info("copiloto: %s", history[-1])
+                if allow_submit:
+                    try:
+                        _f2, buttons2, _t2 = snapshot_page(active)
+                        finished = _maybe_finish(buttons2, tag="final2")
+                        if finished:
+                            return finished
+                    except Exception:
+                        pass
+            else:
+                detail = detail or "sem advance"
+        except Exception:
+            detail = "snapshot final falhou"
+        if allow_submit:
+            # Sem bot para retomar — aborta com nota (não fingir sucesso).
+            _fail_open_ask()
+            return abort_close(
+                active,
+                context,
+                f"site sem driver: esgotou turnos sem concluir o envio ({detail})",
+            )
+        LOG.info("copiloto: turnos esgotados com progresso — handoff ao bot (%s)", detail)
+        return SOLVED, f"copiloto parcial com progresso; bot retoma ({detail})", active
 
     _fail_open_ask()
     return abort_close(active, context, "copiloto esgotou os turnos sem destravar")
@@ -781,6 +1018,7 @@ __all__ = [
     "MAX_TURNS",
     "SOLVED",
     "STAGNATION_LIMIT",
+    "SUBMITTED",
     "UNAVAILABLE",
     "abort_close",
     "action_signature",
@@ -792,10 +1030,16 @@ __all__ = [
     "exec_action",
     "expand_action_steps",
     "extract_action",
+    "find_advance_button_index",
+    "find_submit_button_index",
+    "history_has_progress",
     "is_no_progress_outcome",
+    "looks_ready_for_handoff",
     "panel_profile_block",
     "resolve_selector",
     "should_abort_for_stagnation",
     "snapshot_page",
     "target_is_submit",
+    "try_heuristic_advance",
+    "try_heuristic_submit",
 ]

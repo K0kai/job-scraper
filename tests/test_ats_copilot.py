@@ -191,6 +191,8 @@ class CopilotFrugalityTests(unittest.TestCase):
                     {"action": "type", "args": {"field": 1, "text": "b"}},
                     {"action": "click", "args": {"button": 2}},
                     {"action": "click", "args": {"button": 3}},
+                    {"action": "select", "args": {"field": 4, "value": "x"}},
+                    {"action": "click", "args": {"button": 5}},
                 ]
             },
             "reason": "fill",
@@ -198,6 +200,7 @@ class CopilotFrugalityTests(unittest.TestCase):
         steps = expand_action_steps(act)
         self.assertEqual(len(steps), MAX_STEPS_PER_TURN)
         self.assertEqual(steps[0]["action"], "type")
+        self.assertEqual(steps[-1]["action"], "select")
 
     def test_stagnation_and_no_progress(self) -> None:
         from ats_copilot import is_no_progress_outcome, should_abort_for_stagnation
@@ -213,7 +216,34 @@ class CopilotFrugalityTests(unittest.TestCase):
 
         self.assertIn("batch", ACTION_VOCAB)
         self.assertIn("Be frugal", ACTION_VOCAB)
-        self.assertLessEqual(MAX_TURNS, 8)
+        self.assertLessEqual(MAX_TURNS, 10)
+        self.assertGreaterEqual(MAX_TURNS, 8)
+
+    def test_handoff_helpers(self) -> None:
+        from ats_copilot import (
+            _action_vocab,
+            find_advance_button_index,
+            find_submit_button_index,
+            history_has_progress,
+            looks_ready_for_handoff,
+        )
+
+        self.assertTrue(history_has_progress(["turn 0: type(...) -> typed | ok"]))
+        self.assertFalse(history_has_progress(["turn 0: wait -> waited"]))
+        buttons = [
+            {"index": 1, "visible": True, "text": "Submit application", "aria": ""},
+            {"index": 2, "visible": True, "text": "Next", "aria": ""},
+        ]
+        self.assertEqual(find_advance_button_index(buttons), 2)
+        self.assertEqual(find_submit_button_index(buttons), 1)
+        self.assertTrue(looks_ready_for_handoff(buttons, had_progress=True))
+        self.assertFalse(looks_ready_for_handoff(buttons, had_progress=False))
+        finish = _action_vocab(allow_submit=True)
+        self.assertIn("FINISH MODE", finish)
+        self.assertIn("MAY click Submit", finish)
+        self.assertNotIn("NEVER emit a click whose target text matches submit", finish)
+        blocked = _action_vocab(allow_submit=False)
+        self.assertIn("NEVER emit a click whose target text matches submit", blocked)
 
 
 if __name__ == "__main__":

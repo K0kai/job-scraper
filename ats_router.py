@@ -71,9 +71,11 @@ def copilot_rescue(page, context, cfg: dict, ai: dict, *, reason: str) -> tuple[
     """Chama o copiloto de IA (override total). Nunca levanta exceção — se o
     módulo falhar, cai para UNAVAILABLE e o fluxo segue o comportamento antigo."""
     try:
-        from ats_copilot import ABORTED, SOLVED, copilot_takeover
+        from ats_copilot import ABORTED, SOLVED, SUBMITTED, copilot_takeover
 
         state, detail, active = copilot_takeover(page, context, reason=reason, cfg=cfg, ai=ai)
+        if state == SUBMITTED:
+            return "submitted", detail, active
         if state == SOLVED:
             return "solved", detail, active
         if state == ABORTED:
@@ -129,10 +131,25 @@ def run_ats_flow(
     handler_cls = find_handler(current_url)
     if handler_cls is None:
         host = _host_of(current_url)
-        # site sem driver: o copiloto assume com override total antes de desistir
-        state, note, cpage = copilot_rescue(page, context, cfg, ai or {},
-                                            reason=f"pagina de candidatura sem driver ATS instalado ({host})")
+        # Site sem driver: copiloto termina o fluxo (Next…Submit), não devolve ao bot.
+        ai_finish = dict(ai or {})
+        ai_finish["allow_submit"] = True
+        state, note, cpage = copilot_rescue(
+            page,
+            context,
+            cfg,
+            ai_finish,
+            reason=f"pagina de candidatura sem driver ATS instalado ({host}) — complete e envie",
+        )
+        if state == "submitted":
+            try:
+                if cpage is not None and not cpage.is_closed():
+                    cpage.close()
+            except Exception:
+                pass
+            return OUTCOME_SUBMITTED, note or f"copiloto enviou candidatura em {host}"
         if state == "solved" and cpage is not None:
+            # Fallback assistido se a IA destravou sem confirmar envio.
             outcome = wait_for_human(cpage, minutes=human_wait)
             if outcome == "submitted":
                 return OUTCOME_ASSISTED, f"copiloto destravou {host}; voce enviou (assistido)."
