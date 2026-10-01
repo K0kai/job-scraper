@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import sqlite3
 import time
 from typing import Callable
@@ -14,6 +15,9 @@ STATUS_ANSWERED = "answered"
 STATUS_EXPIRED = "expired"
 STATUS_CANCELLED = "cancelled"
 STATUS_FAILED_AI = "failed_ai"
+
+KIND_TEXT = "text"
+KIND_FILE = "file"
 
 PANEL_OPEN_STATUSES = (STATUS_PENDING, STATUS_AWAITING_AI)
 
@@ -29,14 +33,21 @@ def ensure_table(db: sqlite3.Connection) -> None:
           status TEXT NOT NULL DEFAULT 'pending',
           answer TEXT NOT NULL DEFAULT '',
           hint TEXT NOT NULL DEFAULT '',
+          kind TEXT NOT NULL DEFAULT 'text',
+          file_path TEXT NOT NULL DEFAULT '',
           created_at TEXT NOT NULL,
           answered_at TEXT NOT NULL DEFAULT ''
         )"""
     )
-    try:
-        db.execute("ALTER TABLE copilot_asks ADD COLUMN hint TEXT NOT NULL DEFAULT ''")
-    except sqlite3.OperationalError:
-        pass
+    for ddl in (
+        "ALTER TABLE copilot_asks ADD COLUMN hint TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE copilot_asks ADD COLUMN kind TEXT NOT NULL DEFAULT 'text'",
+        "ALTER TABLE copilot_asks ADD COLUMN file_path TEXT NOT NULL DEFAULT ''",
+    ):
+        try:
+            db.execute(ddl)
+        except sqlite3.OperationalError:
+            pass
 
 
 def create_ask(
@@ -45,21 +56,22 @@ def create_ask(
     job_id: int | None,
     question: str,
     now_iso: str,
+    kind: str = KIND_TEXT,
 ) -> int:
     q = (question or "").strip()
     if not q:
         raise ValueError("pergunta vazia")
+    ask_kind = KIND_FILE if str(kind or "").casefold() == KIND_FILE else KIND_TEXT
     with connect_fn() as db:
         ensure_table(db)
-        # Uma aberta por vez: expira pending e awaiting_ai anteriores.
         db.execute(
             f"UPDATE copilot_asks SET status=? WHERE status IN ({','.join('?' * len(PANEL_OPEN_STATUSES))})",
             (STATUS_EXPIRED, *PANEL_OPEN_STATUSES),
         )
         cur = db.execute(
-            """INSERT INTO copilot_asks(job_id, question, status, answer, hint, created_at, answered_at)
-               VALUES (?,?,?,?,?,?,?)""",
-            (job_id, q, STATUS_PENDING, "", "", now_iso, ""),
+            """INSERT INTO copilot_asks(job_id, question, status, answer, hint, kind, file_path, created_at, answered_at)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            (job_id, q, STATUS_PENDING, "", "", ask_kind, "", now_iso, ""),
         )
         return int(cur.lastrowid)
 
@@ -69,7 +81,7 @@ def get_pending_ask(connect_fn: ConnectFn) -> dict | None:
     with connect_fn() as db:
         ensure_table(db)
         row = db.execute(
-            f"""SELECT id, job_id, question, status, answer, hint, created_at
+            f"""SELECT id, job_id, question, status, answer, hint, kind, file_path, created_at
                FROM copilot_asks
                WHERE status IN ({','.join('?' * len(PANEL_OPEN_STATUSES))})
                ORDER BY id DESC LIMIT 1""",
@@ -84,6 +96,9 @@ def get_pending_ask(connect_fn: ConnectFn) -> dict | None:
         "status": row["status"],
         "answer": row["answer"],
         "hint": row["hint"] or "",
+        "kind": row["kind"] or KIND_TEXT,
+        "file_path": row["file_path"] or "",
+        "needs_file": (row["kind"] or KIND_TEXT) == KIND_FILE,
         "created_at": row["created_at"],
     }
 
@@ -92,7 +107,7 @@ def get_ask(connect_fn: ConnectFn, ask_id: int) -> dict | None:
     with connect_fn() as db:
         ensure_table(db)
         row = db.execute(
-            """SELECT id, job_id, question, status, answer, hint, created_at, answered_at
+            """SELECT id, job_id, question, status, answer, hint, kind, file_path, created_at, answered_at
                FROM copilot_asks WHERE id=?""",
             (ask_id,),
         ).fetchone()
@@ -126,21 +141,27 @@ def answer_ask(
     answer: str,
     *,
     now_iso: str,
+    file_path: str = "",
 ) -> bool:
     text = (answer or "").strip()
-    if not text:
+    path = (file_path or "").strip()
+    if not text and not path:
         return False
+    if not text and path:
+        text = f"arquivo: {os.path.basename(path)}"
     with connect_fn() as db:
         ensure_table(db)
         row = db.execute(
-            "SELECT id, question, status FROM copilot_asks WHERE id=?",
+            "SELECT id, question, status, kind FROM copilot_asks WHERE id=?",
             (ask_id,),
         ).fetchone()
         if not row or row["status"] != STATUS_PENDING:
             return False
+        if (row["kind"] or KIND_TEXT) == KIND_FILE and not path:
+            return False
         db.execute(
-            """UPDATE copilot_asks SET status=?, answer=?, hint=?, answered_at=? WHERE id=?""",
-            (STATUS_AWAITING_AI, text, "", now_iso, ask_id),
+            """UPDATE copilot_asks SET status=?, answer=?, hint=?, file_path=?, answered_at=? WHERE id=?""",
+            (STATUS_AWAITING_AI, text, "", path, now_iso, ask_id),
         )
         question = row["question"]
     append_facts_both(connect_fn, question=question, answer=text)
@@ -227,7 +248,29 @@ def wait_for_answer(
     return STATUS_EXPIRED, ""
 
 
+def save_ask_upload(
+    *,
+    uploads_dir: str,
+    ask_id: int,
+    filename: str,
+    raw_bytes: bytes,
+) -> str:
+    """Persiste upload do modal; devolve caminho absoluto."""
+    if not raw_bytes:
+        raise ValueError("arquivo vazio")
+    if len(raw_bytes) > 12 * 1024 * 1024:
+        raise ValueError("arquivo maior que 12 MB")
+    os.makedirs(uploads_dir, exist_ok=True)
+    safe = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in (filename or "upload.bin"))[:80]
+    stored = os.path.join(uploads_dir, f"ask_{ask_id}_{int(time.time())}_{safe}")
+    with open(stored, "wb") as handle:
+        handle.write(raw_bytes)
+    return stored
+
+
 __all__ = [
+    "KIND_FILE",
+    "KIND_TEXT",
     "STATUS_ANSWERED",
     "STATUS_AWAITING_AI",
     "STATUS_CANCELLED",
@@ -245,6 +288,7 @@ __all__ = [
     "get_ask",
     "get_pending_ask",
     "load_facts",
+    "save_ask_upload",
     "set_ask_hint",
     "wait_for_answer",
 ]

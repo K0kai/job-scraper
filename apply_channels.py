@@ -405,6 +405,7 @@ def apply_via_browser(
 
             ai_ctx = {
                 "job": job, "resume_summary": resume_summary, "resume_json": resume_json,
+                "resume_path": resume_path,
                 "facts": facts, "provider": provider, "model": model, "api_key": api_key,
                 "connect_fn": connect_fn, "now_iso": now_iso,
             }

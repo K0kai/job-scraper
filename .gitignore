@@ -5,6 +5,7 @@ __pycache__/
 .venv/
 resumes/*.pdf
 resumes/*.tmp
+copilot_uploads/
 linkedin_browser_profile/
 *.pyc
 tests/*

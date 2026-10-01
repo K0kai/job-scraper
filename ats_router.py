@@ -128,12 +128,18 @@ def run_ats_flow(
     except Exception:
         current_url = ""
 
+    ai = dict(ai or {})
+    if resume_path and not ai.get("resume_path"):
+        ai["resume_path"] = resume_path
+
     handler_cls = find_handler(current_url)
     if handler_cls is None:
         host = _host_of(current_url)
         # Site sem driver: copiloto termina o fluxo (Next…Submit), não devolve ao bot.
-        ai_finish = dict(ai or {})
+        ai_finish = dict(ai)
         ai_finish["allow_submit"] = True
+        if resume_path:
+            ai_finish["resume_path"] = resume_path
         state, note, cpage = copilot_rescue(
             page,
             context,

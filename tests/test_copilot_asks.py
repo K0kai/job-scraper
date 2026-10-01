@@ -108,6 +108,48 @@ class CopilotAsksDbTests(unittest.TestCase):
         self.assertEqual(status, copilot_asks.STATUS_CANCELLED)
         self.assertEqual(answer, "")
 
+    def test_file_kind_requires_upload(self) -> None:
+        ask_id = copilot_asks.create_ask(
+            self._connect,
+            job_id=2,
+            question="Anexe o certificado de inglês",
+            now_iso="t0",
+            kind=copilot_asks.KIND_FILE,
+        )
+        pending = copilot_asks.get_pending_ask(self._connect)
+        self.assertTrue(pending["needs_file"])
+        self.assertEqual(pending["kind"], copilot_asks.KIND_FILE)
+        self.assertFalse(
+            copilot_asks.answer_ask(self._connect, ask_id, "só texto", now_iso="t1")
+        )
+        stored = Path(self.tmp.name) / "cert.pdf"
+        stored.write_bytes(b"%PDF-1.4 fake")
+        ok = copilot_asks.answer_ask(
+            self._connect,
+            ask_id,
+            "",
+            now_iso="t2",
+            file_path=str(stored),
+        )
+        self.assertTrue(ok)
+        row = copilot_asks.get_ask(self._connect, ask_id)
+        self.assertEqual(row["file_path"], str(stored))
+        self.assertIn("cert.pdf", row["answer"])
+        panel = copilot_asks.get_pending_ask(self._connect)
+        self.assertEqual(panel["status"], copilot_asks.STATUS_AWAITING_AI)
+
+    def test_save_ask_upload(self) -> None:
+        dest = Path(self.tmp.name) / "uploads"
+        path = copilot_asks.save_ask_upload(
+            uploads_dir=str(dest),
+            ask_id=9,
+            filename="Meu Cert!.pdf",
+            raw_bytes=b"abc",
+        )
+        self.assertTrue(Path(path).is_file())
+        self.assertEqual(Path(path).read_bytes(), b"abc")
+        self.assertIn("ask_9_", path)
+
 
 class CopilotAskActionVocabTests(unittest.TestCase):
     def test_vocab_mentions_ask(self) -> None:
@@ -117,6 +159,13 @@ class CopilotAskActionVocabTests(unittest.TestCase):
             job={}, url="", fields=[], buttons=[], page_text="", history=[],
         )
         self.assertIn("ask", prompt)
+
+    def test_file_ask_classifier(self) -> None:
+        from ats_copilot import looks_like_file_ask, looks_like_resume_ask
+
+        self.assertTrue(looks_like_file_ask("Please upload your diploma PDF"))
+        self.assertTrue(looks_like_resume_ask("Need your resume"))
+        self.assertFalse(looks_like_file_ask("What is your GPA?"))
 
 
 if __name__ == "__main__":

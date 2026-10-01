@@ -922,6 +922,7 @@ def apply_via_linkedin(
         "job": job,
         "resume_summary": resume_summary,
         "resume_json": resume_json,
+        "resume_path": resume_path,
         "facts": facts,
         "provider": provider,
         "model": model,

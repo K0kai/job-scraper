@@ -67,7 +67,7 @@ _SUBMIT_CLICK_RE = re.compile(
     re.I,
 )
 _PROGRESS_HINT_RE = re.compile(
-    r"-> (typed|selected|clicked|toggled|ran js)|ask -> answered",
+    r"-> (typed|selected|clicked|toggled|ran js|uploaded)|ask -> answered",
     re.I,
 )
 
@@ -90,6 +90,7 @@ Max 5 steps per batch. Available actions (args in parentheses):
   type     (field=<idx> | selector="<css>", text="<string>")
   select   (field=<idx> | selector="<css>", value="<option text>")   # native <select>
   check    (field=<idx> | selector="<css>", checked=<true|false>)    # radio/checkbox
+  upload   (field=<idx> | selector="<css>")                          # attach RESUME FILE (panel PDF)
   mouse    (x=<int>, y=<int>)                                        # hover to reveal UI
   press    (key="<Enter|Tab|Escape|...>")
   scroll   (y=<int>)                                                 # pixels, +down -up
@@ -111,6 +112,8 @@ Rules:
 - NEVER emit a click whose target text matches submit/apply/finalizar/enviar. The
   caller handles the real submission; you only unblock the flow.
 - Prefer `field`/`button` indices from the page snapshot; they are stable handles.
+- Resume/CV upload: if RESUME FILE path is listed below, use `upload` on the file
+  input. NEVER ask the human for a resume/CV — it is already on disk from the panel.
 - Fill what you can from CANDIDATE FACTS + PANEL PROFILE + RESUME EXCERPT. Prefer
   PANEL PROFILE for city/salary/contact; prefer RESUME EXCERPT for education /
   location_notes / work_authorization. For salary fields: panel salary_brl/usd are
@@ -421,6 +424,77 @@ def looks_ready_for_handoff(buttons: list[dict], *, had_progress: bool) -> bool:
     return bool(had_progress and find_advance_button_index(buttons) is not None)
 
 
+_RESUME_ASK_RE = re.compile(
+    r"\b(resume|curr[ií]culo|curriculum|\bcv\b)\b",
+    re.I,
+)
+_FILE_ASK_RE = re.compile(
+    r"\b(resume|curr[ií]culo|curriculum|\bcv\b|upload|anexar|arquivo|file|portfolio|"
+    r"certificado|certificate|transcript|diploma|attachment|cover\s*letter\s*file)\b",
+    re.I,
+)
+
+
+def looks_like_resume_ask(question: str) -> bool:
+    return bool(_RESUME_ASK_RE.search(question or ""))
+
+
+def looks_like_file_ask(question: str) -> bool:
+    return bool(_FILE_ASK_RE.search(question or ""))
+
+
+def file_field_indices(fields: list[dict]) -> list[int]:
+    out: list[int] = []
+    for f in fields or []:
+        if str(f.get("type") or "").casefold() == "file":
+            try:
+                out.append(int(f["index"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+    return out
+
+
+def try_upload_file(page, fields: list[dict], file_path: str) -> tuple[bool, str]:
+    """Anexa um arquivo em inputs type=file. Retorna (ok, detalhe)."""
+    path = (file_path or "").strip()
+    if not path:
+        return False, "sem file_path"
+    import os
+
+    if not os.path.isfile(path):
+        return False, f"arquivo inexistente: {path}"
+    idxs = file_field_indices(fields)
+    if not idxs:
+        try:
+            loc = page.locator('input[type="file"]')
+            if loc.count() <= 0:
+                return False, "sem campo file"
+            loc.first.set_input_files(path, timeout=8000)
+            return True, f"uploaded {os.path.basename(path)} (locator file)"
+        except Exception as exc:
+            return False, f"upload falhou: {exc}"
+    uploaded = 0
+    for idx in idxs:
+        sel = f'[{MARK_FIELD_ATTR}="{idx}"]'
+        try:
+            page.locator(sel).first.set_input_files(path, timeout=8000)
+            uploaded += 1
+        except Exception:
+            try:
+                page.locator('input[type="file"]').first.set_input_files(path, timeout=8000)
+                uploaded += 1
+                break
+            except Exception:
+                continue
+    if uploaded:
+        return True, f"uploaded {os.path.basename(path)} to {uploaded} field(s)"
+    return False, "nao conseguiu set_input_files"
+
+
+def try_upload_resume(page, fields: list[dict], resume_path: str) -> tuple[bool, str]:
+    return try_upload_file(page, fields, resume_path)
+
+
 def build_copilot_prompt(
     *,
     reason: str,
@@ -435,6 +509,7 @@ def build_copilot_prompt(
     history: list[str],
     panel_profile: str = "",
     allow_submit: bool = False,
+    resume_path: str = "",
 ) -> str:
     """Prompt compacto com contexto total + snapshot da pagina + historico."""
     job = job or {}
@@ -453,9 +528,15 @@ def build_copilot_prompt(
     ][:30]
     hist = "\n".join(f"  - {h}" for h in history[-8:]) or "  (nenhuma ainda)"
     excerpt = copilot_resume_excerpt(resume_json, resume_summary, budget=2000)
+    resume_line = (
+        f"path={resume_path} (use action upload — do NOT ask the human)"
+        if (resume_path or "").strip()
+        else "(missing — only then ask)"
+    )
     return (
         _action_vocab(allow_submit=allow_submit)
         + "\n\n=== STUCK BECAUSE ===\n" + _clip(reason, 300)
+        + "\n\n=== RESUME FILE ===\n" + resume_line
         + "\n\n=== CANDIDATE FACTS ===\n" + (_clip(facts, 1200) or "(none)")
         + "\n\n=== PANEL PROFILE ===\n" + (_clip(panel_profile, 800) or "(none)")
         + "\n\n=== RESUME EXCERPT (prioritized) ===\n" + (excerpt or "(none)")
@@ -559,7 +640,15 @@ def _do_check(page, args: dict, fields: list[dict]) -> str:
     return f"check:{result}"
 
 
-def exec_action(page, context, action: str, args: dict, fields: list[dict]) -> tuple[str, object]:
+def exec_action(
+    page,
+    context,
+    action: str,
+    args: dict,
+    fields: list[dict],
+    *,
+    resume_path: str = "",
+) -> tuple[str, object]:
     """Roda UM comando. Retorna (descricao, nova_page_ou_None)."""
     try:
         if action == "click":
@@ -580,6 +669,10 @@ def exec_action(page, context, action: str, args: dict, fields: list[dict]) -> t
                         opts = f.get("options") or []
             ok = safe_select(page, sel, opts, str(args.get("value", "")))
             return ("selected" if ok else "select failed"), None
+        if action == "upload":
+            path = str(args.get("path") or resume_path or "").strip()
+            ok, detail = try_upload_file(page, fields, path)
+            return detail, None
         if action == "check":
             return _do_check(page, args, fields), None
         if action == "mouse":
@@ -698,6 +791,7 @@ def copilot_takeover(page, context, *, reason: str, cfg: dict, ai: dict,
         return UNAVAILABLE, "copiloto indisponivel (sem IA configurada)", page
 
     allow_submit = bool(ai.get("allow_submit"))
+    resume_path = str(ai.get("resume_path") or "").strip()
     facts = str(ai.get("facts") or "")
     job = ai.get("job") or {}
     resume_summary = str(ai.get("resume_summary") or "")
@@ -708,6 +802,7 @@ def copilot_takeover(page, context, *, reason: str, cfg: dict, ai: dict,
     connect_fn = ai.get("connect_fn")
     no_progress_streak = 0
     last_sig = ""
+    resume_uploaded = False
 
     from ai_client import call_ai_text
 
@@ -737,6 +832,16 @@ def copilot_takeover(page, context, *, reason: str, cfg: dict, ai: dict,
                 url = active.url or ""
             except Exception:
                 url = ""
+            # Currículo do painel: sobe sozinho em campos file (não pergunta ao humano).
+            if resume_path and not resume_uploaded and file_field_indices(fields):
+                ok, detail = try_upload_resume(active, fields, resume_path)
+                if ok:
+                    resume_uploaded = True
+                    history.append(f"turn {turn}: auto {detail}")
+                    LOG.info("copiloto: %s", history[-1])
+                    no_progress_streak = 0
+                    time.sleep(random.uniform(*_TURN_PAUSE))
+                    fields, buttons, page_text = snapshot_page(active)
             # Site com driver: handoff cedo. Site desconhecido: tenta Submit, senão segue.
             if looks_ready_for_handoff(buttons, had_progress=history_has_progress(history)):
                 if allow_submit:
@@ -764,6 +869,7 @@ def copilot_takeover(page, context, *, reason: str, cfg: dict, ai: dict,
                 buttons=buttons, page_text=page_text, history=history,
                 panel_profile=panel_profile_block(cfg),
                 allow_submit=allow_submit,
+                resume_path=resume_path,
             )
             raw = call_ai_with_rate_limit_retry(
                 call_fn=call_ai_text,
@@ -836,13 +942,24 @@ def copilot_takeover(page, context, *, reason: str, cfg: dict, ai: dict,
                 if should_abort_for_stagnation(no_progress_streak):
                     return abort_close(active, context, "copiloto estagnou (ask vazio)")
                 continue
+            # Currículo já no painel → sobe o PDF, não pergunta.
+            if looks_like_resume_ask(question) and resume_path:
+                ok, detail = try_upload_resume(active, fields, resume_path)
+                history.append(f"turn {turn}: resume ask → {detail}")
+                LOG.info("copiloto: %s", history[-1])
+                if ok:
+                    resume_uploaded = True
+                    no_progress_streak = 0
+                    continue
             if not callable(connect_fn):
                 return abort_close(active, context, "ask sem connect_fn — " + question[:120])
             from copilot_asks import (
+                KIND_FILE,
                 STATUS_AWAITING_AI,
                 STATUS_ANSWERED,
                 STATUS_CANCELLED,
                 create_ask,
+                get_ask,
                 load_facts,
                 wait_for_answer,
             )
@@ -853,8 +970,15 @@ def copilot_takeover(page, context, *, reason: str, cfg: dict, ai: dict,
             except (TypeError, ValueError):
                 job_id = None
             now = str(ai.get("now_iso") or "")
+            ask_kind = KIND_FILE if looks_like_file_ask(question) else "text"
             try:
-                ask_id = create_ask(connect_fn, job_id=job_id, question=question, now_iso=now or "now")
+                ask_id = create_ask(
+                    connect_fn,
+                    job_id=job_id,
+                    question=question,
+                    now_iso=now or "now",
+                    kind=ask_kind,
+                )
             except Exception as exc:
                 return abort_close(active, context, f"falha ao criar ask: {exc}")
             wait_min = 12
@@ -863,13 +987,24 @@ def copilot_takeover(page, context, *, reason: str, cfg: dict, ai: dict,
             except ValueError:
                 wait_min = 12
             wait_min = max(3, min(45, wait_min))
-            LOG.info("copiloto: perguntando no painel (ask #%s): %s", ask_id, question[:120])
+            LOG.info(
+                "copiloto: perguntando no painel (ask #%s kind=%s): %s",
+                ask_id, ask_kind, question[:120],
+            )
             status, answer = wait_for_answer(connect_fn, ask_id, minutes=wait_min)
             if status not in {STATUS_AWAITING_AI, STATUS_ANSWERED}:
                 label = "cancelado" if status == STATUS_CANCELLED else "timeout"
                 return abort_close(
                     active, context, f"humano {label} a pergunta do copiloto: {question[:120]}"
                 )
+            row = get_ask(connect_fn, ask_id) or {}
+            human_file = str(row.get("file_path") or "").strip()
+            if human_file:
+                ok, detail = try_upload_file(active, fields, human_file)
+                history.append(f"turn {turn}: ask file → {detail}")
+                LOG.info("copiloto: %s", history[-1])
+                if ok:
+                    no_progress_streak = 0
             lang = str((job or {}).get("language") or "en")
             facts = load_facts(connect_fn, lang) or (facts + f"\n{question}: {answer}").strip()
             history.append(f"turn {turn}: ask -> answered ({_clip(answer, 80)})")
@@ -903,7 +1038,9 @@ def copilot_takeover(page, context, *, reason: str, cfg: dict, ai: dict,
                 history.append(f"turn {turn}: acao repetida ignorada ({sig})")
                 no_progress_streak += 1
                 continue
-            desc, new_page = exec_action(active, context, step_action, step_args, fields)
+            desc, new_page = exec_action(
+                active, context, step_action, step_args, fields, resume_path=resume_path
+            )
             if new_page is not None:
                 active = new_page
             history.append(
@@ -911,6 +1048,8 @@ def copilot_takeover(page, context, *, reason: str, cfg: dict, ai: dict,
                 f"-> {desc} | {step_why}"
             )
             LOG.info("copiloto: %s", history[-1])
+            if "uploaded" in (desc or "").casefold():
+                resume_uploaded = True
             if (
                 allow_submit
                 and step_action == "click"

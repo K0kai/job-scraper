@@ -46,6 +46,7 @@ from panel_log import attach_to_logger, clear_logs, ensure_log_table, list_logs,
 ROOT = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(ROOT, "jobs.db")
 RESUMES_DIR = os.path.join(ROOT, "resumes")
+COPILOT_UPLOADS_DIR = os.path.join(ROOT, "copilot_uploads")
 HOST = "127.0.0.1"
 PORT = 8765
 POLL_SECONDS = 15 * 60
@@ -3297,6 +3298,9 @@ color:#c9c9d1;border:1px solid var(--line);border-radius:10px;padding:12px;max-h
 .copilot-ask-spinner{width:28px;height:28px;border:3px solid var(--line);border-top-color:var(--accent,#9ec9ff);border-radius:50%;animation:copilot-spin .8s linear infinite}
 @keyframes copilot-spin{to{transform:rotate(360deg)}}
 .modal-dialog-ask.is-busy textarea{opacity:.65}
+.copilot-ask-file-wrap{margin:0 0 14px}
+.copilot-ask-file-wrap[hidden]{display:none!important}
+.copilot-ask-file-wrap input[type=file]{width:100%;font-size:13px}
 .worth-pager{display:inline-flex;align-items:center;gap:8px;flex-shrink:0;margin-left:4px}
 .worth-pager-btns{display:inline-flex;align-items:center;gap:6px}
 .worth-table th button.worth-sort-th{background:none;border:0;color:inherit;font:inherit;font-weight:700;letter-spacing:.08em;text-transform:uppercase;cursor:pointer;padding:0;display:inline-flex;align-items:center;gap:4px}
@@ -3417,10 +3421,14 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
   <div class="modal-dialog modal-dialog-ask" role="dialog" aria-modal="true" aria-labelledby="copilot-ask-title">
     <h3 id="copilot-ask-title">Copiloto precisa de um dado</h3>
     <p class="hint" id="copilot-ask-question"></p>
-    <p class="hint" style="margin-top:-8px">A resposta será salva em <strong>Fatos do candidato</strong> (PT e EN). O Chrome da candidatura fica aberto.</p>
+    <p class="hint" id="copilot-ask-help" style="margin-top:-8px">A resposta será salva em <strong>Fatos do candidato</strong> (PT e EN). O Chrome da candidatura fica aberto.</p>
     <div id="copilot-ask-waiting" class="copilot-ask-waiting" hidden>
       <div class="copilot-ask-spinner" aria-hidden="true"></div>
       <p id="copilot-ask-hint" class="hint">Aguardando a IA…</p>
+    </div>
+    <div id="copilot-ask-file-wrap" class="copilot-ask-file-wrap" hidden>
+      <label class="hint" for="copilot-ask-file" style="display:block;margin:0 0 6px">Anexe o arquivo pedido</label>
+      <input type="file" id="copilot-ask-file">
     </div>
     <textarea id="copilot-ask-answer" placeholder="Sua resposta…"></textarea>
     <div class="actions">
@@ -3514,6 +3522,7 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
   function setCopilotAskBusy(busy, hint) {{
     var dialog = document.querySelector("#copilot-ask-modal .modal-dialog-ask");
     var aEl = document.getElementById("copilot-ask-answer");
+    var fileEl = document.getElementById("copilot-ask-file");
     var submit = document.getElementById("copilot-ask-submit");
     var cancel = document.getElementById("copilot-ask-cancel");
     var wait = document.getElementById("copilot-ask-waiting");
@@ -3521,6 +3530,7 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
     if (dialog) dialog.classList.toggle("is-busy", !!busy);
     if (wait) wait.hidden = !busy;
     if (aEl) aEl.disabled = !!busy;
+    if (fileEl) fileEl.disabled = !!busy;
     if (submit) {{
       submit.disabled = !!busy;
       submit.hidden = !!busy;
@@ -3541,18 +3551,29 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
     var modal = document.getElementById("copilot-ask-modal");
     var qEl = document.getElementById("copilot-ask-question");
     var aEl = document.getElementById("copilot-ask-answer");
+    var fileWrap = document.getElementById("copilot-ask-file-wrap");
+    var fileEl = document.getElementById("copilot-ask-file");
+    var helpEl = document.getElementById("copilot-ask-help");
     if (!modal || !qEl) return;
     var ask = data.copilot_ask || null;
     if (ask && ask.id) {{
       var isNew = lastCopilotAskId !== ask.id;
       var busy = ask.status === "awaiting_ai";
+      var needsFile = !!ask.needs_file || ask.kind === "file";
       qEl.textContent = ask.question || "";
       modal.hidden = false;
+      if (fileWrap) fileWrap.hidden = !needsFile;
+      if (helpEl) {{
+        helpEl.innerHTML = needsFile
+          ? "Anexe o arquivo pedido (e opcionalmente um comentário). O Chrome da candidatura fica aberto."
+          : "A resposta será salva em <strong>Fatos do candidato</strong> (PT e EN). O Chrome da candidatura fica aberto.";
+      }}
       if (isNew) {{
         if (aEl && !busy) aEl.value = "";
+        if (fileEl) fileEl.value = "";
         lastCopilotAskId = ask.id;
         if (copilotAskSoundOn && !busy) playCopilotAskSound(copilotAskSoundVol);
-        try {{ if (!busy) aEl && aEl.focus(); }} catch (e) {{}}
+        try {{ if (!busy) {{ if (needsFile && fileEl) fileEl.focus(); else aEl && aEl.focus(); }} }} catch (e) {{}}
       }}
       if (busy && aEl && ask.answer) aEl.value = ask.answer;
       setCopilotAskBusy(busy, ask.hint || (busy ? "Aguardando a IA…" : ""));
@@ -3566,7 +3587,9 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
     var fd = new FormData();
     if (lastCopilotAskId) fd.append("id", String(lastCopilotAskId));
     if (extra) {{
-      Object.keys(extra).forEach(function (k) {{ fd.append(k, extra[k]); }});
+      Object.keys(extra).forEach(function (k) {{
+        if (extra[k] !== undefined && extra[k] !== null) fd.append(k, extra[k]);
+      }});
     }}
     return fetch(path, {{
       method: "POST",
@@ -3927,13 +3950,23 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
   document.addEventListener("click", function (ev) {{
     if (ev.target && ev.target.id === "copilot-ask-submit") {{
       var aEl = document.getElementById("copilot-ask-answer");
+      var fileEl = document.getElementById("copilot-ask-file");
+      var fileWrap = document.getElementById("copilot-ask-file-wrap");
+      var needsFile = fileWrap && !fileWrap.hidden;
       var answer = aEl ? String(aEl.value || "").trim() : "";
-      if (!answer) {{
+      var file = fileEl && fileEl.files && fileEl.files[0] ? fileEl.files[0] : null;
+      if (needsFile && !file) {{
+        showNotice("Anexe o arquivo pedido.", "warning");
+        return;
+      }}
+      if (!needsFile && !answer) {{
         showNotice("Digite a resposta.", "warning");
         return;
       }}
       setCopilotAskBusy(true, "Aguardando a IA…");
-      postCopilotAsk("/copilot-ask-answer", {{ answer: answer }});
+      var extra = {{ answer: answer }};
+      if (file) extra.file = file;
+      postCopilotAsk("/copilot-ask-answer", extra);
       return;
     }}
     if (ev.target && ev.target.id === "copilot-ask-cancel") {{
@@ -4193,6 +4226,55 @@ class Handler(BaseHTTPRequestHandler):
                 self.respond_notice(f"Falha no upload do currículo: {exc}", notice_kind="error", ok=False)
             return
 
+        if path == "/copilot-ask-answer":
+            content_type = (self.headers.get("Content-Type") or "").casefold()
+            file_path = ""
+            try:
+                if "multipart/form-data" in content_type:
+                    fields, files = parse_multipart(self)
+                    form_ask = fields
+                    ask_id = int(form_ask["id"]) if str(form_ask.get("id", "")).isdigit() else 0
+                    answer = (form_ask.get("answer") or "").strip()
+                    if "file" in files:
+                        from copilot_asks import save_ask_upload
+
+                        fname, raw = files["file"]
+                        file_path = save_ask_upload(
+                            uploads_dir=COPILOT_UPLOADS_DIR,
+                            ask_id=ask_id or 0,
+                            filename=fname,
+                            raw_bytes=raw,
+                        )
+                else:
+                    form_ask = parse_form(self)
+                    ask_id = int(form_ask["id"]) if form_ask.get("id", "").isdigit() else 0
+                    answer = (form_ask.get("answer") or "").strip()
+            except ValueError as exc:
+                self.respond_notice(str(exc), notice_kind="warning", ok=False)
+                return
+            if not ask_id or (not answer and not file_path):
+                self.respond_notice("Informe a resposta ou anexe o arquivo.", notice_kind="warning", ok=False)
+                return
+            from copilot_asks import answer_ask, get_ask
+
+            pending = get_ask(connect, ask_id)
+            if pending and (pending.get("kind") or "text") == "file" and not file_path:
+                self.respond_notice("Esta pergunta exige um arquivo anexado.", notice_kind="warning", ok=False)
+                return
+            ok = answer_ask(connect, ask_id, answer, now_iso=now_iso(), file_path=file_path)
+            if ok:
+                log_event(
+                    "info",
+                    "copilot",
+                    f"Ask #{ask_id} respondida no painel"
+                    + (" (com arquivo)" if file_path else "")
+                    + ".",
+                )
+                self.respond_notice("Resposta enviada — aguardando a IA (o modal fica aberto).")
+            else:
+                self.respond_notice("Pergunta já respondida ou expirada.", notice_kind="warning", ok=False)
+            return
+
         form = parse_form(self)
         if path == "/reanalyze-resume":
             language = (form.get("language") or "").strip().casefold()
@@ -4428,20 +4510,6 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/worth-reverify":
             note = enqueue_worth_reverify()
             self.respond_notice(note, notice_kind="info")
-        elif path == "/copilot-ask-answer":
-            ask_id = int(form["id"]) if form.get("id", "").isdigit() else 0
-            answer = (form.get("answer") or "").strip()
-            if not ask_id or not answer:
-                self.respond_notice("Informe a resposta.", notice_kind="warning", ok=False)
-                return
-            from copilot_asks import answer_ask
-
-            ok = answer_ask(connect, ask_id, answer, now_iso=now_iso())
-            if ok:
-                log_event("info", "copilot", f"Ask #{ask_id} respondida no painel.")
-                self.respond_notice("Resposta enviada — aguardando a IA (o modal fica aberto).")
-            else:
-                self.respond_notice("Pergunta já respondida ou expirada.", notice_kind="warning", ok=False)
         elif path == "/copilot-ask-cancel":
             ask_id = int(form["id"]) if form.get("id", "").isdigit() else 0
             if not ask_id:
