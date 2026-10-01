@@ -52,6 +52,26 @@ class ClassifyHttpTests(unittest.TestCase):
             "inactive",
         )
 
+    def test_pt_nao_aceita_candidaturas_agora_is_inactive(self) -> None:
+        # Variante LinkedIn/ATS sem "mais": "Não aceita candidaturas agora".
+        body = "Não aceita candidaturas agora"
+        self.assertEqual(worth_reverify.classify_http(200, body), "inactive")
+
+    def test_pt_nao_aceita_candidaturas_agora_beats_easy_apply(self) -> None:
+        body = (
+            "Não aceita candidaturas agora"
+            "<button>Candidatura simplificada</button>"
+        )
+        self.assertEqual(worth_reverify.classify_http(200, body), "inactive")
+
+    def test_en_not_accepting_applications_now_is_inactive(self) -> None:
+        body = "This job is not accepting applications right now."
+        self.assertEqual(worth_reverify.classify_http(200, body), "inactive")
+
+    def test_pt_nao_aceitamos_candidaturas_no_momento_is_inactive(self) -> None:
+        body = "Não aceitamos candidaturas no momento."
+        self.assertEqual(worth_reverify.classify_http(200, body), "inactive")
+
     def test_pt_nao_aceita_mais_candidaturas_is_inactive(self) -> None:
         # Texto real do banner LinkedIn PT (não "não estamos mais aceitando").
         body = (

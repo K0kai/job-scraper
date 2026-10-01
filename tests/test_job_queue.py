@@ -97,6 +97,31 @@ class QueueRetryTests(unittest.TestCase):
         late = [backoff_seconds(10, rate_limited=True) for _ in range(20)]
         self.assertTrue(all(s <= 20 * 60 for s in late))
 
+    def test_append_progress_survives_finish(self) -> None:
+        jid = self.queue.enqueue("job_apply", {"job_id": 1}, dedupe_key=None)
+        with self.queue._connect() as db:
+            db.execute("UPDATE queue_jobs SET status='running' WHERE id=?", (jid,))
+        self.queue.append_progress(jid, "abrindo Chrome")
+        self.queue.append_progress(jid, "preenchendo passo 1")
+        self.queue._finish(jid, "succeeded", 1, "", "vaga 1: ok")
+        with self.queue._connect() as db:
+            row = db.execute(
+                "SELECT status, result, last_error, progress_log FROM queue_jobs WHERE id=?",
+                (jid,),
+            ).fetchone()
+        self.assertEqual(row["status"], "succeeded")
+        self.assertEqual(row["result"], "vaga 1: ok")
+        self.assertEqual(row["last_error"], "")
+        log = row["progress_log"] or ""
+        self.assertIn("abrindo Chrome", log)
+        self.assertIn("preenchendo passo 1", log)
+        self.assertTrue(log.index("abrindo Chrome") < log.index("preenchendo passo 1"))
+
+    def test_append_progress_noop_on_bad_id(self) -> None:
+        self.queue.append_progress(None, "ignored")
+        self.queue.append_progress("x", "ignored")
+        self.queue.append_progress(999999, "missing-row")
+
 
 class LinkedInQueueConcurrencyTests(unittest.TestCase):
     def setUp(self) -> None:

@@ -72,13 +72,18 @@ def copilot_rescue(page, context, cfg: dict, ai: dict, *, reason: str) -> tuple[
     módulo falhar, cai para UNAVAILABLE e o fluxo segue o comportamento antigo."""
     try:
         from ats_copilot import ABORTED, SOLVED, SUBMITTED, copilot_takeover
+        from queue_progress import progress_from_ai
 
+        progress_from_ai(ai)(f"copiloto: {reason[:160]}")
         state, detail, active = copilot_takeover(page, context, reason=reason, cfg=cfg, ai=ai)
         if state == SUBMITTED:
+            progress_from_ai(ai)(f"copiloto enviou: {str(detail)[:140]}")
             return "submitted", detail, active
         if state == SOLVED:
+            progress_from_ai(ai)(f"copiloto ok: {str(detail)[:140]}")
             return "solved", detail, active
         if state == ABORTED:
+            progress_from_ai(ai)(f"copiloto abortou: {str(detail)[:160]}")
             return "aborted", detail, None
         return "unavailable", detail, page
     except Exception as exc:
@@ -133,12 +138,15 @@ def run_ats_flow(
         ai["resume_path"] = resume_path
 
     from apply_mode import apply_mode_is_auto
+    from queue_progress import progress_from_ai
 
+    progress = progress_from_ai(ai)
     want_auto = apply_mode_is_auto(cfg)
 
     handler_cls = find_handler(current_url)
     if handler_cls is None:
         host = _host_of(current_url)
+        progress(f"sem driver ATS ({host}) — copiloto")
         # Site sem driver: em modo auto o copiloto pode Submit; em review só preenche.
         ai_finish = dict(ai)
         ai_finish["allow_submit"] = want_auto
@@ -178,6 +186,7 @@ def run_ats_flow(
     page = _reanchor(page, context, handler_cls)
     handler: type[BaseATSHandler] = handler_cls
     instance = handler_cls()
+    progress(f"ATS {handler_cls.name} — preenchendo")
     ctx = ApplyContext(
         cfg=cfg,
         rules=rules,
@@ -206,6 +215,7 @@ def run_ats_flow(
             bits.append(str(fill_res.error))
         fill_note = " (preenchimento incompleto — " + "; ".join(bits) + ")"
         # Travou: o copiloto assume com override total antes de chamar o humano.
+        progress(f"ATS travou — copiloto ({fill_note.strip(' ()')[:140]})")
         ai_stuck = dict(ai or {})
         ai_stuck["allow_submit"] = want_auto
         state, note, cpage = copilot_rescue(page, context, cfg, ai_stuck,
@@ -213,11 +223,13 @@ def run_ats_flow(
         if state == "aborted":
             return OUTCOME_UNAUTOMATED, note
         if state == "submitted":
+            progress("copiloto enviou após travamento")
             return OUTCOME_SUBMITTED, note or f"{handler_cls.name}: copiloto enviou apos travamento"
         if state == "solved" and cpage is not None:
             # IA destravou (clicou Next, abriu o proximo passo). NAO re-executamos
             # instance.fill — em sites que ja avancaram (ex.: InHire) isso daria
             # duplo-avanco. Assumimos o passo liberado e seguimos a politica normal.
+            progress("copiloto destravou — seguindo fluxo")
             page = cpage
             fill_res = FillResult(ok=True, filled=list(fill_res.filled), missing=[])
             fill_note = " (copiloto destravou)"
@@ -230,17 +242,21 @@ def run_ats_flow(
         and (handler_cls.auto_submit_capable or want_auto)
     )
     if may_auto_submit:
+        progress("modo auto — tentando enviar")
         submit_res = instance.submit(page)
         if submit_res.clicked:
             if _confirm_submission(instance, page):
+                progress("envio confirmado (auto)")
                 return OUTCOME_SUBMITTED, (
                     f"{handler_cls.name}: enviado automaticamente "
                     f"(botao: {submit_res.button_label})"
                 )
             # submit clicado mas sem confirmacao — nao insiste, deixa com humano
+            progress("Submit sem confirmação — aguardando você")
             return _assisted_finish(instance, page, handler_cls, fill_note, human_wait, ctx)
         LOG.info("%s submit falhou (%s); caindo para assistido.", handler_cls.name, submit_res.error)
 
+    progress("preenchido — aguardando você no Chrome")
     return _assisted_finish(instance, page, handler_cls, fill_note, human_wait, ctx)
 
 

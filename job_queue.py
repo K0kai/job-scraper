@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import random
+import re
 import sqlite3
 import threading
 import time
@@ -143,6 +144,11 @@ class JobQueue:
             )
             db.execute("CREATE INDEX IF NOT EXISTS queue_jobs_status_idx ON queue_jobs(status, next_run_at)")
             db.execute("CREATE INDEX IF NOT EXISTS queue_jobs_kind_idx ON queue_jobs(kind)")
+            cols = {row["name"] for row in db.execute("PRAGMA table_info(queue_jobs)")}
+            if "progress_log" not in cols:
+                db.execute(
+                    "ALTER TABLE queue_jobs ADD COLUMN progress_log TEXT NOT NULL DEFAULT ''"
+                )
 
     def _limits(self) -> tuple[int, int, int]:
         cfg = self.get_settings()
@@ -281,6 +287,38 @@ class JobQueue:
             job_id = int(cur.lastrowid)
         log_event("info", "queue", f"Enfileirado #{job_id} ({kind}).")
         return job_id
+
+    def append_progress(self, job_id: int | None, message: str, *, max_chars: int = 12000) -> None:
+        """Append-only na fila. Não apaga result/last_error. job_id None = no-op."""
+        if job_id is None:
+            return
+        try:
+            qid = int(job_id)
+        except (TypeError, ValueError):
+            return
+        text = re.sub(r"\s+", " ", str(message or "").strip())
+        if not text:
+            return
+        stamp = _utc_now().strftime("%H:%M:%S")
+        line = f"{stamp} {text[:400]}"
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT progress_log FROM queue_jobs WHERE id=?", (qid,)
+            ).fetchone()
+            if not row:
+                return
+            prev = str(row["progress_log"] or "")
+            merged = (prev + ("\n" if prev else "") + line).strip()
+            if len(merged) > max_chars:
+                merged = merged[-max_chars:]
+                # evita cortar no meio da primeira linha visível
+                nl = merged.find("\n")
+                if nl > 0:
+                    merged = merged[nl + 1 :]
+            db.execute(
+                "UPDATE queue_jobs SET progress_log=?, updated_at=? WHERE id=?",
+                (merged, _iso(_utc_now()), qid),
+            )
 
     def list_jobs(self, *, limit: int = 100, include_terminal: bool = True) -> list[sqlite3.Row]:
         limit = max(1, min(300, limit))
@@ -466,9 +504,14 @@ class JobQueue:
         if not handler:
             self._finish(job_id, "failed", attempts, f"Handler ausente para {kind}", "")
             return
+        if attempts > 1:
+            self.append_progress(job_id, f"— retry {attempts}/{max_attempts} —")
+        else:
+            self.append_progress(job_id, f"iniciando ({kind})")
         log_event("info", "queue", f"Executando #{job_id} ({kind}), tentativa {attempts}/{max_attempts}.")
         try:
             result = handler(payload) or "ok"
+            self.append_progress(job_id, f"concluído: {str(result)[:200]}")
             self._finish(job_id, "succeeded", attempts, "", str(result)[:1000])
             log_event("success", "queue", f"Job #{job_id} ({kind}) concluído.")
         except Exception as exc:
@@ -481,6 +524,7 @@ class JobQueue:
             if retryable and attempts < max_attempts and (expires is None or now < expires):
                 delay = backoff_seconds(attempts, rate_limited=is_rate_limit_error(exc))
                 next_run = _iso(now + timedelta(seconds=delay))
+                self.append_progress(job_id, f"retry em ~{delay}s: {err[:180]}")
                 with self._connect() as db:
                     db.execute(
                         """UPDATE queue_jobs SET status='retry_wait', attempts=?, next_run_at=?, last_error=?, updated_at=?
@@ -493,6 +537,7 @@ class JobQueue:
                     f"Job #{job_id} ({kind}) em retry ({attempts}/{max_attempts}) em ~{delay}s: {err}",
                 )
             else:
+                self.append_progress(job_id, f"falhou: {err[:200]}")
                 self._finish(job_id, "failed", attempts, err[:1000], "")
                 log_event("error", "queue", f"Job #{job_id} ({kind}) falhou em definitivo: {err}")
 

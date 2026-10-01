@@ -965,13 +965,19 @@ def handle_job_apply_job(payload: dict) -> str:
     return process_auto_job(job_id)
 
 
-def process_worth_easy_apply(job_id: int) -> str:
+def process_worth_easy_apply(job_id: int, *, queue_job_id: int | None = None, on_progress=None) -> str:
     """Easy Apply assistido a partir de 'Vale a pena olhar' — sem nova busca/triagem."""
     cfg = settings()
     if cfg.get("linkedin_easy_apply") != "1":
         raise ValueError("Ative Easy Apply LinkedIn (e o aceite de risco) no painel.")
     if cfg.get("linkedin_risk_ack") != "1":
         raise ValueError("Confirme o aviso de risco/ToS no painel antes do Easy Apply.")
+
+    from queue_progress import make_progress_fn, noop_progress
+
+    progress = on_progress if callable(on_progress) else make_progress_fn(queue, queue_job_id)
+    if not callable(progress):
+        progress = noop_progress
 
     with connect() as db:
         job_row = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
@@ -1024,6 +1030,7 @@ def process_worth_easy_apply(job_id: int) -> str:
     reason = (decision["reason"] if decision else "") or "Easy Apply manual a partir de Vale a pena olhar"
 
     log_event("info", "linkedin", f"Easy Apply manual enfileirado/iniciado para vaga #{job_id}: {job.get('title')}")
+    progress(f"vaga #{job_id}: {job.get('title') or 'sem título'} — abrindo Chrome")
     ok, detail = apply_via_linkedin(
         connect,
         job,
@@ -1039,6 +1046,7 @@ def process_worth_easy_apply(job_id: int) -> str:
         api_key=api_key,
         now_iso=stamp,
         project_root=ROOT,
+        on_progress=progress,
     )
     channel = "linkedin"
     if ok:
@@ -1084,7 +1092,12 @@ def handle_linkedin_apply_job(payload: dict) -> str:
     job_id = int(payload.get("job_id") or 0)
     if not job_id:
         raise ValueError("job_id ausente no payload da fila.")
-    return process_worth_easy_apply(job_id)
+    qid = payload.get("_queue_job_id")
+    try:
+        queue_job_id = int(qid) if qid is not None else None
+    except (TypeError, ValueError):
+        queue_job_id = None
+    return process_worth_easy_apply(job_id, queue_job_id=queue_job_id)
 
 
 def enqueue_worth_easy_apply(job_id: int) -> str:
@@ -2463,6 +2476,31 @@ def queue_html(limit: int = 100) -> str:
                 f'<form method="post" action="/queue-retry" class="js-process-form" style="display:inline">'
                 f'<input type="hidden" name="id" value="{jid}"><button class="subtle" type="submit">Reenfileirar</button></form>'
             )
+        progress_raw = ""
+        try:
+            progress_raw = str(row["progress_log"] or "")
+        except (KeyError, IndexError):
+            progress_raw = ""
+        progress_lines = [ln for ln in progress_raw.splitlines() if ln.strip()]
+        last_step = progress_lines[-1] if progress_lines else ""
+        outcome = (row["last_error"] or row["result"] or "").strip()
+        detail_bits = []
+        if last_step:
+            detail_bits.append(f'<div class="queue-step"><small>{esc(last_step[:280])}</small></div>')
+        if len(progress_lines) > 1:
+            hist = esc("\n".join(progress_lines[-40:]))
+            detail_bits.append(
+                f'<details class="queue-progress"><summary><small>histórico '
+                f'({len(progress_lines)})</small></summary>'
+                f'<pre style="white-space:pre-wrap;max-height:220px;overflow:auto;'
+                f'font-size:11px;margin:4px 0 0">{hist}</pre></details>'
+            )
+        if outcome:
+            detail_bits.append(
+                f'<div class="queue-outcome"><small>{esc(outcome[:220])}</small></div>'
+            )
+        if not detail_bits:
+            detail_bits.append("<small>—</small>")
         body.append(
             "<tr>"
             f"<td>#{jid}</td>"
@@ -2470,7 +2508,7 @@ def queue_html(limit: int = 100) -> str:
             f"<td><span class=\"queue-status queue-{esc(row['status'])}\">{esc(status_label.get(row['status'], row['status']))}</span></td>"
             f"<td>{int(row['attempts'])}/{int(row['max_attempts'])}</td>"
             f"<td><small>{esc(format_brasilia(row['next_run_at']))}</small></td>"
-            f"<td><small>{esc((row['last_error'] or row['result'] or '—')[:220])}</small></td>"
+            f"<td>{''.join(detail_bits)}</td>"
             f"<td>{' '.join(actions) or '—'}</td>"
             "</tr>"
         )

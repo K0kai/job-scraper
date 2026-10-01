@@ -1049,6 +1049,12 @@ def copilot_takeover(page, context, *, reason: str, cfg: dict, ai: dict,
                 "copiloto: perguntando no painel (ask #%s kind=%s): %s",
                 ask_id, ask_kind, question[:120],
             )
+            progress = ai.get("progress")
+            if callable(progress):
+                try:
+                    progress(f"perguntando no painel: {question[:140]}")
+                except Exception:
+                    pass
             status, answer = wait_for_answer(connect_fn, ask_id, minutes=wait_min)
             if status not in {STATUS_AWAITING_AI, STATUS_ANSWERED}:
                 label = "cancelado" if status == STATUS_CANCELLED else "timeout"

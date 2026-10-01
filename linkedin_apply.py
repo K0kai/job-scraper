@@ -473,6 +473,12 @@ def _handle_external_ats(
                 continue
 
     salary = _salary_from_rules(rules, cfg, job_context_text((ai or {}).get("job")))
+    progress = (ai or {}).get("progress") if isinstance(ai, dict) else None
+    if callable(progress):
+        try:
+            progress("fluxo ATS externo")
+        except Exception:
+            pass
     outcome, detail = run_ats_flow(
         page,
         context,
@@ -828,6 +834,7 @@ def apply_via_linkedin(
     api_key: str,
     now_iso: str,
     project_root: str,
+    on_progress=None,
 ) -> tuple[bool, str]:
     """
     Assisted Easy Apply only:
@@ -837,6 +844,9 @@ def apply_via_linkedin(
     - headed Chrome persistent profile (manual login once)
     - leaves Review open for you to send
     """
+    from queue_progress import noop_progress
+
+    progress = on_progress if callable(on_progress) else noop_progress
     if (cfg.get("linkedin_easy_apply") or "0") != "1":
         return False, "Easy Apply LinkedIn desligado nas configurações."
     if (cfg.get("linkedin_risk_ack") or "0") != "1":
@@ -929,6 +939,7 @@ def apply_via_linkedin(
         "api_key": api_key,
         "connect_fn": connect_fn,
         "now_iso": now_iso,
+        "progress": progress,
     }
     pending_answers: list[tuple[str, str]] = []
     open_count = [0]
@@ -955,6 +966,7 @@ def apply_via_linkedin(
 
             # URL de ATS conhecido direto (sem hop LinkedIn) — handler decide.
             if find_handler(url) is not None:
+                progress("ATS direto — abrindo formulário")
                 page.goto(url, wait_until="domcontentloaded", timeout=60000)
                 _human_pause(1.5, 3.0)
                 return _handle_external_ats(
@@ -971,10 +983,12 @@ def apply_via_linkedin(
                 )
 
             # Go straight to the LinkedIn job URL.
+            progress("abrindo vaga no LinkedIn")
             page.goto(url, wait_until="domcontentloaded", timeout=60000)
             _human_pause(1.8, 3.5)
 
             if _page_has_checkpoint(page):
+                progress("checkpoint/CAPTCHA — aguardando você")
                 if not _wait_for_human_checkpoint(page, minutes=min(15, login_wait)):
                     context.close()
                     return block(
@@ -983,6 +997,7 @@ def apply_via_linkedin(
                     )
 
             if _page_looks_logged_out(page):
+                progress("login LinkedIn necessário — aguardando você")
                 if not _wait_for_manual_login(page, minutes=login_wait, profile=profile):
                     # Closing saves cookies from any partial login progress.
                     context.close()
@@ -1040,6 +1055,7 @@ def apply_via_linkedin(
 
             # --- External ATS (InHire, etc.) ---
             if external_btn and not easy_btn:
+                progress("Apply externo — abrindo ATS")
                 external_btn.scroll_into_view_if_needed(timeout=3000)
                 _human_pause(0.4, 1.0)
                 ats_page = _open_external_apply_target(page, context, external_btn)
@@ -1056,6 +1072,7 @@ def apply_via_linkedin(
                     ai=ai_ctx,
                 )
 
+            progress("Easy Apply — preenchendo passos")
             easy_btn.scroll_into_view_if_needed(timeout=3000)
             _human_pause(0.4, 1.0)
             easy_btn.click(timeout=8000, delay=random.randint(50, 160))
@@ -1133,11 +1150,13 @@ def apply_via_linkedin(
                     # Travou no modal Easy Apply: o copiloto assume com override total.
                     from ats_router import copilot_rescue
 
+                    progress(f"passo {step + 1}: travou — copiloto ({str(err)[:120]})")
                     cstate, cnote, cpage = copilot_rescue(page, context, cfg, ai_ctx,
                                                           reason="modal Easy Apply travado — " + str(err))
                     if cstate == "aborted":
                         return block(cnote)
                     if cstate == "solved":
+                        progress("copiloto destravou — retomando preenchimento")
                         page = cpage
                         retry_modal = _modal(page, timeout_ms=4000)
                         if retry_modal is None:
@@ -1155,6 +1174,7 @@ def apply_via_linkedin(
                     if err:
                         # Copiloto nao resolveu (ou nao havia IA): browser aberto p/ humano.
                         LOG.warning("Fill incomplete (%s) — aguardando você no Chrome.", err)
+                        progress("aguardando você no Chrome (preenchimento parcial)")
                         outcome = _wait_for_human_submit(page, minutes=human_wait)
                         try:
                             context.close()
@@ -1172,10 +1192,12 @@ def apply_via_linkedin(
                 # Prefer Review; never Submit.
                 if _click_first_matching(page, REVIEW_RE):
                     reached_review = True
+                    progress("chegou em Review")
                     _human_pause(1.0, 2.0)
                     break
 
                 if _click_first_matching(page, NEXT_RE):
+                    progress(f"passo {step + 1}: Next")
                     _human_pause(0.9, 2.0)
                     continue
 
@@ -1195,6 +1217,7 @@ def apply_via_linkedin(
 
             if apply_mode_is_auto(cfg):
                 LOG.info("Easy Apply modo auto: tentando clicar Enviar.")
+                progress("modo auto — tentando Enviar")
                 if _click_first_matching(page, SUBMIT_RE):
                     _human_pause(1.0, 2.0)
                     if wait_for_success_signal(page, timeout_s=25, success_regex=SUCCESS_RE):
@@ -1202,13 +1225,18 @@ def apply_via_linkedin(
                             context.close()
                         except Exception:
                             pass
+                        progress("envio confirmado (auto)")
                         return finish_ok(
                             "auto: candidatura enviada pelo robô no Easy Apply.",
                             status_detail="Easy Apply enviado automaticamente (sucesso confirmado na página).",
                         )
                     LOG.warning("Easy Apply auto: Submit clicado sem confirmação — abrindo espera humana.")
+                    progress("Submit sem confirmação — aguardando você")
                 else:
                     LOG.warning("Easy Apply auto: botão Enviar não encontrado — espera humana.")
+                    progress("Enviar não encontrado — aguardando você")
+            else:
+                progress("Review pronto — aguardando você enviar")
 
             outcome = _wait_for_human_submit(page, minutes=human_wait)
             try:

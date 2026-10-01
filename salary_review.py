@@ -140,12 +140,24 @@ def review_salary_value(
     if action == "ok":
         return value, meta
     if action == "adjust" and parsed.get("value"):
+        progress = ai.get("progress")
+        if callable(progress):
+            try:
+                progress(f"salário ajustado pela IA: {parsed['value']}")
+            except Exception:
+                pass
         return str(parsed["value"]), meta
     if action == "ask":
         connect_fn = ai.get("connect_fn")
         question = parsed.get("question") or (
             f"Qual pretensão informar neste campo? (proposta: {value}; {field_hint[:120]})"
         )
+        progress = ai.get("progress")
+        if callable(progress):
+            try:
+                progress(f"perguntando salário: {question[:140]}")
+            except Exception:
+                pass
         if callable(connect_fn):
             try:
                 from copilot_asks import (
@@ -172,6 +184,11 @@ def review_salary_value(
                 status, answer = wait_for_answer(connect_fn, ask_id, minutes=12)
                 if status in {STATUS_AWAITING_AI, STATUS_ANSWERED} and (answer or "").strip():
                     complete_ask(connect_fn, ask_id)
+                    if callable(progress):
+                        try:
+                            progress(f"salário respondido: {answer.strip()[:80]}")
+                        except Exception:
+                            pass
                     return answer.strip(), {**meta, "action": "ask", "answered": True}
             except Exception as exc:
                 LOG.warning("salary_review ask falhou (%s) — mantendo proposta", exc)
