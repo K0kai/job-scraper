@@ -2939,6 +2939,76 @@ def format_countdown(seconds: int | None) -> str:
     return f"{mins:02d}:{secs:02d}"
 
 
+# Labels padrão do timer do coletor (runbar). Outros timers passam o próprio dict.
+COLLECTOR_COUNTDOWN_LABELS: dict[str, str] = {
+    "stopped": "Próxima busca: — (bot parado)",
+    "busy": "Próxima busca: em andamento…",
+    "running": "Próxima busca em",
+}
+
+
+def countdown_entry(*, at: str | None = None, state: str = "busy") -> dict[str, str]:
+    """Estado de um timer: state=stopped|busy|running; at=ISO UTC quando running."""
+    state = (state or "busy").strip().casefold()
+    if state not in {"stopped", "busy", "running"}:
+        state = "busy"
+    return {"at": (at or "").strip(), "state": state}
+
+
+def collector_countdown(status: dict) -> dict[str, str]:
+    if (status.get("state") or "") == "stopped":
+        return countdown_entry(state="stopped")
+    at = status.get("next_run_at")
+    if at:
+        return countdown_entry(at=str(at), state="running")
+    return countdown_entry(state="busy")
+
+
+def format_countdown_label(entry: dict[str, str], *, labels: dict[str, str]) -> str:
+    state = (entry.get("state") or "busy").casefold()
+    if state == "stopped":
+        return labels.get("stopped") or "—"
+    at = (entry.get("at") or "").strip()
+    if not at or state == "busy":
+        return labels.get("busy") or "em andamento…"
+    secs = next_run_countdown_seconds(at)
+    prefix = (labels.get("running") or "").rstrip()
+    clock = format_countdown(secs if secs is not None else 0)
+    return f"{prefix} {clock}".strip() if prefix else clock
+
+
+def countdown_span_html(
+    key: str,
+    entry: dict[str, str],
+    *,
+    labels: dict[str, str],
+    extra_class: str = "runtime",
+    style: str = "",
+) -> str:
+    """Span com data-* para o JS atualizar N timers com um único setInterval."""
+    text = format_countdown_label(entry, labels=labels)
+    style_attr = f' style="{esc(style)}"' if style else ""
+    cls = f"countdown {extra_class}".strip()
+    return (
+        f'<span class="{esc(cls)}"'
+        f' data-countdown-key="{esc(key)}"'
+        f' data-at="{esc(entry.get("at") or "")}"'
+        f' data-state="{esc(entry.get("state") or "")}"'
+        f' data-label-stopped="{esc(labels.get("stopped") or "")}"'
+        f' data-label-busy="{esc(labels.get("busy") or "")}"'
+        f' data-label-running="{esc(labels.get("running") or "")}"'
+        f"{style_attr}>{esc(text)}</span>"
+    )
+
+
+def live_countdowns(status: dict | None = None) -> dict[str, dict[str, str]]:
+    """Mapa key → {{at, state}} exposto em /live. Inclua novas chaves aqui + span no HTML."""
+    status = status or collector.snapshot()
+    return {
+        "collector": collector_countdown(status),
+    }
+
+
 def live_payload(
     *,
     worth_page: int = 1,
@@ -2977,7 +3047,9 @@ def live_payload(
         pass
     linkedin_filter = linkedin_filter_panel_html()
     usage = usage_dashboard_html()
-    next_in = next_run_countdown_seconds(status.get("next_run_at"))
+    countdowns = live_countdowns(status)
+    collector_cd = countdowns.get("collector") or countdown_entry(state="stopped")
+    next_in = next_run_countdown_seconds(collector_cd.get("at") or None)
     from copilot_asks import get_pending_ask
 
     pending_ask = get_pending_ask(connect)
@@ -2986,9 +3058,11 @@ def live_payload(
         "state": status["state"],
         "state_label": state_label_for(status["state"]),
         "message": status["message"],
-        "next_run_at": status.get("next_run_at"),
+        "countdowns": countdowns,
+        # aliases legados do timer do coletor
+        "next_run_at": collector_cd.get("at") or None,
         "next_run_in_seconds": next_in,
-        "next_run_label": format_countdown(next_in) if next_in is not None else "",
+        "next_run_label": format_countdown_label(collector_cd, labels=COLLECTOR_COUNTDOWN_LABELS),
         "stats_html": stats,
         "stats_hash": _live_hash(stats),
         "jobs_html": jobs_body,
@@ -3453,13 +3527,13 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
     rows = job_rows_html(jobs, collecting)
     history = history_html(runs)
     state_label = state_label_for(status["state"])
-    next_in = next_run_countdown_seconds(status.get("next_run_at"))
-    if status["state"] == "stopped":
-        next_run_timer_text = "Próxima busca: — (bot parado)"
-    elif next_in is not None:
-        next_run_timer_text = f"Próxima busca em {format_countdown(next_in)}"
-    else:
-        next_run_timer_text = "Próxima busca: em andamento…"
+    countdowns = live_countdowns(status)
+    collector_timer_html = countdown_span_html(
+        "collector",
+        countdowns["collector"],
+        labels=COLLECTOR_COUNTDOWN_LABELS,
+        style="margin-left:14px",
+    )
     resume_panel = resume_panels_html()
     rules_panel = form_rules_html()
     logs_view = logs_html()
@@ -3503,7 +3577,7 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
 <main class="content">{notice_html}
 
 <div id="tab-painel" class="tab-panel active">
-<section class="panel runbar"><div class="actions" style="margin:0"><form method="post" action="/start" class="js-process-form"><button>Iniciar bot</button></form><form method="post" action="/stop" class="js-process-form"><button class="stop">Parar bot</button></form><span class="runtime" id="runtime-message">{esc(status['message'])}</span><span class="runtime" id="next-run-timer" style="margin-left:14px">{esc(next_run_timer_text)}</span></div></section>
+<section class="panel runbar"><div class="actions" style="margin:0"><form method="post" action="/start" class="js-process-form"><button>Iniciar bot</button></form><form method="post" action="/stop" class="js-process-form"><button class="stop">Parar bot</button></form><span class="runtime" id="runtime-message">{esc(status['message'])}</span>{collector_timer_html}</div></section>
 <div class="stats" id="job-stats">{cards}</div>
 <section class="table-wrap"><table><thead><tr><th>Vaga</th><th>Localidade</th><th>Fonte</th><th>Idioma</th><th>Etapa</th><th>Carta e descrição</th><th>Data</th></tr></thead><tbody id="jobs-body">{rows}</tbody></table></section>
 <section class="panel" style="margin-top:18px"><h2>Execuções recentes</h2><ul class="history" id="run-history">{history}</ul></section>
@@ -3567,8 +3641,6 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
 <script>
 (function () {{
   var inFlight = false;
-  var nextRunAtIso = {json.dumps(status.get("next_run_at"))};
-  var collectorState = {json.dumps(status["state"])};
   function formatCountdownClient(sec) {{
     sec = Math.max(0, Math.floor(sec));
     var h = Math.floor(sec / 3600);
@@ -3577,24 +3649,38 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
     if (h > 0) return h + ":" + String(m).padStart(2, "0") + ":" + String(s).padStart(2, "0");
     return String(m).padStart(2, "0") + ":" + String(s).padStart(2, "0");
   }}
-  function updateNextRunTimer() {{
-    var el = document.getElementById("next-run-timer");
-    if (!el) return;
-    if (collectorState === "stopped") {{
-      el.textContent = "Próxima busca: — (bot parado)";
-      return;
-    }}
-    if (!nextRunAtIso) {{
-      el.textContent = "Próxima busca: em andamento…";
-      return;
-    }}
-    var target = Date.parse(nextRunAtIso);
-    if (!target) {{
-      el.textContent = "Próxima busca: —";
-      return;
-    }}
-    var left = Math.max(0, Math.round((target - Date.now()) / 1000));
-    el.textContent = "Próxima busca em " + formatCountdownClient(left);
+  function applyCountdownMap(map) {{
+    if (!map || typeof map !== "object") return;
+    Object.keys(map).forEach(function (key) {{
+      var el = document.querySelector('[data-countdown-key="' + key + '"]');
+      if (!el) return;
+      var entry = map[key] || {{}};
+      el.setAttribute("data-at", entry.at || "");
+      el.setAttribute("data-state", entry.state || "");
+    }});
+  }}
+  function updateAllCountdowns() {{
+    document.querySelectorAll("[data-countdown-key]").forEach(function (el) {{
+      var state = el.getAttribute("data-state") || "";
+      if (state === "stopped") {{
+        el.textContent = el.getAttribute("data-label-stopped") || "—";
+        return;
+      }}
+      var iso = el.getAttribute("data-at") || "";
+      if (!iso || state === "busy") {{
+        el.textContent = el.getAttribute("data-label-busy") || "em andamento…";
+        return;
+      }}
+      var target = Date.parse(iso);
+      if (!target) {{
+        el.textContent = el.getAttribute("data-label-busy") || "—";
+        return;
+      }}
+      var left = Math.max(0, Math.round((target - Date.now()) / 1000));
+      var prefix = (el.getAttribute("data-label-running") || "").replace(/\\s+$/, "");
+      var clock = formatCountdownClient(left);
+      el.textContent = prefix ? (prefix + " " + clock) : clock;
+    }});
   }}
   document.querySelectorAll(".tab").forEach(function (btn) {{
     btn.addEventListener("click", function () {{
@@ -3996,11 +4082,18 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
         var worthEl = document.getElementById("worth-body");
         if (stateEl && stateEl.textContent !== data.state_label) stateEl.textContent = data.state_label;
         if (messageEl && messageEl.textContent !== data.message) messageEl.textContent = data.message;
-        if (data.state) collectorState = data.state;
-        if (typeof data.next_run_at !== "undefined") {{
-          nextRunAtIso = data.next_run_at || null;
-          updateNextRunTimer();
+        if (data.countdowns) {{
+          applyCountdownMap(data.countdowns);
+        }} else if (typeof data.next_run_at !== "undefined") {{
+          // fallback legado se o payload ainda não tiver countdowns
+          applyCountdownMap({{
+            collector: {{
+              at: data.next_run_at || "",
+              state: data.state === "stopped" ? "stopped" : (data.next_run_at ? "running" : "busy")
+            }}
+          }});
         }}
+        updateAllCountdowns();
         // Cliente é a fonte da verdade p/ match+data+sort. Resposta velha do /live
         // não pode sobrescrever um filtro que o usuário acabou de mudar.
         var worthFresh = reqGen === liveReqGen;
@@ -4173,8 +4266,8 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
       }});
   }});
   setInterval(refresh, 1500);
-  setInterval(updateNextRunTimer, 1000);
-  updateNextRunTimer();
+  setInterval(updateAllCountdowns, 1000);
+  updateAllCountdowns();
   document.addEventListener("visibilitychange", function () {{ if (!document.hidden) refresh(); }});
 }})();
 </script></body></html>'''
