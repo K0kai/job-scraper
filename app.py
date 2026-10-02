@@ -3658,11 +3658,11 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
   function applyCountdownMap(map) {{
     if (!map || typeof map !== "object") return;
     Object.keys(map).forEach(function (key) {{
-      var el = document.querySelector('[data-countdown-key="' + key + '"]');
-      if (!el) return;
       var entry = map[key] || {{}};
-      el.setAttribute("data-at", entry.at || "");
-      el.setAttribute("data-state", entry.state || "");
+      document.querySelectorAll('[data-countdown-key="' + key + '"]').forEach(function (el) {{
+        el.setAttribute("data-at", entry.at || "");
+        el.setAttribute("data-state", entry.state || "");
+      }});
     }});
   }}
   function updateAllCountdowns() {{
