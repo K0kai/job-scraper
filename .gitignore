@@ -1,6 +1,9 @@
 jobs.db
 jobs.db-shm
 jobs.db-wal
+*.db
+.env
+.env.*
 __pycache__/
 .venv/
 resumes/*.pdf
@@ -8,5 +11,7 @@ resumes/*.tmp
 copilot_uploads/
 linkedin_browser_profile/
 *.pyc
-tests/*
-!tests/*.py
+
+# Notas internas e suíte local — fora do repositório público
+docs/superpowers/
+tests/
