@@ -1598,7 +1598,10 @@ def ai_generate_linkedin_search_filter(cfg: dict[str, str]) -> dict:
         raise AiUnavailableError("Configure a chave da API de IA para gerar o filtro LinkedIn.")
 
     prompt = f"""You design LinkedIn Jobs search filters for Apify (curious_coder linkedin-jobs-scraper).
-The scraper takes LinkedIn search URLs. Choose filters that match THIS candidate's real level and stack.
+The scraper takes LinkedIn search URLs. Choose filters that match THIS candidate's real level and stack,
+AND also take market demand into account: select and prioritize the skills and project topics most in high demand
+globally. When picking keywords, experience levels, and projects, you should reflect the candidate's relevant experience
+but emphasize those skills and subjects that are currently in high demand on the job market.
 
 LinkedIn experience codes (f_E): 1 Internship, 2 Entry, 3 Associate, 4 Mid-Senior, 5 Director, 6 Executive.
 LinkedIn workplace codes (f_WT): 1 On-site, 2 Remote, 3 Hybrid.
@@ -1614,7 +1617,8 @@ GEO / WORKPLACE RULES (mandatory — override panel location preferences):
 
 Other rules:
 - Prefer 2–4 experience codes centered on the candidate's seniority (usually one level below + main; avoid Director/Executive unless clearly supported).
-- keywords: 2–5 concrete job-search phrases (role + stack when useful), preferably in English for global remote reach; PT only if clearly Brazil-hybrid BH search.
+- keywords: Select 2–5 concrete job-search phrases (role + stack when useful), preferably in English for global remote reach; PT only if clearly Brazil-hybrid BH search. Make sure these reflect skills and projects from the candidate's experience that are ALSO in high demand on the global job market.
+- Use current job market demand (for example, trending roles, frameworks, languages, or stacks) as an influence — but ONLY select those which are actually present in the candidate's real experience or demonstrated skills/projects.
 - Do NOT invent employers or skills; only use the resume summaries and facts.
 - RECENCY (mandatory — the URL builder enforces this; mention it in reason):
   * Only consider jobs from the last 7 days (LinkedIn f_TPR=r604800).
@@ -1624,7 +1628,7 @@ Other rules:
   locations (string array),
   experience_levels (integer array of f_E codes),
   workplace_types (integer array of f_WT codes),
-  reason (short string in Portuguese explaining the choice, mentioning remote global + hybrid BH + prioridade a vagas do dia / máx. 7 dias).
+  reason (short string in Portuguese explaining the choice, mentioning remote global + hybrid BH + prioridade a vagas do dia / máx. 7 dias, e também destacando que as palavras-chave escolhidas estão em alta demanda no mercado e refletem a experiência do candidato).
 
 Panel keyword preferences (roles/skills only — ignore geo bias here): {pref_keywords or '[none]'}
 Candidate facts PT: {facts_pt or '[none]'}
@@ -2941,7 +2945,7 @@ def format_countdown(seconds: int | None) -> str:
 
 # Labels padrão do timer do coletor (runbar). Outros timers passam o próprio dict.
 COLLECTOR_COUNTDOWN_LABELS: dict[str, str] = {
-    "stopped": "Próxima busca: — (bot parado)",
+    "stopped": "Próxima busca: —",
     "busy": "Próxima busca: em andamento…",
     "running": "Próxima busca em",
 }
@@ -3362,6 +3366,7 @@ border-left:2px solid transparent;transition:background .12s,color .12s}
 .sidebar-foot{margin-top:auto;border-top:1px solid var(--line);padding-top:14px}
 #collector-state{font-size:12px;font-weight:700;color:var(--muted);display:inline-flex;align-items:center;gap:7px}
 #collector-state::before{content:"";width:8px;height:8px;border-radius:50%;background:var(--muted2)}
+#collector-countdown{font-size:12px;font-weight:500;color:var(--muted);display:inline-flex;align-items:center;gap:7px}
 .content{padding:28px clamp(20px,3vw,40px) 40px;overflow-x:auto}
 h1{font-size:20px;margin:0}
 h2{font-size:16px;margin:0 0 16px;font-weight:700;letter-spacing:-.01em;color:var(--white)}
@@ -3573,7 +3578,7 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
 <button type="button" class="tab" data-tab="automacao">Automação &amp; LinkedIn</button>
 <button type="button" class="tab" data-tab="smtp">SMTP</button>
 </nav>
-<div class="sidebar-foot"><span id="collector-state">{esc(state_label)}</span></div>
+<div class="sidebar-foot"><span id="collector-state">{esc(state_label)}</span><br><span id="collector-countdown">{collector_timer_html}</span></div>
 </aside>
 <main class="content">{notice_html}
 
