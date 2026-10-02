@@ -3444,6 +3444,7 @@ border:1px solid var(--line2);background:var(--panel2)}
   word-break: break-word;
   font-size: 13px;
   vertical-align: middle;
+}
 .log-console{font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:#08080a;
 color:#c9c9d1;border:1px solid var(--line);border-radius:10px;padding:12px;max-height:600px;overflow:auto}
 .log-line{display:grid;grid-template-columns:128px 66px 104px 1fr;gap:10px;padding:5px 0;border-bottom:1px solid #141417}
