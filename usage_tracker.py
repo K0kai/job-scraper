@@ -10,6 +10,8 @@ import threading
 from datetime import datetime, timezone
 from typing import Any, Callable
 
+from dates_br import format_brasilia_date, format_cycle_range, format_month_label
+
 STORE_KEY = "ai_usage_json"
 APIFY_SNAPSHOT_KEY = "apify_quota_snapshot_json"
 _LOCK = threading.Lock()
@@ -154,8 +156,8 @@ def summarize_ai_usage(
         "provider": provider,
         "day": day,
         "month": month,
-        "day_label": when.astimezone(timezone.utc).strftime("%Y-%m-%d"),
-        "month_label": when.astimezone(timezone.utc).strftime("%Y-%m"),
+        "day_label": format_brasilia_date(when.astimezone(timezone.utc).strftime("%Y-%m-%d")),
+        "month_label": format_month_label(when.astimezone(timezone.utc).strftime("%Y-%m")),
         "is_local_estimate": True,
     }
 
@@ -167,9 +169,9 @@ def parse_apify_limits(payload: dict[str, Any], *, local_limit_usd: float) -> di
     cycle = data.get("monthlyUsageCycle") or data.get("usageCycle") or {}
     used = float(current.get("monthlyUsageUsd") or 0)
     api_limit = float(limits.get("maxMonthlyUsageUsd") or 0)
-    start = str(cycle.get("startAt", ""))[:10]
-    end = str(cycle.get("endAt", ""))[:10]
-    label = f"{start} a {end}" if start or end else "ciclo atual"
+    start = cycle.get("startAt", "")
+    end = cycle.get("endAt", "")
+    label = format_cycle_range(start, end)
     local = max(0.0, float(local_limit_usd or 0))
     pct_local = (used / local * 100.0) if local > 0 else 0.0
     pct_api = (used / api_limit * 100.0) if api_limit > 0 else 0.0

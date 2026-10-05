@@ -16,9 +16,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote_plus, urlparse
 from urllib.request import Request, urlopen
-from zoneinfo import ZoneInfo
 
-from apply_channels import apply_via_browser, apply_via_email, record_blocked, send_smtp_email
+from dates_br import BRASILIA, format_brasilia, format_brasilia_date, format_cycle_label_display, format_cycle_range, parse_utc
+
 from form_rules import ensure_default_rules, list_rules, save_rules_from_form
 from job_queue import (
     ACTIVE_STATUSES,
@@ -170,57 +170,10 @@ DEFAULT_SETTINGS = {
     "candidate_diversity_note": "",
 }
 STATUSES = {"new": "Nova", "review": "Na fila", "worth": "Vale a pena olhar", "saved": "Salva", "prepared": "Carta preparada", "applied": "Aplicada", "ignored": "Ignorada", "blocked": "Envio indisponível"}
-BRASILIA = ZoneInfo("America/Sao_Paulo")
 
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
-def parse_utc(value: object) -> datetime | None:
-    raw = str(value or "").strip()
-    if not raw:
-        return None
-    normalized = raw.replace("Z", "+00:00")
-    try:
-        parsed = datetime.fromisoformat(normalized)
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
-
-
-def format_brasilia(value: object) -> str:
-    raw = str(value or "").strip()
-    if not raw:
-        return ""
-    if "T" not in raw and " " not in raw and not raw.replace(".", "", 1).isdigit():
-        # Date-only string without time — keep as calendar day when already dd-like, else parse.
-        parsed = parse_utc(raw + "T00:00:00+00:00") if len(raw) >= 10 and raw[4] == "-" else None
-        if parsed is None:
-            return raw[:10]
-        return parsed.astimezone(BRASILIA).strftime("%d/%m/%Y")
-    parsed = parse_utc(raw)
-    if parsed is None:
-        return raw
-    return parsed.astimezone(BRASILIA).strftime("%d/%m/%Y %H:%M")
-
-
-def format_brasilia_date(value: object) -> str:
-    """Data em Brasília no formato dd/mm/yyyy (sem hora)."""
-    raw = str(value or "").strip()
-    if not raw:
-        return ""
-    if "T" not in raw and " " not in raw and not raw.replace(".", "", 1).isdigit():
-        parsed = parse_utc(raw[:10] + "T12:00:00+00:00") if len(raw) >= 10 and raw[4] == "-" else None
-        if parsed is None:
-            return raw[:10]
-        return parsed.astimezone(BRASILIA).strftime("%d/%m/%Y")
-    parsed = parse_utc(raw)
-    if parsed is None:
-        return raw[:10]
-    return parsed.astimezone(BRASILIA).strftime("%d/%m/%Y")
 
 
 def connect() -> sqlite3.Connection:
@@ -1249,9 +1202,7 @@ def apify_monthly_usage_usd(token: str) -> tuple[float, str]:
     data = payload.get("data", payload) if isinstance(payload, dict) else {}
     used = float(data.get("totalUsageCreditsUsdAfterVolumeDiscount") or data.get("totalUsageCreditsUsdBeforeVolumeDiscount") or 0)
     cycle = data.get("usageCycle") or {}
-    start = str(cycle.get("startAt", ""))[:10]
-    end = str(cycle.get("endAt", ""))[:10]
-    label = f"{start} a {end}" if start or end else "ciclo atual"
+    label = format_cycle_range(cycle.get("startAt", ""), cycle.get("endAt", ""))
     return used, label
 
 
@@ -1347,10 +1298,10 @@ def usage_dashboard_html() -> str:
             f'<div><span>Usado (ciclo)</span><strong>${used:.2f}</strong></div>'
             f'<div><span>Limite da conta (API)</span><strong>${api_lim:.2f}</strong></div>'
             f'<div><span>Limite local (painel)</span><strong>${local_lim:.2f}</strong></div>'
-            f'<div><span>Ciclo</span><strong>{esc(snap.get("cycle_label") or "—")}</strong></div>'
+            f'<div><span>Ciclo</span><strong>{esc(format_cycle_label_display(snap.get("cycle_label") or "—"))}</strong></div>'
             f'</div>'
             f'{bar(pct if effective > 0 else 0)}'
-            f'<p class="hint">Última consulta: {esc(snap.get("fetched_at") or "—")}'
+            f'<p class="hint">Última consulta: {esc(format_brasilia(snap.get("fetched_at") or "")) or "—"}'
             + (f' · {esc(err)}' if err else "")
             + "</p>"
         )
@@ -1363,7 +1314,7 @@ def usage_dashboard_html() -> str:
         f'Conta só chamadas feitas por aqui (tokens quando a API devolver).</p>'
         f'<p class="hint">Provedor ativo: <strong>{esc(provider_label)}</strong>'
         + (f' · modelo <code>{esc(model)}</code>' if model else "")
-        + f' · dia {esc(ai["day_label"])} / mês {esc(ai["month_label"])} (UTC)</p>'
+        + f' · dia {esc(ai["day_label"])} / mês {esc(ai["month_label"])} (Brasília)</p>'
         f'<div class="usage-metrics">'
         f'<div><span>Chamadas OK (hoje)</span><strong>{int(day.get("calls_ok") or 0)}</strong></div>'
         f'<div><span>Erros de quota (hoje)</span><strong>{int(day.get("calls_quota_error") or 0)}</strong></div>'
@@ -2842,7 +2793,10 @@ def worth_html(
     if min_match > 0:
         note_bits.append(f"match ≥ {min_match}")
     if date_from or date_to:
-        note_bits.append(f"encontrada {date_from or '…'} → {date_to or '…'}")
+        note_bits.append(
+            f"encontrada {format_brasilia_date(date_from) if date_from else '…'}"
+            f" → {format_brasilia_date(date_to) if date_to else '…'}"
+        )
     if total:
         start = offset + 1
         end = offset + len(rows)
@@ -2905,7 +2859,7 @@ def worth_html(
                     '<button type="button" class="subtle" disabled title="Ative Easy Apply + risco">EA off</button>'
                 )
         posted_raw = (job["posted_at"] or "").strip()
-        posted_label = format_brasilia(posted_raw) if posted_raw else "—"
+        posted_label = format_brasilia_date(posted_raw) if posted_raw else "—"
         seen_label = format_brasilia(job["first_seen_at"])
         details = (
             "<details class=\"worth-details\"><summary>Abrir</summary>"
@@ -4926,7 +4880,7 @@ class Handler(BaseHTTPRequestHandler):
                 used = float(snap.get("used_usd") or 0)
                 lim = float(snap.get("local_limit_usd") or snap.get("api_limit_usd") or 0)
                 self.respond_notice(
-                    f"Apify: ${used:.2f} de ${lim:.2f} no ciclo {snap.get('cycle_label') or 'atual'}.",
+                    f"Apify: ${used:.2f} de ${lim:.2f} no ciclo {format_cycle_label_display(snap.get('cycle_label') or 'atual')}.",
                     notice_kind="success",
                 )
         elif path == "/queue-cancel":
