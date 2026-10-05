@@ -1487,12 +1487,13 @@ Other rules:
 - RECENCY (mandatory — the URL builder enforces this; mention it in reason):
   * Only consider jobs from the last 7 days (LinkedIn f_TPR=r604800).
   * Strongly prioritize jobs posted today / last 24 hours (f_TPR=r86400) over older ones in the week.
+- OPEN JOBS ONLY (intent): design searches for roles that still accept applications. Prefer fresher postings; never aim for filled/closed/expired listings.
 - Return ONLY JSON with keys:
   keywords (string array),
   locations (string array),
   experience_levels (integer array of f_E codes),
   workplace_types (integer array of f_WT codes),
-  reason (short string in Portuguese explaining breadth of skills covered + remote global + hybrid BH + prioridade a vagas do dia / máx. 7 dias).
+  reason (short string in Portuguese explaining breadth of skills covered + remote global + hybrid BH + prioridade a vagas do dia / máx. 7 dias + só vagas abertas).
 
 Panel keyword preferences (roles/skills only — ignore geo bias here): {pref_keywords}
 Candidate facts PT: {facts_pt}
@@ -2041,11 +2042,18 @@ def _linkedin_within_max_age(posted_at: object, *, max_days: int = LINKEDIN_MAX_
 
 
 def normalize_apify_items(items: list, *, label: str) -> list[dict]:
+    """Normaliza itens Apify e descarta vagas já fechadas (filtro de coleta)."""
+    from worth_reverify import apify_item_indicates_closed
+
     results: list[dict] = []
     source_name = f"Apify:{label}" if label else "Apify"
     is_linkedin = "linkedin" in (label or "").casefold()
+    skipped_closed = 0
     for item in items:
         if not isinstance(item, dict):
+            continue
+        if apify_item_indicates_closed(item):
+            skipped_closed += 1
             continue
         url = _apify_item_url(item)
         title = str(item.get("title") or item.get("position") or item.get("jobTitle") or item.get("displayTitle") or "").strip()
@@ -2107,6 +2115,12 @@ def normalize_apify_items(items: list, *, label: str) -> list[dict]:
                 "url": url,
                 "posted_at": posted_at,
             }
+        )
+    if skipped_closed:
+        log_event(
+            "info",
+            "apify",
+            f"{label or 'Apify'}: {skipped_closed} vaga(s) descartada(s) no filtro (fechadas / sem candidaturas).",
         )
     if is_linkedin and results:
         # Prioriza o mais recente (mesmo dia primeiro) na fila de inserção/triagem.

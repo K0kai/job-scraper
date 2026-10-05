@@ -50,6 +50,52 @@ ACTIVE_RE = re.compile(
     re.I,
 )
 
+
+def text_indicates_closed(text: str) -> bool:
+    """True se o texto deixa claro que a vaga não aceita mais candidaturas."""
+    return bool(INACTIVE_RE.search(text or ""))
+
+
+def apify_item_indicates_closed(item: dict) -> bool:
+    """Usado só no filtro de coleta Apify — sinais no payload, sem HTTP/browser."""
+    if not isinstance(item, dict):
+        return False
+    for key in (
+        "closed",
+        "isClosed",
+        "jobClosed",
+        "applicationsClosed",
+        "isJobClosed",
+        "expired",
+        "isExpired",
+    ):
+        val = item.get(key)
+        if val is True or str(val).strip().casefold() in {"1", "true", "yes"}:
+            return True
+    state = str(
+        item.get("jobState") or item.get("jobStatus") or item.get("listingStatus") or ""
+    ).strip().casefold()
+    if state in {"closed", "expired", "inactive", "filled", "archived"}:
+        return True
+    blob = " ".join(
+        str(item.get(k) or "")
+        for k in (
+            "title",
+            "position",
+            "jobTitle",
+            "displayTitle",
+            "descriptionText",
+            "descriptionHtml",
+            "description",
+            "jobDescription",
+            "jobDescriptionHTML",
+            "closedJobText",
+            "jobStateMessage",
+        )
+    )
+    return text_indicates_closed(blob)
+
+
 # Erro transitório do LinkedIn — não é sinal de vaga ativa/fechada; não esperar timeout.
 LOAD_ERROR_RE = re.compile(
     r"n[aã]o\s+foi\s+poss[ií]vel\s+carregar\s+a\s+p[aá]gina|"
