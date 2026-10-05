@@ -3542,6 +3542,18 @@ color:#c9c9d1;border:1px solid var(--line);border-radius:10px;padding:12px;max-h
 .tab-panel{display:none}
 .tab-panel.active{display:block}
 .subtle{color:var(--muted)}
+.assistant-chat{display:flex;flex-direction:column;gap:14px;min-height:min(62vh,560px)}
+.assistant-messages{flex:1;min-height:280px;max-height:min(52vh,480px);overflow-y:auto;border:1px solid var(--line);border-radius:12px;padding:14px;background:var(--panel2);display:flex;flex-direction:column;gap:12px}
+.assistant-empty{color:var(--muted2);font-size:13px;margin:auto;text-align:center;padding:24px 12px;line-height:1.5}
+.assistant-msg{max-width:92%;padding:10px 12px;border-radius:12px;font-size:13.5px;line-height:1.45;white-space:pre-wrap;word-break:break-word}
+.assistant-msg.user{align-self:flex-end;background:rgba(63,111,158,.28);color:var(--white);border:1px solid rgba(158,201,255,.25)}
+.assistant-msg.bot{align-self:flex-start;background:rgba(0,0,0,.22);color:#d6d6de;border:1px solid var(--line)}
+.assistant-msg.bot.error{border-color:rgba(194,84,77,.45);color:#f0a0a0}
+.assistant-msg-actions{display:flex;justify-content:flex-end;margin-top:8px}
+.assistant-msg-actions button{font-size:11px;padding:4px 10px}
+.assistant-compose{display:flex;flex-direction:column;gap:10px}
+.assistant-compose textarea{width:100%;min-height:88px;resize:vertical}
+.assistant-compose .actions{margin:0;justify-content:flex-end}
 @media(max-width:900px){.log-line{grid-template-columns:1fr;gap:2px}}
 @media(max-width:820px){.shell{grid-template-columns:1fr}.sidebar{position:static;height:auto}
 .top{grid-template-columns:1fr}.stats{grid-template-columns:repeat(2,1fr)}
@@ -3593,6 +3605,7 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
 <button type="button" class="tab active" data-tab="painel">Visão geral</button>
 <button type="button" class="tab" data-tab="vale">Vale a pena olhar</button>
 <button type="button" class="tab" data-tab="filas">Filas de IA</button>
+<button type="button" class="tab" data-tab="assistente">Assistente</button>
 <button type="button" class="tab" data-tab="uso">Uso &amp; cotas</button>
 <button type="button" class="tab" data-tab="logs">Logs</button>
 <span class="nav-label">Configuração</span>
@@ -3663,6 +3676,8 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
 </div>
 
 <div id="tab-filas" class="tab-panel"><section class="panel"><h2>Filas de IA (async + retry)</h2><p class="hint">Análise de currículo e candidaturas rodam em paralelo (até 3 workers). Em fila/rate-limit da API, o job entra em retry automático até sucesso, expirar (24h) ou cancelar.</p><div id="queue-body">{queue_view}</div></section></div>
+
+<div id="tab-assistente" class="tab-panel"><section class="panel"><h2>Assistente</h2><p class="hint">Cole a pergunta do formulário; a IA responde com o valor pronto para colar, usando perfil, fatos e currículo. O histórico fica só nesta sessão (some ao recarregar) e <strong>não</strong> grava em Fatos.</p><div class="assistant-chat"><div id="assistant-messages" class="assistant-messages" aria-live="polite"><div class="assistant-empty" id="assistant-empty">Cole uma pergunta de formulário abaixo — por exemplo escala 1–10, “anos de experiência com X”, ou um rótulo de campo.</div></div><div class="assistant-compose"><textarea id="assistant-input" placeholder="Cole ou digite a pergunta do formulário…" rows="3"></textarea><div class="actions"><button type="button" class="subtle" id="assistant-clear" hidden>Limpar chat</button><button type="button" id="assistant-send">Gerar resposta</button></div></div></div></section></div>
 
 <div id="tab-uso" class="tab-panel"><div id="usage-body">{usage_view}</div></div>
 
@@ -4216,6 +4231,129 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
       postCopilotAsk("/copilot-ask-cancel", {{}});
     }}
   }});
+  var assistantHistory = [];
+  var assistantBusy = false;
+  function syncAssistantEmpty() {{
+    var empty = document.getElementById("assistant-empty");
+    var clearBtn = document.getElementById("assistant-clear");
+    var hasMsgs = assistantHistory.length > 0;
+    if (empty) empty.hidden = hasMsgs;
+    if (clearBtn) clearBtn.hidden = !hasMsgs;
+  }}
+  function appendAssistantBubble(role, text, opts) {{
+    opts = opts || {{}};
+    var box = document.getElementById("assistant-messages");
+    if (!box) return;
+    var empty = document.getElementById("assistant-empty");
+    if (empty) empty.hidden = true;
+    var div = document.createElement("div");
+    div.className = "assistant-msg " + (role === "user" ? "user" : "bot") + (opts.error ? " error" : "");
+    div.textContent = text;
+    if (role === "assistant" && !opts.error) {{
+      var actions = document.createElement("div");
+      actions.className = "assistant-msg-actions";
+      var btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "subtle";
+      btn.textContent = "Copiar";
+      btn.addEventListener("click", function () {{
+        var payload = text;
+        if (navigator.clipboard && navigator.clipboard.writeText) {{
+          navigator.clipboard.writeText(payload).then(function () {{
+            btn.textContent = "Copiado";
+            setTimeout(function () {{ btn.textContent = "Copiar"; }}, 1400);
+          }}).catch(function () {{
+            showNotice("Não foi possível copiar.", "warning");
+          }});
+        }} else {{
+          showNotice("Clipboard indisponível neste navegador.", "warning");
+        }}
+      }});
+      actions.appendChild(btn);
+      div.appendChild(actions);
+    }}
+    box.appendChild(div);
+    box.scrollTop = box.scrollHeight;
+    syncAssistantEmpty();
+  }}
+  function setAssistantBusy(on) {{
+    assistantBusy = !!on;
+    var send = document.getElementById("assistant-send");
+    var input = document.getElementById("assistant-input");
+    if (send) {{
+      send.disabled = assistantBusy;
+      send.textContent = assistantBusy ? "Gerando…" : "Gerar resposta";
+    }}
+    if (input) input.disabled = assistantBusy;
+  }}
+  function sendAssistantChat() {{
+    if (assistantBusy) return;
+    var input = document.getElementById("assistant-input");
+    var question = input ? String(input.value || "").trim() : "";
+    if (!question) {{
+      showNotice("Cole a pergunta do formulário.", "warning");
+      return;
+    }}
+    appendAssistantBubble("user", question);
+    assistantHistory.push({{ role: "user", content: question }});
+    if (input) input.value = "";
+    setAssistantBusy(true);
+    var body = new URLSearchParams();
+    body.set("message", question);
+    body.set("history", JSON.stringify(assistantHistory.slice(0, -1)));
+    fetch("/assistant-chat", {{
+      method: "POST",
+      headers: {{
+        "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+        "Accept": "application/json",
+        "X-Requested-With": "fetch"
+      }},
+      body: body.toString()
+    }})
+      .then(function (res) {{ return res.json().then(function (data) {{ return {{ ok: res.ok, data: data }}; }}); }})
+      .then(function (res) {{
+        var data = res.data || {{}};
+        if (data.ok && data.answer) {{
+          appendAssistantBubble("assistant", data.answer);
+          assistantHistory.push({{ role: "assistant", content: data.answer }});
+        }} else {{
+          var err = data.notice || "Falha ao gerar resposta.";
+          appendAssistantBubble("assistant", err, {{ error: true }});
+          showNotice(err, data.kind || "error");
+        }}
+      }})
+      .catch(function () {{
+        appendAssistantBubble("assistant", "Falha de comunicação com o painel.", {{ error: true }});
+        showNotice("Falha de comunicação com o painel.", "error");
+      }})
+      .then(function () {{
+        setAssistantBusy(false);
+        syncAssistantEmpty();
+      }});
+  }}
+  document.addEventListener("click", function (ev) {{
+    if (ev.target && ev.target.id === "assistant-send") {{
+      sendAssistantChat();
+      return;
+    }}
+    if (ev.target && ev.target.id === "assistant-clear") {{
+      assistantHistory = [];
+      var box = document.getElementById("assistant-messages");
+      if (box) {{
+        box.innerHTML = '<div class="assistant-empty" id="assistant-empty">Cole uma pergunta de formulário abaixo — por exemplo escala 1–10, “anos de experiência com X”, ou um rótulo de campo.</div>';
+      }}
+      syncAssistantEmpty();
+    }}
+  }});
+  var assistantInput = document.getElementById("assistant-input");
+  if (assistantInput) {{
+    assistantInput.addEventListener("keydown", function (ev) {{
+      if (ev.key === "Enter" && (ev.ctrlKey || ev.metaKey)) {{
+        ev.preventDefault();
+        sendAssistantChat();
+      }}
+    }});
+  }}
   var noticeTimer = null;
   var PROCESS_PATHS = {{
     "/upload-resume": 1,
@@ -4535,6 +4673,48 @@ class Handler(BaseHTTPRequestHandler):
                 self.respond_notice("Resposta enviada — aguardando a IA (o modal fica aberto).")
             else:
                 self.respond_notice("Pergunta já respondida ou expirada.", notice_kind="warning", ok=False)
+            return
+
+        if path == "/assistant-chat":
+            form_ask = parse_form(self)
+            message = (form_ask.get("message") or "").strip()
+            history_raw = form_ask.get("history") or "[]"
+            cfg = settings()
+            provider = (cfg.get("ai_provider") or "gemini").strip()
+            model = (cfg.get("ai_model") or "gemini-2.5-flash").strip()
+            api_key = get_ai_key(provider)
+            try:
+                from assistant_chat import answer_form_question
+                from resume_pipeline import AiUnavailableError
+
+                with connect() as db:
+                    answer = answer_form_question(
+                        question=message,
+                        cfg=cfg,
+                        db=db,
+                        provider=provider,
+                        model=model,
+                        api_key=api_key,
+                        history=history_raw,
+                    )
+                log_event("info", "assistant", "Resposta gerada no Assistente.")
+                self.send_json({"ok": True, "answer": answer})
+            except AiUnavailableError as exc:
+                self.send_json(
+                    {"ok": False, "notice": str(exc), "kind": "warning"},
+                    status=503,
+                )
+            except ValueError as exc:
+                self.send_json(
+                    {"ok": False, "notice": str(exc), "kind": "warning"},
+                    status=400,
+                )
+            except Exception as exc:
+                log_event("error", "assistant", f"Falha no Assistente: {exc}")
+                self.send_json(
+                    {"ok": False, "notice": f"Falha ao gerar resposta: {exc}", "kind": "error"},
+                    status=500,
+                )
             return
 
         form = parse_form(self)
