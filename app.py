@@ -1,5 +1,5 @@
 # Radar de Vagas: interface local, armazenamento, busca e preparação de candidaturas.
-# O servidor escuta apenas em 127.0.0.1 para manter o painel acessível somente neste computador.
+# O host e a porta podem ser sobrescritos pelo ambiente de deploy (ex.: Render).
 from __future__ import annotations
 
 import hashlib
@@ -49,8 +49,8 @@ DB_PATH = os.path.join(ROOT, "jobs.db")
 RESUMES_DIR = os.path.join(ROOT, "resumes")
 COPILOT_UPLOADS_DIR = os.path.join(ROOT, "copilot_uploads")
 FAVICON_PATH = os.path.join(ROOT, "assets", "public", "favicon.ico")
-HOST = "127.0.0.1"
-PORT = 8765
+HOST = os.environ.get("HOST", "0.0.0.0")
+PORT = int(os.environ.get("PORT", "8765"))
 POLL_SECONDS = 15 * 60
 LOG = logging.getLogger("job-scraper")
 
@@ -2340,10 +2340,6 @@ def _boot_queue() -> None:
     queue.start()
 
 
-_boot_logging()
-_boot_queue()
-
-
 def esc(value: object) -> str:
     return html.escape(str(value or ""), quote=True)
 
@@ -4515,6 +4511,17 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def send_extension_json(self, payload: dict, status: int = 200) -> None:
+        """Read-only, allow-listed profile data for the local autofill extension."""
+        data = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(data)
+
     def redirect(self, notice: str = "", notice_kind: str = "success") -> None:
         body = render_page(notice, notice_kind=notice_kind)
         self.send_page(body)
@@ -4571,6 +4578,26 @@ class Handler(BaseHTTPRequestHandler):
                     worth_date_to=worth_date_to,
                 )
             )
+            return
+        if path == "/api/autofill-profile":
+            cfg = settings()
+            name_parts = (cfg.get("candidate_name") or "").strip().split()
+            first_name = name_parts[0] if name_parts else ""
+            last_name = " ".join(name_parts[1:]) if len(name_parts) > 1 else ""
+            self.send_extension_json({
+                "profile": {
+                    "firstName": first_name,
+                    "lastName": last_name,
+                    "fullName": (cfg.get("candidate_name") or "").strip(),
+                    "email": (cfg.get("candidate_email") or "").strip(),
+                    "phone": (cfg.get("candidate_phone") or "").strip(),
+                    "city": (cfg.get("candidate_city") or "").strip(),
+                    "state": (cfg.get("candidate_state") or "").strip(),
+                    "country": (cfg.get("candidate_country") or "").strip(),
+                    "zip": (cfg.get("candidate_postal_code") or "").strip(),
+                    "linkedin": (cfg.get("candidate_linkedin") or "").strip(),
+                }
+            })
             return
         self.send_page(render_page())
 
@@ -5015,5 +5042,7 @@ class Handler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     initialize()
+    _boot_logging()
+    _boot_queue()
     print(f"Radar de Vagas disponível em http://{HOST}:{PORT}")
     ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
