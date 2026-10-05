@@ -1157,7 +1157,56 @@ def apply_via_linkedin(
                     progress(f"passo {step + 1}: travou — copiloto ({str(err)[:120]})")
                     cstate, cnote, cpage = copilot_rescue(page, context, cfg, ai_ctx,
                                                           reason="modal Easy Apply travado — " + str(err))
+                    if cstate == "manual":
+                        page = cpage or page
+                        progress("modo manual — Chrome aberto; IA e bot pararam")
+                        from wait_human import wait_for_manual_handoff
+
+                        max_min = max(int(human_wait) * 4, 120)
+                        outcome = wait_for_manual_handoff(page, max_minutes=max_min)
+                        # Só fecha se o humano já fechou OU esgotou o teto (libera o lock).
+                        try:
+                            still = page is not None and not page.is_closed()
+                        except Exception:
+                            still = False
+                        if still and outcome == "timeout":
+                            try:
+                                context.close()
+                            except Exception:
+                                pass
+                        elif not still:
+                            try:
+                                context.close()
+                            except Exception:
+                                pass
+                        if outcome == "submitted":
+                            return finish_ok(
+                                "modo manual: você enviou no Chrome.",
+                                status_detail="Easy Apply — modo manual; você enviou.",
+                            )
+                        return block(
+                            f"{cnote} (Chrome ficou aberto para você; sem mais automação.)"
+                        )
                     if cstate == "aborted":
+                        try:
+                            still_open = cpage is not None and not cpage.is_closed()
+                        except Exception:
+                            still_open = False
+                        if still_open:
+                            page = cpage
+                            LOG.warning("Copiloto abortou com Chrome aberto — aguardando você.")
+                            progress("aguardando você no Chrome (copiloto cedeu)")
+                            outcome = _wait_for_human_submit(page, minutes=human_wait)
+                            try:
+                                context.close()
+                            except Exception:
+                                pass
+                            if outcome == "submitted":
+                                return finish_ok(
+                                    "assisted: você enviou após o copiloto ceder.",
+                                    status_detail="Easy Apply enviado por você (assistido).",
+                                )
+                            return block(f"{cnote} (Chrome ficou aberto para correção.)")
                         return block(cnote)
                     if cstate == "solved":
                         progress("copiloto destravou — retomando preenchimento")

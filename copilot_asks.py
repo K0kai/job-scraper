@@ -12,6 +12,7 @@ LOG = logging.getLogger("job-scraper")
 STATUS_PENDING = "pending"
 STATUS_AWAITING_AI = "awaiting_ai"
 STATUS_ANSWERED = "answered"
+STATUS_MANUAL = "manual"
 STATUS_EXPIRED = "expired"
 STATUS_CANCELLED = "cancelled"
 STATUS_FAILED_AI = "failed_ai"
@@ -215,6 +216,17 @@ def cancel_ask(connect_fn: ConnectFn, ask_id: int) -> bool:
         return cur.rowcount > 0
 
 
+def manual_ask(connect_fn: ConnectFn, ask_id: int) -> bool:
+    """Humano assume o Chrome: IA/bot param; janela NÃO deve ser fechada pelo robô."""
+    with connect_fn() as db:
+        ensure_table(db)
+        cur = db.execute(
+            "UPDATE copilot_asks SET status=?, hint=? WHERE id=? AND status=?",
+            (STATUS_MANUAL, "", ask_id, STATUS_PENDING),
+        )
+        return cur.rowcount > 0
+
+
 def expire_ask(connect_fn: ConnectFn, ask_id: int) -> None:
     with connect_fn() as db:
         ensure_table(db)
@@ -247,7 +259,7 @@ def wait_for_answer(
         if not row:
             return STATUS_EXPIRED, ""
         st = row["status"]
-        if st in {STATUS_AWAITING_AI, STATUS_ANSWERED}:
+        if st in {STATUS_AWAITING_AI, STATUS_ANSWERED, STATUS_MANUAL}:
             return st, row.get("answer") or ""
         if st in {STATUS_CANCELLED, STATUS_EXPIRED, STATUS_FAILED_AI}:
             return st, ""
@@ -284,6 +296,7 @@ __all__ = [
     "STATUS_CANCELLED",
     "STATUS_EXPIRED",
     "STATUS_FAILED_AI",
+    "STATUS_MANUAL",
     "STATUS_PENDING",
     "answer_ask",
     "append_facts_both",
@@ -296,6 +309,7 @@ __all__ = [
     "get_ask",
     "get_pending_ask",
     "load_facts",
+    "manual_ask",
     "save_ask_upload",
     "set_ask_hint",
     "wait_for_answer",

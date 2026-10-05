@@ -84,3 +84,32 @@ def wait_for_human(page, *, minutes: int, success_regex: re.Pattern[str] | None 
         except Exception:
             return "abandoned"
     return "timeout"
+
+
+def wait_for_manual_handoff(
+    page,
+    *,
+    max_minutes: int = 180,
+    success_regex: re.Pattern[str] | None = None,
+    poll_s: float = 5.0,
+) -> str:
+    """Modo manual: IA/bot não interferem. Chrome fica aberto até sucesso, o humano
+    fechar a janela, ou esgotar ``max_minutes`` (só então o caller pode liberar o lock).
+
+    Retorna 'submitted' | 'abandoned' | 'timeout'. Sem on_tick — zero automação.
+    """
+    regex = success_regex or DEFAULT_SUCCESS_RE
+    deadline = _now() + max(1, int(max_minutes)) * 60
+    while _now() < deadline:
+        _sleep(max(1.0, float(poll_s)))
+        try:
+            if page.is_closed():
+                return "abandoned"
+        except Exception:
+            return "abandoned"
+        try:
+            if page_shows_success(page, regex):
+                return "submitted"
+        except Exception:
+            return "abandoned"
+    return "timeout"

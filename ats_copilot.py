@@ -34,10 +34,13 @@ LOG = logging.getLogger("job-scraper")
 
 #: prefixo da nota que o painel pinta em AMARELO ("nao foi possivel automatizar")
 COPILOT_FAIL_PREFIX = "COPILOT_UNAUTOMATED:"
+#: humano assumiu o Chrome — nota distinta (não é falha de automação)
+COPILOT_MANUAL_PREFIX = "COPILOT_MANUAL:"
 
 #: estado do copiloto -> roteador/chamador decide o que fazer
 SOLVED = "solved"      # IA destravou o fluxo; pode retomar o preenchimento/envio
 ABORTED = "aborted"    # IA desistiu (ou sem IA/esgotou turnos): fechar + nota amarela
+MANUAL = "manual"      # humano assumiu: Chrome aberto, sem mais IA/bot
 UNAVAILABLE = "unavailable"  # IA nao configurada: segue o comportamento antigo (humano)
 
 MAX_TURNS = 10  # free tier: folga p/ wizards longos; estagnação / handoff cortam desperdício
@@ -1706,6 +1709,7 @@ def copilot_takeover(page, context, *, reason: str, cfg: dict, ai: dict,
                 STATUS_AWAITING_AI,
                 STATUS_ANSWERED,
                 STATUS_CANCELLED,
+                STATUS_MANUAL,
                 create_ask,
                 get_ask,
                 load_facts,
@@ -1746,6 +1750,10 @@ def copilot_takeover(page, context, *, reason: str, cfg: dict, ai: dict,
                 except Exception:
                     pass
             status, answer = wait_for_answer(connect_fn, ask_id, minutes=wait_min)
+            if status == STATUS_MANUAL:
+                LOG.info("copiloto: humano assumiu modo manual (ask #%s) — Chrome permanece aberto", ask_id)
+                history.append(f"turn {turn}: ask -> manual handoff")
+                return handoff_manual(active)
             if status not in {STATUS_AWAITING_AI, STATUS_ANSWERED}:
                 label = "cancelado" if status == STATUS_CANCELLED else "timeout"
                 return abort_close(
@@ -1901,6 +1909,15 @@ def abort_leave_open(page, why: str) -> tuple[str, str, object]:
     return ABORTED, f"{COPILOT_FAIL_PREFIX} nao foi possivel automatizar o fluxo - {why[:200]}", page
 
 
+def handoff_manual(page) -> tuple[str, str, object]:
+    """Cede o Chrome ao humano. Nunca fecha a janela."""
+    return (
+        MANUAL,
+        f"{COPILOT_MANUAL_PREFIX} humano assumiu o restante no Chrome — IA e bot pararam",
+        page,
+    )
+
+
 def abort_close(page, context, why: str) -> tuple[str, str, object]:
     """Fecha tudo e devolve a nota amarela com o motivo."""
     try:
@@ -1925,6 +1942,8 @@ __all__ = [
     "ACTION_VOCAB",
     "AI_RATE_LIMIT_BUDGET_SECONDS",
     "COPILOT_FAIL_PREFIX",
+    "COPILOT_MANUAL_PREFIX",
+    "MANUAL",
     "MAX_STEPS_PER_TURN",
     "MAX_TURNS",
     "SOLVED",
@@ -1933,6 +1952,7 @@ __all__ = [
     "UNAVAILABLE",
     "abort_close",
     "abort_leave_open",
+    "handoff_manual",
     "action_signature",
     "build_copilot_prompt",
     "call_ai_with_rate_limit_retry",

@@ -15,7 +15,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from ats_base import ApplyContext, BaseATSHandler, FillResult
-from wait_human import wait_for_human
+from wait_human import wait_for_human, wait_for_manual_handoff
 
 LOG = logging.getLogger("job-scraper")
 
@@ -71,7 +71,7 @@ def copilot_rescue(page, context, cfg: dict, ai: dict, *, reason: str) -> tuple[
     """Chama o copiloto de IA (override total). Nunca levanta exceção — se o
     módulo falhar, cai para UNAVAILABLE e o fluxo segue o comportamento antigo."""
     try:
-        from ats_copilot import ABORTED, SOLVED, SUBMITTED, copilot_takeover
+        from ats_copilot import ABORTED, MANUAL, SOLVED, SUBMITTED, copilot_takeover
         from queue_progress import progress_from_ai
 
         progress_from_ai(ai)(f"copiloto: {reason[:160]}")
@@ -82,6 +82,9 @@ def copilot_rescue(page, context, cfg: dict, ai: dict, *, reason: str) -> tuple[
         if state == SOLVED:
             progress_from_ai(ai)(f"copiloto ok: {str(detail)[:140]}")
             return "solved", detail, active
+        if state == MANUAL:
+            progress_from_ai(ai)(f"modo manual: {str(detail)[:160]}")
+            return "manual", detail, active
         if state == ABORTED:
             progress_from_ai(ai)(f"copiloto abortou: {str(detail)[:160]}")
             # Página ainda aberta → revisão humana; None → fechou de verdade.
@@ -176,6 +179,9 @@ def run_ats_flow(
             if outcome == "submitted":
                 return OUTCOME_ASSISTED, f"copiloto destravou {host}; voce enviou (assistido)."
             return OUTCOME_TIMEOUT, f"copiloto destravou {host}; sem confirmacao de envio."
+        if state == "manual":
+            handoff = cpage if cpage is not None else page
+            return _manual_finish(handoff, host=host, note=note, human_wait=human_wait, progress=progress)
         if state == "aborted":
             handoff = cpage if cpage is not None else page
             try:
@@ -248,6 +254,16 @@ def run_ats_flow(
                     instance, handoff, handler_cls, fill_note + f" ({note})", human_wait, ctx
                 )
             return OUTCOME_UNAUTOMATED, note
+        if state == "manual":
+            handoff = cpage if cpage is not None else page
+            return _manual_finish(
+                handoff,
+                host=handler_cls.name,
+                note=note,
+                human_wait=human_wait,
+                progress=progress,
+                success_regex=handler_cls.success_regex,
+            )
         if state == "submitted":
             progress("copiloto enviou após travamento")
             return OUTCOME_SUBMITTED, note or f"{handler_cls.name}: copiloto enviou apos travamento"
@@ -311,6 +327,39 @@ def _confirm_submission(instance, page, *, timeout_s: float = 20) -> bool:
             return False
         _verify_sleep(2)
     return False
+
+
+def _manual_finish(
+    page,
+    *,
+    host: str,
+    note: str,
+    human_wait: int,
+    progress,
+    success_regex=None,
+) -> tuple[str, str]:
+    """Modo manual: sem IA/bot. Chrome NÃO é fechado aqui — só espera o humano."""
+    try:
+        still_open = page is not None and not page.is_closed()
+    except Exception:
+        still_open = False
+    if not still_open:
+        return OUTCOME_UNAUTOMATED, note
+    # Teto generoso: o robô não fecha a janela; só libera o lock após o humano
+    # fechar, confirmar envio, ou esgotar o teto (aí o caller pode fechar).
+    max_min = max(int(human_wait) * 4, 120)
+    progress(f"modo manual em {host} — Chrome aberto; IA e bot pararam")
+    LOG.info(
+        "modo manual (%s): Chrome permanece aberto (até %s min). Sem automação.",
+        host,
+        max_min,
+    )
+    outcome = wait_for_manual_handoff(page, max_minutes=max_min, success_regex=success_regex)
+    if outcome == "submitted":
+        return OUTCOME_ASSISTED, f"modo manual em {host}; voce enviou ({note})."
+    if outcome == "abandoned":
+        return OUTCOME_TIMEOUT, f"modo manual em {host}; janela fechada por voce ({note})."
+    return OUTCOME_TIMEOUT, f"modo manual em {host}; tempo esgotado com Chrome ainda aberto ({note})."
 
 
 def _assisted_finish(instance, page, handler_cls, fill_note: str, human_wait: int, ctx: ApplyContext | None = None) -> tuple[str, str]:

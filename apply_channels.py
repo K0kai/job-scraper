@@ -445,6 +445,14 @@ def apply_via_browser(
 
                 state, note, cpage = copilot_rescue(active, context, cfg, ai_ctx,
                                                     reason="formulário de candidatura travado — " + stuck)
+                if state == "manual":
+                    # Navegador headless deste canal não serve para handoff visual —
+                    # registra nota e fecha (Easy Apply/ATS com Chrome é o caminho manual).
+                    try:
+                        browser.close()
+                    except Exception:
+                        pass
+                    return block(note + " (canal headless — use Easy Apply/ATS com Chrome para modo manual)")
                 if state == "aborted":
                     browser.close()
                     return block(note)  # nota AMARELA no painel

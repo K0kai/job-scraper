@@ -3658,7 +3658,7 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
   <div class="modal-dialog modal-dialog-ask" role="dialog" aria-modal="true" aria-labelledby="copilot-ask-title">
     <h3 id="copilot-ask-title">Copiloto precisa de um dado</h3>
     <p class="hint" id="copilot-ask-question"></p>
-    <p class="hint" id="copilot-ask-help" style="margin-top:-8px">A resposta será salva em <strong>Fatos do candidato</strong> (PT e EN). O Chrome da candidatura fica aberto.</p>
+    <p class="hint" id="copilot-ask-help" style="margin-top:-8px">A resposta será salva em <strong>Fatos do candidato</strong> (PT e EN). O Chrome da candidatura fica aberto. Use <strong>Modo manual</strong> para a IA/bot pararem e você concluir sozinho (Chrome não fecha).</p>
     <div id="copilot-ask-waiting" class="copilot-ask-waiting" hidden>
       <div class="copilot-ask-spinner" aria-hidden="true"></div>
       <p id="copilot-ask-hint" class="hint">Aguardando a IA…</p>
@@ -3670,6 +3670,7 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
     <textarea id="copilot-ask-answer" placeholder="Sua resposta…"></textarea>
     <div class="actions">
       <button type="button" class="subtle" id="copilot-ask-cancel">Cancelar</button>
+      <button type="button" class="subtle" id="copilot-ask-manual" title="IA e bot param; o Chrome fica aberto com você">Modo manual</button>
       <button type="button" id="copilot-ask-submit">Enviar</button>
     </div>
   </div>
@@ -3776,6 +3777,7 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
     var fileEl = document.getElementById("copilot-ask-file");
     var submit = document.getElementById("copilot-ask-submit");
     var cancel = document.getElementById("copilot-ask-cancel");
+    var manual = document.getElementById("copilot-ask-manual");
     var wait = document.getElementById("copilot-ask-waiting");
     var hintEl = document.getElementById("copilot-ask-hint");
     if (dialog) dialog.classList.toggle("is-busy", !!busy);
@@ -3789,6 +3791,10 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
     if (cancel) {{
       cancel.disabled = !!busy;
       cancel.hidden = !!busy;
+    }}
+    if (manual) {{
+      manual.disabled = !!busy;
+      manual.hidden = !!busy;
     }}
     if (hintEl) hintEl.textContent = hint || (busy ? "Aguardando a IA…" : "");
   }}
@@ -3861,6 +3867,12 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
             if (modalDone) modalDone.hidden = true;
             lastCopilotAskId = null;
           }}
+        }}
+        if ((path === "/copilot-ask-cancel" || path === "/copilot-ask-manual") && data.ok !== false) {{
+          setCopilotAskBusy(false, "");
+          var modalClose = document.getElementById("copilot-ask-modal");
+          if (modalClose) modalClose.hidden = true;
+          lastCopilotAskId = null;
         }}
         refresh();
       }})
@@ -4236,6 +4248,10 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
     }}
     if (ev.target && ev.target.id === "copilot-ask-cancel") {{
       postCopilotAsk("/copilot-ask-cancel", {{}});
+      return;
+    }}
+    if (ev.target && ev.target.id === "copilot-ask-manual") {{
+      postCopilotAsk("/copilot-ask-manual", {{}});
     }}
   }});
   var assistantHistory = [];
@@ -4379,7 +4395,8 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
     "/job-status": 1,
     "/worth-ignore-all": 1,
     "/copilot-ask-answer": 1,
-    "/copilot-ask-cancel": 1
+    "/copilot-ask-cancel": 1,
+    "/copilot-ask-manual": 1
   }};
   function noticeClass(kind) {{
     return {{
@@ -4998,6 +5015,22 @@ class Handler(BaseHTTPRequestHandler):
             if ok:
                 log_event("info", "copilot", f"Ask #{ask_id} cancelada no painel.")
                 self.respond_notice("Pergunta cancelada — o copiloto vai abortar.", notice_kind="warning")
+            else:
+                self.respond_notice("Pergunta já fechada.", notice_kind="info")
+        elif path == "/copilot-ask-manual":
+            ask_id = int(form["id"]) if form.get("id", "").isdigit() else 0
+            if not ask_id:
+                self.respond_notice("Pergunta inválida.", notice_kind="error", ok=False)
+                return
+            from copilot_asks import manual_ask
+
+            ok = manual_ask(connect, ask_id)
+            if ok:
+                log_event("info", "copilot", f"Ask #{ask_id} — modo manual (Chrome permanece aberto).")
+                self.respond_notice(
+                    "Modo manual: IA e bot pararam. O Chrome fica aberto com você — conclua e feche a janela quando terminar.",
+                    notice_kind="info",
+                )
             else:
                 self.respond_notice("Pergunta já fechada.", notice_kind="info")
         elif path == "/notes":
