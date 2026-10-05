@@ -135,6 +135,8 @@ DEFAULT_SETTINGS = {
     "apify_actors_json": "[{\"id\": \"curious_coder~linkedin-jobs-scraper\", \"label\": \"LinkedIn Jobs\", \"enabled\": true, \"input_mode\": \"linkedin_search\", \"count\": 25}]",
     "apify_linkedin_filter_json": "",
     "apify_linkedin_filter_hash": "",
+    # Vazio = DEFAULT_LINKEDIN_FILTER_PROMPT (editável em Busca & coleta)
+    "linkedin_filter_prompt": "",
     "ai_usage_json": "",
     "apify_quota_snapshot_json": "",
     "smtp_host": "",
@@ -578,6 +580,7 @@ CRITICAL CALIBRATION (follow strictly):
 - Be GENEROUS with match_score. Most plausible tech/office/remote roles for this candidate should land 65–90, not 20–40.
 - If the job is in the SAME broad field as the resume (e.g. software/engineering/IT/data/web vs software resume), match_score MUST be >= 65 unless a hard blocker applies.
 - If the job title overlaps the candidate's roles/skills even partially, match_score MUST be >= 70.
+- If ANY single skill, tool, or stack from the resume matches the job well, treat that as a strong positive — do NOT require a long list of overlapping skills to select the role.
 - Missing tools from a long JD list is NORMAL — do NOT tank the score. Penalize at most 5–15 points total for missing secondary tools.
 - Prefer transferable and adjacent skills (React↔Vue, AWS↔GCP, SQL dialects, similar frameworks).
 - Do NOT invent employers, degrees, or tools absent from the resume context.
@@ -1496,9 +1499,87 @@ LINKEDIN_TPR_DAY = "r86400"
 #: Past week — teto duro de 7 dias (nunca buscar mais antigo que isso).
 LINKEDIN_TPR_WEEK = "r604800"
 LINKEDIN_MAX_AGE_DAYS = 7
+#: Quantos keywords a IA pode gravar / usar nas URLs (antes era 4–5 e estreita demais).
+LINKEDIN_FILTER_MAX_KEYWORDS = 12
+LINKEDIN_URL_MAX_KEYWORDS = 8
+LINKEDIN_SEARCH_MAX_URLS = 8
+
+# Placeholders obrigatórios no texto editável: {pref_keywords} {facts_pt} {facts_en} {resume_pt} {resume_en}
+DEFAULT_LINKEDIN_FILTER_PROMPT = """You design LinkedIn Jobs search filters for Apify (curious_coder linkedin-jobs-scraper).
+The scraper takes LinkedIn search URLs. Cover the BREADTH of THIS candidate's real skills and roles — do NOT collapse to only 4–5 trendy skills.
+
+LinkedIn experience codes (f_E): 1 Internship, 2 Entry, 3 Associate, 4 Mid-Senior, 5 Director, 6 Executive.
+LinkedIn workplace codes (f_WT): 1 On-site, 2 Remote, 3 Hybrid.
+
+GEO / WORKPLACE RULES (mandatory — override panel location preferences):
+- Do NOT prioritize Brazil, Brasil, or Brazilian cities as the main search target.
+- Remote (f_WT=2) is the PRIMARY target: the candidate accepts remote work from ANYWHERE worldwide.
+- For remote searches, prefer location strings like "Remote", "Worldwide", "United States", "Europe", or leave broad global remote — NOT "Brazil" as the default.
+- Hybrid (f_WT=3) is allowed ONLY when paired with location "Belo Horizonte" (or "Belo Horizonte, Minas Gerais" / "Belo Horizonte, Brazil").
+- Do NOT use f_WT=1 (On-site) unless the resume explicitly requires it (default: omit on-site).
+- Typical good combo: workplace_types [2, 3] with locations including "Remote" and "Belo Horizonte" (hybrid applies to BH only in intent).
+- Never make "Brazil" the only or primary location.
+
+KEYWORD BREADTH (mandatory):
+- Produce 6–12 distinct job-search phrases that spread across DIFFERENT skills, stacks, domains, and role titles from the resume.
+- One solid skill match is enough to justify a keyword. Do NOT require the intersection of many skills; e.g. include separate phrases for Python, React, SQL, DevOps, etc. when present on the resume.
+- Prefer English for global remote reach; PT only if clearly Brazil-hybrid BH search.
+- Market demand may influence ORDER, but NEVER drop a real resume skill just because it is less trendy.
+- Do NOT invent employers or skills; only use the resume summaries and facts.
+
+Other rules:
+- Prefer 2–4 experience codes centered on the candidate's seniority (usually one level below + main; avoid Director/Executive unless clearly supported).
+- RECENCY (mandatory — the URL builder enforces this; mention it in reason):
+  * Only consider jobs from the last 7 days (LinkedIn f_TPR=r604800).
+  * Strongly prioritize jobs posted today / last 24 hours (f_TPR=r86400) over older ones in the week.
+- Return ONLY JSON with keys:
+  keywords (string array),
+  locations (string array),
+  experience_levels (integer array of f_E codes),
+  workplace_types (integer array of f_WT codes),
+  reason (short string in Portuguese explaining breadth of skills covered + remote global + hybrid BH + prioridade a vagas do dia / máx. 7 dias).
+
+Panel keyword preferences (roles/skills only — ignore geo bias here): {pref_keywords}
+Candidate facts PT: {facts_pt}
+Candidate facts EN: {facts_en}
+Resume summary PT: {resume_pt}
+Resume summary EN: {resume_en}
+"""
 
 
-def _resume_filter_fingerprint() -> str:
+def effective_linkedin_filter_prompt(cfg: dict[str, str] | None = None) -> str:
+    """Prompt efetivo: custom do painel, senão o default amplo."""
+    cfg = cfg or {}
+    custom = str(cfg.get("linkedin_filter_prompt") or "").strip()
+    return custom if custom else DEFAULT_LINKEDIN_FILTER_PROMPT
+
+
+def render_linkedin_filter_prompt(
+    template: str,
+    *,
+    pref_keywords: str,
+    facts_pt: str,
+    facts_en: str,
+    resume_pt: str,
+    resume_en: str,
+) -> str:
+    """Substitui placeholders sem .format() (o template pode ter chaves JSON)."""
+    pairs = {
+        "pref_keywords": pref_keywords or "[none]",
+        "facts_pt": facts_pt or "[none]",
+        "facts_en": facts_en or "[none]",
+        "resume_pt": resume_pt or "[none]",
+        "resume_en": resume_en or "[none]",
+    }
+    out = template or DEFAULT_LINKEDIN_FILTER_PROMPT
+    for key, value in pairs.items():
+        out = out.replace("{" + key + "}", value)
+    return out
+
+
+def _resume_filter_fingerprint(cfg: dict[str, str] | None = None) -> str:
+    cfg = cfg or settings()
+    prompt = effective_linkedin_filter_prompt(cfg)
     with connect() as db:
         summaries = resume_summaries(db)
         rows = db.execute(
@@ -1507,6 +1588,7 @@ def _resume_filter_fingerprint() -> str:
     blob = json.dumps(
         {
             "summaries": summaries,
+            "prompt": prompt,
             "meta": [
                 {
                     "language": r["language"],
@@ -1541,7 +1623,7 @@ def _fallback_linkedin_filter(cfg: dict[str, str]) -> dict:
 def _normalize_linkedin_filter(raw: dict, cfg: dict[str, str]) -> dict:
     fallback = _fallback_linkedin_filter(cfg)
     keywords = raw.get("keywords") if isinstance(raw.get("keywords"), list) else []
-    keywords = [str(k).strip() for k in keywords if str(k).strip()][:5]
+    keywords = [str(k).strip() for k in keywords if str(k).strip()][:LINKEDIN_FILTER_MAX_KEYWORDS]
     if not keywords:
         keywords = list(fallback["keywords"])
     locations = raw.get("locations") if isinstance(raw.get("locations"), list) else []
@@ -1597,45 +1679,14 @@ def ai_generate_linkedin_search_filter(cfg: dict[str, str]) -> dict:
     if not api_key:
         raise AiUnavailableError("Configure a chave da API de IA para gerar o filtro LinkedIn.")
 
-    prompt = f"""You design LinkedIn Jobs search filters for Apify (curious_coder linkedin-jobs-scraper).
-The scraper takes LinkedIn search URLs. Choose filters that match THIS candidate's real level and stack,
-AND also take market demand into account: select and prioritize the skills and project topics most in high demand
-globally. When picking keywords, experience levels, and projects, you should reflect the candidate's relevant experience
-but emphasize those skills and subjects that are currently in high demand on the job market.
-
-LinkedIn experience codes (f_E): 1 Internship, 2 Entry, 3 Associate, 4 Mid-Senior, 5 Director, 6 Executive.
-LinkedIn workplace codes (f_WT): 1 On-site, 2 Remote, 3 Hybrid.
-
-GEO / WORKPLACE RULES (mandatory — override panel location preferences):
-- Do NOT prioritize Brazil, Brasil, or Brazilian cities as the main search target.
-- Remote (f_WT=2) is the PRIMARY target: the candidate accepts remote work from ANYWHERE worldwide.
-- For remote searches, prefer location strings like "Remote", "Worldwide", "United States", "Europe", or leave broad global remote — NOT "Brazil" as the default.
-- Hybrid (f_WT=3) is allowed ONLY when paired with location "Belo Horizonte" (or "Belo Horizonte, Minas Gerais" / "Belo Horizonte, Brazil").
-- Do NOT use f_WT=1 (On-site) unless the resume explicitly requires it (default: omit on-site).
-- Typical good combo: workplace_types [2, 3] with locations including "Remote" and "Belo Horizonte" (hybrid applies to BH only in intent).
-- Never make "Brazil" the only or primary location.
-
-Other rules:
-- Prefer 2–4 experience codes centered on the candidate's seniority (usually one level below + main; avoid Director/Executive unless clearly supported).
-- keywords: Select 2–5 concrete job-search phrases (role + stack when useful), preferably in English for global remote reach; PT only if clearly Brazil-hybrid BH search. Make sure these reflect skills and projects from the candidate's experience that are ALSO in high demand on the global job market.
-- Use current job market demand (for example, trending roles, frameworks, languages, or stacks) as an influence — but ONLY select those which are actually present in the candidate's real experience or demonstrated skills/projects.
-- Do NOT invent employers or skills; only use the resume summaries and facts.
-- RECENCY (mandatory — the URL builder enforces this; mention it in reason):
-  * Only consider jobs from the last 7 days (LinkedIn f_TPR=r604800).
-  * Strongly prioritize jobs posted today / last 24 hours (f_TPR=r86400) over older ones in the week.
-- Return ONLY JSON with keys:
-  keywords (string array),
-  locations (string array),
-  experience_levels (integer array of f_E codes),
-  workplace_types (integer array of f_WT codes),
-  reason (short string in Portuguese explaining the choice, mentioning remote global + hybrid BH + prioridade a vagas do dia / máx. 7 dias, e também destacando que as palavras-chave escolhidas estão em alta demanda no mercado e refletem a experiência do candidato).
-
-Panel keyword preferences (roles/skills only — ignore geo bias here): {pref_keywords or '[none]'}
-Candidate facts PT: {facts_pt or '[none]'}
-Candidate facts EN: {facts_en or '[none]'}
-Resume summary PT: {resume_pt[:6000] or '[none]'}
-Resume summary EN: {resume_en[:6000] or '[none]'}
-"""
+    prompt = render_linkedin_filter_prompt(
+        effective_linkedin_filter_prompt(cfg),
+        pref_keywords=pref_keywords,
+        facts_pt=facts_pt,
+        facts_en=facts_en,
+        resume_pt=resume_pt[:6000],
+        resume_en=resume_en[:6000],
+    )
     try:
         if provider == "openai":
             endpoint = "https://api.openai.com/v1/responses"
@@ -1645,7 +1696,7 @@ Resume summary EN: {resume_en[:6000] or '[none]'}
                     "input": prompt,
                     "text": {"format": {"type": "json_object"}},
                     "store": False,
-                    "max_output_tokens": 500,
+                    "max_output_tokens": 700,
                 }
             ).encode("utf-8")
             headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
@@ -1657,7 +1708,7 @@ Resume summary EN: {resume_en[:6000] or '[none]'}
             payload = json.dumps(
                 {
                     "contents": [{"parts": [{"text": prompt}]}],
-                    "generationConfig": {"maxOutputTokens": 500, "responseMimeType": "application/json"},
+                    "generationConfig": {"maxOutputTokens": 700, "responseMimeType": "application/json"},
                 }
             ).encode("utf-8")
             headers = {"Content-Type": "application/json"}
@@ -1700,8 +1751,8 @@ Resume summary EN: {resume_en[:6000] or '[none]'}
 
 
 def get_linkedin_search_filter(cfg: dict[str, str], *, force_refresh: bool = False) -> dict:
-    """Retorna filtro LinkedIn em cache ou gera com IA quando o currículo mudou."""
-    fingerprint = _resume_filter_fingerprint()
+    """Retorna filtro LinkedIn em cache ou gera com IA quando o currículo/prompt mudou."""
+    fingerprint = _resume_filter_fingerprint(cfg)
     cached_hash = (cfg.get("apify_linkedin_filter_hash") or "").strip()
     cached_raw = (cfg.get("apify_linkedin_filter_json") or "").strip()
     if not force_refresh and cached_hash == fingerprint and cached_raw:
@@ -1804,7 +1855,8 @@ def linkedin_filter_panel_html(cfg: dict[str, str] | None = None) -> str:
         '<p class="hint" style="margin:8px 0 0">Somente leitura. As URLs de busca sempre usam '
         f"<code>f_TPR={LINKEDIN_TPR_DAY}</code> (mesmo dia, prioridade) e "
         f"<code>f_TPR={LINKEDIN_TPR_WEEK}</code> (≤{LINKEDIN_MAX_AGE_DAYS} dias). "
-        "Regenera automaticamente quando o currículo analisado muda e roda uma nova coleta LinkedIn/Apify.</p>"
+        "Regenera quando o currículo analisado ou o <em>prompt do filtro</em> (aba Busca) mudam — "
+        "ou na hora ao salvar o prompt.</p>"
         "</div>"
     )
 
@@ -1816,7 +1868,7 @@ def build_linkedin_search_urls(filter_data: dict, *, max_urls: int = 4) -> list[
     (``r86400``); o restante completa a janela de 7 dias (``r604800``). Nunca
     busca sem teto de tempo — evita vagas velhas no scrape.
     """
-    keywords = [str(k) for k in (filter_data.get("keywords") or []) if str(k).strip()][:4]
+    keywords = [str(k) for k in (filter_data.get("keywords") or []) if str(k).strip()][:LINKEDIN_URL_MAX_KEYWORDS]
     locations = [str(x) for x in (filter_data.get("locations") or []) if str(x).strip()][:4]
     if not keywords:
         keywords = ["software engineer"]
@@ -1900,7 +1952,7 @@ def build_apify_run_input(actor: dict, cfg: dict[str, str]) -> dict:
     mode = str(actor.get("input_mode") or "linkedin_search")
     if mode == "linkedin_search":
         filter_data = get_linkedin_search_filter(cfg)
-        urls = build_linkedin_search_urls(filter_data, max_urls=4)
+        urls = build_linkedin_search_urls(filter_data, max_urls=LINKEDIN_SEARCH_MAX_URLS)
         return {"urls": urls, "count": count, "scrapeCompany": False}
 
     template = actor.get("input_template")
@@ -3589,7 +3641,7 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
 <section class="panel" style="margin-top:18px"><h2>Execuções recentes</h2><ul class="history" id="run-history">{history}</ul></section>
 </div>
 
-<div id="tab-busca" class="tab-panel"><section class="panel"><h2>Busca &amp; coleta</h2><form method="post" action="/settings"><div class="form-grid"><label>Cargos e termos, separados por vírgula<textarea name="keywords" rows="3">{esc(cfg.get('keywords',''))}</textarea></label><label>Países/regiões aceitos<textarea name="locations" rows="3">{esc(cfg.get('locations',''))}</textarea></label><label>Fontes: remotive, remoteok, adzuna, apify<input name="sources" value="{esc(cfg.get('sources',''))}"></label><label>Intervalo de busca (minutos)<input name="interval_minutes" type="number" min="5" value="{esc(cfg.get('interval_minutes','15'))}"></label><label>Países Adzuna (ex.: br,us,gb,ca)<input name="adzuna_countries" value="{esc(cfg.get('adzuna_countries','br,us,gb,ca'))}"></label><label>Limite mensal Apify (USD)<input name="apify_monthly_credit_limit_usd" type="number" min="0" step="0.01" value="{esc(cfg.get('apify_monthly_credit_limit_usd','5'))}"></label><label>Máximo de vagas por ciclo Apify<input name="apify_job_count" type="number" min="1" max="100" value="{esc(cfg.get('apify_job_count','25'))}"></label><label style="grid-column:1/-1">Actors Apify (JSON — um ou mais scrapers)<textarea name="apify_actors_json" rows="8" style="font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px">{esc(cfg.get('apify_actors_json',''))}</textarea></label></div><p class="hint">Cada actor: <code>id</code>, <code>label</code>, <code>enabled</code>, <code>input_mode</code> (<code>linkedin_search</code> ou <code>custom</code>), <code>count</code> opcional. Em <code>linkedin_search</code>, a IA monta sozinha keywords + f_E (nível) + f_WT (remote/híbrido) a partir do currículo (cache até reanalisar). Em <code>custom</code>, use <code>input_template</code> com placeholders <code>{{keyword}}</code>, <code>{{location}}</code>, <code>{{count}}</code>, <code>{{keywords}}</code>.</p><div id="linkedin-filter-slot">{linkedin_filter_view}</div><button>Salvar preferências</button></form></section></div>
+<div id="tab-busca" class="tab-panel"><section class="panel"><h2>Busca &amp; coleta</h2><form method="post" action="/settings"><div class="form-grid"><label>Cargos e termos, separados por vírgula<textarea name="keywords" rows="3">{esc(cfg.get('keywords',''))}</textarea></label><label>Países/regiões aceitos<textarea name="locations" rows="3">{esc(cfg.get('locations',''))}</textarea></label><label>Fontes: remotive, remoteok, adzuna, apify<input name="sources" value="{esc(cfg.get('sources',''))}"></label><label>Intervalo de busca (minutos)<input name="interval_minutes" type="number" min="5" value="{esc(cfg.get('interval_minutes','15'))}"></label><label>Países Adzuna (ex.: br,us,gb,ca)<input name="adzuna_countries" value="{esc(cfg.get('adzuna_countries','br,us,gb,ca'))}"></label><label>Limite mensal Apify (USD)<input name="apify_monthly_credit_limit_usd" type="number" min="0" step="0.01" value="{esc(cfg.get('apify_monthly_credit_limit_usd','5'))}"></label><label>Máximo de vagas por ciclo Apify<input name="apify_job_count" type="number" min="1" max="100" value="{esc(cfg.get('apify_job_count','25'))}"></label><label style="grid-column:1/-1">Actors Apify (JSON — um ou mais scrapers)<textarea name="apify_actors_json" rows="8" style="font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px">{esc(cfg.get('apify_actors_json',''))}</textarea></label></div><p class="hint">Cada actor: <code>id</code>, <code>label</code>, <code>enabled</code>, <code>input_mode</code> (<code>linkedin_search</code> ou <code>custom</code>), <code>count</code> opcional. Em <code>linkedin_search</code>, a IA monta sozinha keywords + f_E (nível) + f_WT (remote/híbrido) a partir do currículo (cache até o prompt ou o currículo mudarem). Em <code>custom</code>, use <code>input_template</code> com placeholders <code>{{keyword}}</code>, <code>{{location}}</code>, <code>{{count}}</code>, <code>{{keywords}}</code>.</p><label style="margin:16px 0 8px;display:block;grid-column:1/-1">Prompt do filtro LinkedIn (IA)<textarea name="linkedin_filter_prompt" rows="14" style="font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px">{esc(effective_linkedin_filter_prompt(cfg))}</textarea></label><p class="hint">Edite as instruções da IA para o filtro. Placeholders: <code>{{pref_keywords}}</code>, <code>{{facts_pt}}</code>, <code>{{facts_en}}</code>, <code>{{resume_pt}}</code>, <code>{{resume_en}}</code>. Ao salvar com mudanças neste texto, o filtro é <strong>regerado</strong> na hora (precisa de chave de IA e currículo analisado).</p><div id="linkedin-filter-slot">{linkedin_filter_view}</div><button>Salvar preferências</button></form></section></div>
 
 <div id="tab-curriculos" class="tab-panel"><section class="panel"><h2>Currículos (PDF)</h2>{resume_panel}<p class="hint">O seletor de arquivos do sistema abre ao escolher o PDF. A análise agora gera um dossiê completo (skills, experiências, projetos). Use <em>Reanalisar</em> para regenerar com o prompt enriquecido.</p></section></div>
 
@@ -4549,9 +4601,33 @@ class Handler(BaseHTTPRequestHandler):
                 except ValueError as exc:
                     self.redirect(f"Actors Apify inválidos: {exc}", notice_kind="error")
                     return
+            old_prompt = effective_linkedin_filter_prompt(settings())
+            raw_prompt = (form.get("linkedin_filter_prompt") or "").strip()
+            # Mesmo texto do default embutido → guarda vazio (usa DEFAULT).
+            if raw_prompt == DEFAULT_LINKEDIN_FILTER_PROMPT.strip():
+                form["linkedin_filter_prompt"] = ""
+            else:
+                form["linkedin_filter_prompt"] = raw_prompt
             save_settings(form)
-            log_event("info", "settings", "Preferências de busca salvas.")
-            self.redirect("Filtros salvos.")
+            new_cfg = settings()
+            new_prompt = effective_linkedin_filter_prompt(new_cfg)
+            notice = "Filtros salvos."
+            notice_kind = "success"
+            if new_prompt != old_prompt:
+                try:
+                    get_linkedin_search_filter(new_cfg, force_refresh=True)
+                    notice = "Filtros salvos e filtro LinkedIn regerado."
+                    log_event("info", "settings", "Prompt do filtro LinkedIn alterado; filtro regerado.")
+                except Exception as exc:
+                    notice = (
+                        "Preferências salvas, mas falhou ao regenerar o filtro LinkedIn: "
+                        f"{exc}. Ele tentará de novo na próxima coleta."
+                    )
+                    notice_kind = "warning"
+                    log_event("warning", "settings", f"Regeneração do filtro LinkedIn falhou: {exc}")
+            else:
+                log_event("info", "settings", "Preferências de busca salvas.")
+            self.redirect(notice, notice_kind=notice_kind)
         elif path == "/candidate-settings":
             save_settings(form)
             log_event("info", "settings", "Perfil do candidato salvo (dados, salário, diversidade).")
