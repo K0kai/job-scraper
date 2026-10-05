@@ -19,7 +19,10 @@ STATUS_FAILED_AI = "failed_ai"
 KIND_TEXT = "text"
 KIND_FILE = "file"
 
-PANEL_OPEN_STATUSES = (STATUS_PENDING, STATUS_AWAITING_AI)
+# Modal só fica aberto enquanto o humano ainda não respondeu.
+# `awaiting_ai` era usado para segurar o spinner durante a próxima chamada à IA
+# (rate-limit podia segurar por vários minutos) — não entra mais no painel.
+PANEL_OPEN_STATUSES = (STATUS_PENDING,)
 
 ConnectFn = Callable[[], sqlite3.Connection]
 
@@ -77,9 +80,14 @@ def create_ask(
 
 
 def get_pending_ask(connect_fn: ConnectFn) -> dict | None:
-    """Ask visível no painel: pending (editável) ou awaiting_ai (spinner)."""
+    """Ask visível no painel: só pending (ainda sem resposta do humano)."""
     with connect_fn() as db:
         ensure_table(db)
+        # Asks antigos em awaiting_ai (spinner eterno) → fecha na leitura.
+        db.execute(
+            "UPDATE copilot_asks SET status=?, hint=? WHERE status=?",
+            (STATUS_ANSWERED, "", STATUS_AWAITING_AI),
+        )
         row = db.execute(
             f"""SELECT id, job_id, question, status, answer, hint, kind, file_path, created_at
                FROM copilot_asks
@@ -161,7 +169,7 @@ def answer_ask(
             return False
         db.execute(
             """UPDATE copilot_asks SET status=?, answer=?, hint=?, file_path=?, answered_at=? WHERE id=?""",
-            (STATUS_AWAITING_AI, text, "", path, now_iso, ask_id),
+            (STATUS_ANSWERED, text, "", path, now_iso, ask_id),
         )
         question = row["question"]
     append_facts_both(connect_fn, question=question, answer=text)

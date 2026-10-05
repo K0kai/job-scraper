@@ -118,6 +118,11 @@ Rules:
   FORBIDDEN vague asks: "required fields need confirmation", "subjective
   ratings", "custom form needs input", "preciso de um dado", or any summary
   that does not name the field. Ask ONE field at a time; never bundle.
+- "Add skills" / "Search and add skills" / typeahead skill pickers: these are
+  NOT 1–10 rating scales. Type skill names from RESUME EXCERPT / FACTS (one
+  at a time, Enter between chips if needed). Do NOT `ask` "qual valor
+  preencher" for addSkills widgets. Only `ask` if the page requires a skill
+  you cannot evidence at all — then list 3–5 concrete skills to choose from.
 - Be frugal: prefer ONE batch that fills/clicks only what you already know, then
   click Next/Continue/Review (never Submit) OR emit `done` so the bot resumes.
   If you cannot unblock after asking, `abort` quickly (do not burn turns guessing).
@@ -361,6 +366,9 @@ def is_vague_ask(question: str) -> bool:
         return True
     if _VAGUE_ASK_RE.search(q):
         return True
+    # Typeahead "add skills" / rótulos técnicos — não é pergunta útil ao humano.
+    if _ADD_SKILLS_WIDGET_RE.search(q):
+        return True
     # Sem rótulo citado e sem "qual …" direcionado → provavelmente vago.
     has_quoted_label = bool(re.search(r"[«»\"“”'].{3,}", q))
     has_direct_qual = bool(
@@ -412,6 +420,22 @@ def _ask_for_page_field(field: dict) -> str:
     )
 
 
+_ADD_SKILLS_WIDGET_RE = re.compile(
+    r"add[_\s-]*skills?|search\s+and\s+add|adicion(ar|e)\s+(skills?|habilidades?)|"
+    r"type\s*to\s*add|selecione\s+habilidades|addskills",
+    re.I,
+)
+
+
+def _looks_like_add_skills_widget(field: dict) -> bool:
+    """Typeahead 'Search and add skills' — NÃO é escala 1–10."""
+    label = _field_label(field)
+    name = str(field.get("name") or "")
+    fid = str(field.get("id") or "")
+    hay = " ".join((label, name, fid))
+    return bool(_ADD_SKILLS_WIDGET_RE.search(hay))
+
+
 def _iter_skill_scale_fields(fields: list[dict]) -> list[dict]:
     """Campos de escala/proficiência 1–10 (select, combobox ou number)."""
     try:
@@ -422,6 +446,8 @@ def _iter_skill_scale_fields(fields: list[dict]) -> list[dict]:
 
     out: list[dict] = []
     for field in fields or []:
+        if _looks_like_add_skills_widget(field):
+            continue
         label = _field_label(field)
         opts = [str(o) for o in (field.get("options") or []) if str(o).strip()]
         tag = str(field.get("tag") or "")
@@ -433,7 +459,8 @@ def _iter_skill_scale_fields(fields: list[dict]) -> list[dict]:
             looks_scale = True
         else:
             low = label.casefold()
-            if any(
+            # Exige sinal de ESCALA — "skill"/"habilidade" sozinho é typeahead, não 1–10.
+            has_scale_cue = any(
                 tok in low
                 for tok in (
                     "escala",
@@ -443,13 +470,26 @@ def _iter_skill_scale_fields(fields: list[dict]) -> list[dict]:
                     "1 a 10",
                     "profici",
                     "rate ",
+                    "rate your",
                     "avalie",
+                    "autoavalia",
+                    "self-assess",
+                    "self assess",
+                    "nível",
+                    "nivel",
+                )
+            )
+            has_topic = any(
+                tok in low
+                for tok in (
                     "experi",
                     "skill",
                     "habilidade",
                     "conheciment",
+                    "familiar",
                 )
-            ):
+            )
+            if has_scale_cue and (has_topic or "1-10" in low or "1 a 10" in low or "1 – 10" in low):
                 looks_scale = True
             if tag in {"select", "combobox"} and opts:
                 nums = []
@@ -458,7 +498,9 @@ def _iter_skill_scale_fields(fields: list[dict]) -> list[dict]:
                     if m:
                         nums.append(int(m.group(1)))
                 if len(nums) >= 3 and min(nums) >= 1 and max(nums) <= 10:
-                    looks_scale = True
+                    # Só trata como escala se o rótulo sugere rating OU opções são 1..N puro.
+                    if has_scale_cue or has_topic or len(nums) >= 5:
+                        looks_scale = True
             if tag == "input" and ftype == "number" and looks_scale:
                 pass
         if looks_scale:
@@ -476,8 +518,10 @@ def concrete_ask_from_page(cfg: dict | None, fields: list[dict]) -> str | None:
     for field in _iter_skill_scale_fields(fields):
         return _ask_for_page_field(field)
 
-    # Campos required sem regra de painel.
+    # Campos required sem regra de painel (ignora typeahead add-skills).
     for field in fields or []:
+        if _looks_like_add_skills_widget(field):
+            continue
         if not field.get("required"):
             continue
         if not _field_label(field):
@@ -486,12 +530,16 @@ def concrete_ask_from_page(cfg: dict | None, fields: list[dict]) -> str | None:
 
     # Qualquer select/combobox com opções (ainda sem valor óbvio no perfil).
     for field in fields or []:
+        if _looks_like_add_skills_widget(field):
+            continue
         opts = [str(o) for o in (field.get("options") or []) if str(o).strip()]
         if str(field.get("tag") or "") in {"select", "combobox"} and opts and _field_label(field):
             return _ask_for_page_field(field)
 
-    # Último recurso: primeiro campo com rótulo legível.
+    # Último recurso: primeiro campo com rótulo legível (não widget de skills).
     for field in fields or []:
+        if _looks_like_add_skills_widget(field):
+            continue
         label = _field_label(field)
         if len(label) >= 3:
             return _ask_for_page_field(field)
@@ -1650,7 +1698,9 @@ def copilot_takeover(page, context, *, reason: str, cfg: dict, ai: dict,
             except Exception as exc:
                 LOG.debug("copiloto: fill pós-ask falhou: %s", exc)
             history.append(f"turn {turn}: ask -> answered ({_clip(answer, 80)})")
-            open_ask_id = ask_id
+            # Não mantém o modal aberto durante a próxima chamada à IA
+            # (rate-limit pode segurar awaiting_ai por vários minutos).
+            open_ask_id = None
             no_progress_streak = 0
             continue
 

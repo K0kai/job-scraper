@@ -3852,8 +3852,15 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
       .then(function (res) {{
         var data = res.data || {{}};
         showNotice(data.notice || (data.ok ? "OK" : "Falha"), data.kind || (data.ok ? "success" : "error"));
-        if (path === "/copilot-ask-answer" && data.ok === false) {{
-          setCopilotAskBusy(false, "");
+        if (path === "/copilot-ask-answer") {{
+          if (data.ok === false) {{
+            setCopilotAskBusy(false, "");
+          }} else {{
+            setCopilotAskBusy(false, "");
+            var modalDone = document.getElementById("copilot-ask-modal");
+            if (modalDone) modalDone.hidden = true;
+            lastCopilotAskId = null;
+          }}
         }}
         refresh();
       }})
@@ -4670,7 +4677,7 @@ class Handler(BaseHTTPRequestHandler):
                     + (" (com arquivo)" if file_path else "")
                     + ".",
                 )
-                self.respond_notice("Resposta enviada — aguardando a IA (o modal fica aberto).")
+                self.respond_notice("Resposta enviada — o copiloto continua no Chrome.")
             else:
                 self.respond_notice("Pergunta já respondida ou expirada.", notice_kind="warning", ok=False)
             return
