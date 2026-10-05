@@ -118,6 +118,10 @@ Rules:
   FORBIDDEN vague asks: "required fields need confirmation", "subjective
   ratings", "custom form needs input", "preciso de um dado", or any summary
   that does not name the field. Ask ONE field at a time; never bundle.
+- NEVER quote technical field ids as the label (`rec-form_829…`, long numeric
+  ids, UUIDs, `ember123`). If FIELDS only has an opaque id, look at PAGE TEXT
+  for the visible question next to that blank, or `ask` the human to read the
+  visible label in Chrome — do not ask "qual valor em «rec-form_…»".
 - "Add skills" / "Search and add skills" / typeahead skill pickers: these are
   NOT 1–10 rating scales. Type skill names from RESUME EXCERPT / FACTS (one
   at a time, Enter between chips if needed). Do NOT `ask` "qual valor
@@ -359,6 +363,56 @@ _VAGUE_ASK_RE = re.compile(
 )
 
 
+_TECHNICAL_FIELD_TOKEN_RE = re.compile(
+    r"^(?:"
+    r"rec-form_[0-9]+|"
+    r"[a-z]*[-_]?form[-_]?\d{8,}|"
+    r"zf[-_]?[a-z0-9]+|"
+    r"ember\d+|"
+    r"react-select[-a-z0-9]*|"
+    r"mui-[-a-z0-9]+|"
+    r"css-[-a-z0-9]+|"
+    r"data-radar[-a-z0-9]*|"
+    r"[0-9a-f]{8}-[0-9a-f-]{20,}|"
+    r"[a-zA-Z0-9_-]{16,}"
+    r")$",
+    re.I,
+)
+
+
+def _is_technical_field_token(text: str) -> bool:
+    """True para ids/nomes de ATS (Zoho rec-form_…, UUIDs longos, etc.)."""
+    t = (text or "").strip()
+    if not t:
+        return True
+    if re.search(r"rec-form_|zcrm|crm[_-]?field", t, re.I):
+        return True
+    if re.match(r"^[a-zA-Z]*[-_]?form[-_]?\d{8,}", t):
+        return True
+    if _TECHNICAL_FIELD_TOKEN_RE.match(t) and (
+        re.search(r"\d{6,}", t) or "-" in t or len(t) >= 20
+    ):
+        return True
+    # Só dígitos / só camelCase técnico sem espaço e com muitos dígitos.
+    if " " not in t and re.search(r"\d{8,}", t):
+        return True
+    return False
+
+
+def _humanize_field_text(text: str) -> str:
+    """Remove tokens técnicos; devolve string legível ou vazio."""
+    raw = re.sub(r"\s+", " ", (text or "").strip())
+    if not raw:
+        return ""
+    if not _is_technical_field_token(raw) and " " not in raw and not re.search(r"\d{6,}", raw):
+        return raw
+    parts = [p for p in raw.split(" ") if p and not _is_technical_field_token(p)]
+    joined = " ".join(parts).strip()
+    if joined and not _is_technical_field_token(joined):
+        return joined
+    return ""
+
+
 def is_vague_ask(question: str) -> bool:
     """True se a pergunta não aponta um campo concreto que o humano consiga responder."""
     q = (question or "").strip()
@@ -369,6 +423,10 @@ def is_vague_ask(question: str) -> bool:
     # Typeahead "add skills" / rótulos técnicos — não é pergunta útil ao humano.
     if _ADD_SKILLS_WIDGET_RE.search(q):
         return True
+    # Cita id técnico (ex.: «rec-form_829…») em vez de rótulo legível.
+    for m in re.finditer(r"[«»\"“”']([^«»\"“”']{3,})[«»\"“”']", q):
+        if _is_technical_field_token(m.group(1).strip()) or not _humanize_field_text(m.group(1)):
+            return True
     # Sem rótulo citado e sem "qual …" direcionado → provavelmente vago.
     has_quoted_label = bool(re.search(r"[«»\"“”'].{3,}", q))
     has_direct_qual = bool(
@@ -388,20 +446,33 @@ def is_vague_ask(question: str) -> bool:
 
 
 def _field_label(field: dict) -> str:
-    return (
-        str(field.get("label") or "").strip()
-        or str(field.get("placeholder") or "").strip()
-        or str(field.get("name") or "").strip()
-        or str(field.get("id") or "").strip()
-    )
+    """Rótulo legível para ask/prompt — nunca id técnico de ATS."""
+    for key in ("label", "placeholder", "name", "id"):
+        human = _humanize_field_text(str(field.get(key) or ""))
+        if human:
+            return human
+    return ""
 
 
 def _ask_for_page_field(field: dict) -> str:
     """Pergunta concreta citando o rótulo (e opções, se houver)."""
-    label = _field_label(field) or "campo sem rótulo"
+    label = _field_label(field)
     opts = [str(o).strip() for o in (field.get("options") or []) if str(o).strip()]
     tag = str(field.get("tag") or "")
     ftype = str(field.get("type") or "").casefold()
+    if not label:
+        if opts:
+            sample = ", ".join(opts[:10])
+            more = "…" if len(opts) > 10 else ""
+            return (
+                "Há um campo sem rótulo legível nesta página. "
+                f"Qual opção marcar? Opções: {sample}{more}"
+            )
+        kind = ftype or tag or "texto"
+        return (
+            f"Há um campo obrigatório ({kind}) sem rótulo legível no Chrome. "
+            "Qual o texto/pergunta que aparece ao lado dele e qual valor devo usar?"
+        )
     if opts:
         sample = ", ".join(opts[:10])
         more = "…" if len(opts) > 10 else ""
@@ -555,7 +626,7 @@ def clarify_ask_question(question: str, fields: list[dict], cfg: dict | None = N
     if concrete:
         LOG.info("copiloto: ask vago reescrito → %s", concrete[:160])
         return concrete
-    # Nunca peça o rótulo ao humano — liste o que a página mostra.
+    # Nunca peça o rótulo ao humano — liste o que a página mostra (só legíveis).
     labels = []
     for field in fields or []:
         lab = _field_label(field)
@@ -570,8 +641,9 @@ def clarify_ask_question(question: str, fields: list[dict], cfg: dict | None = N
             f"Qual destes preencher e com qual valor? {listed}"
         )
     return (
-        "Há um campo obrigatório em branco nesta página do formulário. "
-        "Qual o texto do campo que você está vendo e qual valor devo usar?"
+        "Há um campo obrigatório em branco nesta página, mas o rótulo no HTML "
+        "é só um id técnico (não dá para ler). Olhando o Chrome, qual texto/"
+        "pergunta aparece ao lado do campo vazio e qual valor devo usar?"
     )
 
 

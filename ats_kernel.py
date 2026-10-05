@@ -80,23 +80,59 @@ _FIELDS_JS = """() => {
   };
   const labelFor = (el) => {
     const id = el.id || '';
+    const isTech = (s) => {
+      const t = String(s || '').trim();
+      if (!t) return true;
+      if (/rec-form_|zf[_-]|zcrm|ember\\d+|react-select|mui-|css-|data-radar|crm[_-]?field/i.test(t)) return true;
+      if (/^[a-zA-Z]*[-_]?form[-_]?\\d{8,}/i.test(t)) return true;
+      if (/^[a-zA-Z0-9_-]{16,}$/.test(t) && /\\d{6,}/.test(t)) return true;
+      if (/^[0-9a-f]{8}-[0-9a-f-]{20,}$/i.test(t)) return true;
+      return false;
+    };
+    const clean = (s) => String(s || '').replace(/\\s+/g, ' ').trim().slice(0, 400);
+    const pick = (s) => {
+      const t = clean(s);
+      if (!t || isTech(t)) return '';
+      // Se misturou id técnico no texto, fica só a parte humana.
+      const parts = t.split(/\\s+/).filter((p) => !isTech(p));
+      const joined = parts.join(' ').trim();
+      return joined.length >= 2 ? joined.slice(0, 400) : '';
+    };
     let label = '';
     if (id) {
       const lab = document.querySelector(`label[for="${CSS.escape(id)}"]`);
-      if (lab) label = lab.innerText || '';
+      if (lab) label = pick(lab.innerText);
     }
-    if (!label && el.closest('label')) label = el.closest('label').innerText || '';
-    if (!label && el.getAttribute('aria-label')) label = el.getAttribute('aria-label');
+    if (!label && el.closest('label')) label = pick(el.closest('label').innerText);
+    if (!label) label = pick(el.getAttribute('aria-label'));
+    if (!label) label = pick(el.getAttribute('aria-placeholder'));
+    if (!label) label = pick(el.getAttribute('data-label') || el.getAttribute('title'));
     if (!label) {
       const legend = el.closest('fieldset')?.querySelector('legend');
-      if (legend) label = legend.innerText || '';
+      if (legend) label = pick(legend.innerText);
     }
     if (!label) {
       const prev = el.previousElementSibling;
-      if (prev && /label|span|p|div/i.test(prev.tagName)) label = prev.innerText || '';
+      if (prev && /label|span|p|div|strong|b/i.test(prev.tagName)) label = pick(prev.innerText);
     }
-    if (!label) label = [el.name, el.placeholder, el.id, el.getAttribute('aria-label')].filter(Boolean).join(' ');
-    return (label || '').slice(0, 400);
+    if (!label) {
+      let node = el.parentElement;
+      for (let i = 0; i < 4 && node && !label; i++) {
+        const cand = node.querySelector(
+          'label, .label, [class*="label"], [class*="Label"], [class*="title"], legend'
+        );
+        if (cand && !cand.contains(el)) label = pick(cand.innerText);
+        if (!label) {
+          const sib = node.previousElementSibling;
+          if (sib) label = pick(sib.innerText);
+        }
+        node = node.parentElement;
+      }
+    }
+    if (!label) label = pick(el.placeholder);
+    if (!label) label = pick(el.name);
+    // Nunca devolver id técnico como "rótulo" — melhor vazio.
+    return label || '';
   };
   document.querySelectorAll('input, textarea, select').forEach((el) => {
     const type = (el.type || '').toLowerCase();
