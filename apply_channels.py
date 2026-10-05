@@ -295,6 +295,32 @@ def apply_via_browser(
         if not controls:
             return "Nenhum formulário público detectado."
 
+        try:
+            from ats_answers import answer_choice_groups, answer_skill_rating_fields
+            from ats_base import ApplyContext
+
+            step_ctx = ApplyContext(
+                cfg=cfg,
+                rules=rules,
+                resume_path=resume_path,
+                cover_letter=cover_letter,
+                ai={
+                    "job": job,
+                    "resume_summary": resume_summary,
+                    "resume_json": resume_json,
+                    "facts": facts,
+                    "provider": provider,
+                    "model": model,
+                    "api_key": api_key,
+                    "connect_fn": connect_fn,
+                    "now_iso": now_iso,
+                },
+            )
+            answer_choice_groups(active_page, step_ctx, log_prefix="browser")
+            answer_skill_rating_fields(active_page, step_ctx, log_prefix="browser")
+        except Exception as exc:
+            LOG.debug("browser opcoes/escala falharam: %s", exc)
+
         for control in controls:
             label = control.get("label") or control.get("name") or ""
             tag = control.get("tag")

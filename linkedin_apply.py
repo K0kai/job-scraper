@@ -636,6 +636,10 @@ def _fill_modal_step(
             )
             answered, _deferred = answer_choice_groups(modal, step_ctx, log_prefix="easy-apply")
             pending_answers.extend(("opcao respondida", a[:500]) for a in answered)
+            from ats_answers import answer_skill_rating_fields
+
+            rated, _def_rating = answer_skill_rating_fields(modal, step_ctx, log_prefix="easy-apply")
+            pending_answers.extend(("escala 1-10", a[:500]) for a in rated)
         except Exception as exc:
             LOG.debug("grupos de opcoes no modal falharam: %s", exc)
 

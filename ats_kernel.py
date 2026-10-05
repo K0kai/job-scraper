@@ -409,6 +409,13 @@ def fill_page(page, ctx: ApplyContext, handler=None) -> FillResult:
             filled.extend(answered)
         except Exception as exc:
             LOG.debug("grupos de opcoes falharam: %s", exc)
+        try:
+            from ats_answers import answer_skill_rating_fields
+
+            rated, _def_rating = answer_skill_rating_fields(page, ctx, log_prefix="kernel")
+            filled.extend(rated)
+        except Exception as exc:
+            LOG.debug("escalas 1-10 falharam: %s", exc)
         return FillResult(ok=not missing, filled=filled, missing=missing)
     except Exception as exc:
         return FillResult(

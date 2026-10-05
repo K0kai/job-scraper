@@ -53,6 +53,15 @@ CONSENT_RE = re.compile(
     r"\bagree\b|consent|terms|privacy|autorizo|concordo|pol[ií]tica de privacidade",
     re.I,
 )
+SKILL_RATING_RE = re.compile(
+    r"escala.{0,25}1.{0,8}10|scale.{0,25}1.{0,8}10|"
+    r"rate.{0,40}(experience|skill|proficiency|your)|"
+    r"avalie.{0,40}(experi|conhec|habilidade)|"
+    r"nível.{0,20}1.{0,8}10|n[ií]vel.{0,20}1.{0,8}10|"
+    r"how would you rate|qu[aã]o.{0,20}(experi|conhec|habilidade)|"
+    r"self.?assess|autoavalia",
+    re.I,
+)
 
 NOT_INFORMED = "not_informed"
 
@@ -331,6 +340,156 @@ Resume analysis JSON: {resume_json[:8000] or '[none]'}
 Job title: {job.get('title')}
 Company: {job.get('company')}
 """
+
+
+def label_looks_like_skill_rating(label: str) -> bool:
+    hay = label or ""
+    if SKILL_RATING_RE.search(hay):
+        return True
+    low = hay.casefold()
+    if re.search(r"1\s*[-–]\s*10|1\s+a\s+10|\bscale\b|\bescala\b", low):
+        return any(
+            tok in low
+            for tok in (
+                "experi",
+                "skill",
+                "habilidade",
+                "conhecimento",
+                "proficiency",
+                "familiar",
+                "domínio",
+                "dominio",
+                "anos de",
+                "years of",
+            )
+        )
+    return False
+
+
+def options_look_like_numeric_scale(options: list[str]) -> bool:
+    if len(options) < 3:
+        return False
+    nums: list[int] = []
+    for raw in options:
+        m = re.match(r"^\s*(\d{1,2})\s*$", str(raw).strip())
+        if not m:
+            return False
+        nums.append(int(m.group(1)))
+    return min(nums) >= 1 and max(nums) <= 10 and len(set(nums)) >= 3
+
+
+def build_skill_rating_prompt(
+    *,
+    question: str,
+    options: list[str],
+    job: dict,
+    resume_summary: str,
+    resume_json: str,
+    facts: str,
+) -> str:
+    opts = ", ".join(options)
+    return f"""Pick ONE self-rating option for this job application skill question.
+Use ONLY the resume analysis and candidate facts. Be honest and conservative:
+- strong daily use / core skill → 8–9
+- solid but not primary → 6–7
+- beginner / exposure only → 3–5
+- no evidence → reply exactly: CANNOT_ANSWER
+Return ONLY the exact option text from this list: {opts}
+
+Question: {question}
+Candidate facts: {facts or '[none]'}
+Resume summary: {resume_summary or '[none]'}
+Resume analysis JSON: {resume_json[:6000] or '[none]'}
+Job title: {job.get('title')}
+Company: {job.get('company')}
+"""
+
+
+def choose_skill_rating_option(question: str, options: list[str], ai: dict) -> str | None:
+    """Uma opção da escala 1–10 com cache."""
+    if not options or not ai.get("api_key"):
+        return None
+    cached = cache_get(ai.get("connect_fn"), question)
+    if cached and cached.strip().upper() != "CANNOT_ANSWER":
+        pick = parse_choices_answer(cached, options, multiple=False)
+        if pick:
+            return pick[0]
+    try:
+        from ai_client import call_ai_text
+
+        prompt = build_skill_rating_prompt(
+            question=question,
+            options=options,
+            job=ai.get("job") or {},
+            resume_summary=ai.get("resume_summary") or "",
+            resume_json=ai.get("resume_json") or "",
+            facts=ai.get("facts") or "",
+        )
+        text = call_ai_text(
+            prompt=prompt,
+            provider=ai.get("provider") or "",
+            model=ai.get("model") or "",
+            api_key=ai.get("api_key") or "",
+        )
+        if not text or "CANNOT_ANSWER" in text.upper():
+            return None
+        pick = parse_choices_answer(text, options, multiple=False)
+        if pick:
+            cache_put(
+                ai.get("connect_fn"),
+                question=question,
+                kind="skill_rating",
+                answer=text.strip()[:4000],
+                provider=ai.get("provider") or "",
+                model=ai.get("model") or "",
+                now_iso=ai.get("now_iso") or "",
+            )
+            return pick[0]
+    except (AiUnavailableError, ValueError, RuntimeError) as exc:
+        LOG.info("skill rating IA indisponível (%s): %s", question[:60], exc)
+    return None
+
+
+def answer_skill_rating_fields(scope, ctx, *, log_prefix: str = "form") -> tuple[list[str], list[str]]:
+    """Preenche selects/inputs numéricos de autoavaliação 1–10 (fora de radio groups)."""
+    from ats_kernel import field_selector, safe_fill, safe_select
+
+    answered: list[str] = []
+    deferred: list[str] = []
+    ai = ctx.ai or {}
+    try:
+        from ats_kernel import collect_fields
+
+        fields = collect_fields(scope)
+    except Exception:
+        return answered, deferred
+    for field in fields:
+        label = str(field.get("label") or "")
+        options = [str(o) for o in (field.get("options") or []) if str(o).strip()]
+        tag = str(field.get("tag") or "")
+        ftype = str(field.get("type") or "").casefold()
+        is_scale_select = tag in {"select", "combobox"} and options_look_like_numeric_scale(options)
+        is_scale_number = tag == "input" and ftype == "number"
+        if not (is_scale_select or is_scale_number):
+            continue
+        if not label_looks_like_skill_rating(label):
+            continue
+        opts = options if options else [str(n) for n in range(1, 11)]
+        chosen = choose_skill_rating_option(label, opts, ai)
+        if not chosen:
+            deferred.append(label[:120])
+            continue
+        sel = field_selector(field)
+        ok = False
+        if is_scale_select:
+            ok = safe_select(scope, sel, options, chosen)
+        else:
+            ok = safe_fill(scope, sel, chosen)
+        if ok:
+            answered.append(f"{label[:80]} → {chosen}")
+        else:
+            deferred.append(label[:120])
+    return answered, deferred
 
 
 def parse_choices_answer(text: str, options: list[str], *, multiple: bool) -> list[str] | None:
@@ -625,6 +784,14 @@ def answer_choice_groups(scope, ctx, *, log_prefix: str = "form") -> tuple[list[
             if category == "other":
                 category = _infer_category_from_options(options) or "other"
             got = diversity_answer_for_options(ctx.cfg, category, options)
+            chosen = [got] if got else None
+        elif (
+            not group.get("multiple")
+            and options_look_like_numeric_scale(options)
+            and label_looks_like_skill_rating(question)
+            and ai.get("api_key")
+        ):
+            got = choose_skill_rating_option(question, options, ai)
             chosen = [got] if got else None
         elif kind == "company" and ai.get("api_key"):
             cached = cache_get(ai.get("connect_fn"), question)

@@ -103,11 +103,17 @@ Max 5 steps per batch. Available actions (args in parentheses):
   abort    (reason="<why it cannot be automated>")                   # give up -> yellow note
 
 Rules:
-- Be frugal: prefer ONE batch that fills/clicks everything obvious, then click
-  Next/Continue/Review (never Submit) OR emit `done` so the bot resumes.
-  If data is missing, `ask` immediately as a STANDALONE action (never bury `ask`
-  inside a batch) — do not probe with wait/scroll/mouse.
-  If you cannot unblock, `abort` quickly (do not burn turns guessing).
+- HARD RULE — NEVER INVENT DATA. If a value is not explicitly present in
+  PANEL PROFILE, CANDIDATE FACTS, or RESUME EXCERPT, you MUST emit `ask` as a
+  STANDALONE action (never bury `ask` inside a batch). This applies to ANY
+  field the site asks for: address, CEP/zip, phone, city, state, country,
+  salary nuance, dates, IDs, skill ratings you cannot evidence, open questions,
+  and every other blank. Guessing, placeholders ("Rua Exemplo", "123 Main St",
+  fake CEP, "N/A", "TBD"), or copying the job's company/location is FORBIDDEN.
+  When unsure even a little → `ask`. Do not probe with wait/scroll/mouse first.
+- Be frugal: prefer ONE batch that fills/clicks only what you already know, then
+  click Next/Continue/Review (never Submit) OR emit `done` so the bot resumes.
+  If you cannot unblock after asking, `abort` quickly (do not burn turns guessing).
 - After filling required fields, prefer clicking Next/Continue/Review yourself
   in the same batch, or `done` — do not keep typing the same fields.
 - NEVER emit a click whose target text matches submit/apply/finalizar/enviar. The
@@ -116,13 +122,17 @@ Rules:
 - Resume/CV upload: if RESUME FILE path is listed below, use `upload` on the file
   input. NEVER ask the human for a resume/CV — it is already on disk from the panel.
 - Fill what you can from CANDIDATE FACTS + PANEL PROFILE + RESUME EXCERPT. Prefer
-  PANEL PROFILE for city/country/state/salary/contact; prefer RESUME EXCERPT for
-  education / location_notes / work_authorization / current employer.
+  PANEL PROFILE for city/country/state/street/postal/salary/contact; prefer RESUME
+  EXCERPT for education / location_notes / work_authorization / current employer.
   Country / State / Province / País / Estado / UF: use PANEL PROFILE
   `country`/`state` (or an explicit line in FACTS/EXCERPT). If those are missing,
   you MUST `ask` — do NOT invent Brazil, a Brazilian state, or the job-posting
   country. City alone is NOT enough to fill country/state unless the text
   explicitly names them.
+  Street / address line / CEP / zip / postal code: use PANEL PROFILE `street` and
+  `postal_code` only. NEVER type placeholders. If missing → `ask`.
+  Skill self-ratings (scale 1–10): use `select` on the numeric option that matches
+  the resume; be conservative; if unsure, `ask`.
   Current company / employer: use RESUME EXCERPT "Current employer" or PANEL
   PROFILE; do NOT use JOB.company (that is the hiring company).
   For salary fields: panel salary_brl/usd are MONTHLY mid-level targets.
@@ -133,9 +143,9 @@ Rules:
   For mid+ roles: stay above Brazil floor (converted) and a bit under local
   market (~10–20%) for offshore hires; prefer panel USD remote anchor when
   present. Do not put N/A if a base salary exists.
-  If a required field is still missing, prefer `ask` (human answers in the web
-  panel; Chrome stays open) over `abort`. Only `abort` when the human
-  cancelled/timed out, or for legal consent you must not sign. Never invent.
+  If a required field is still missing, you MUST `ask` (human answers in the web
+  panel; Chrome stays open). Only `abort` when the human cancelled/timed out, or
+  for legal consent you must not sign. Never invent.
 - For diversity/identity questions use only values you are explicitly given; if a
   legal consent box is the only blocker, use `abort` (we never sign terms for the
   person).
@@ -149,6 +159,8 @@ _PANEL_PROFILE_FIELDS: tuple[tuple[str, str], ...] = (
     ("candidate_phone", "phone"),
     ("candidate_linkedin", "linkedin"),
     ("candidate_city", "city"),
+    ("candidate_street", "street"),
+    ("candidate_postal_code", "postal_code"),
     ("candidate_state", "state"),
     ("candidate_country", "country"),
     ("candidate_current_company", "current_company"),
@@ -157,6 +169,322 @@ _PANEL_PROFILE_FIELDS: tuple[tuple[str, str], ...] = (
     ("salary_expectation_usd", "salary_usd"),
     ("candidate_contract_type", "contract_type"),
 )
+
+_STREET_FIELD_RE = re.compile(
+    r"street\s*address|address\s*line|endere[cç]o|logradouro|\brua\b|"
+    r"street\s*name|nome\s*da\s*rua|address\s*1|line\s*1|\baddress\b(?!\s*(type|book))",
+    re.I,
+)
+_POSTAL_FIELD_RE = re.compile(
+    r"\bzip\b|postal\s*code|\bcep\b|post\s*code|postcode|"
+    r"c[oó]digo\s*postal|codigo\s*postal",
+    re.I,
+)
+_PHONE_FIELD_RE = re.compile(r"phone|telefone|celular|mobile|whatsapp|\btel\b", re.I)
+_EMAIL_FIELD_RE = re.compile(r"e-?mail|correo", re.I)
+_NAME_FIELD_RE = re.compile(
+    r"full\s*name|nome\s*completo|your\s*name|candidate\s*name|"
+    r"^(name|nome)$|first\s*name|last\s*name|sobrenome|primeiro\s*nome",
+    re.I,
+)
+_CITY_FIELD_RE = re.compile(r"\bcity\b|\bcidade\b|localidade", re.I)
+_STATE_FIELD_RE = re.compile(
+    r"\bstate\b|\bestado\b|\bprovince\b|prov[ií]ncia|\buf\b|estado/provincia",
+    re.I,
+)
+_COUNTRY_FIELD_RE = re.compile(r"\bcountry\b|\bpa[ií]s\b|nationality\s*country", re.I)
+_CPF_FIELD_RE = re.compile(r"\bcpf\b|tax\s*id|documento|id\s*number", re.I)
+_LINKEDIN_FIELD_RE = re.compile(r"linkedin|profile\s*url", re.I)
+_COMPANY_FIELD_RE = re.compile(
+    r"current\s*company|empresa\s*atual|current\s*employer|most\s*recent\s*employer",
+    re.I,
+)
+
+# (profile_key, kind, matcher, ask_question)
+_PANEL_FIELD_SPECS: tuple[tuple[str, str, re.Pattern[str], str], ...] = (
+    (
+        "candidate_street",
+        "street",
+        _STREET_FIELD_RE,
+        "Qual é o seu endereço (rua e número)? (será salvo no perfil)",
+    ),
+    (
+        "candidate_postal_code",
+        "postal",
+        _POSTAL_FIELD_RE,
+        "Qual é o seu CEP / código postal? (será salvo no perfil)",
+    ),
+    (
+        "candidate_phone",
+        "phone",
+        _PHONE_FIELD_RE,
+        "Qual é o seu telefone (com DDD)? (será salvo no perfil)",
+    ),
+    (
+        "candidate_email",
+        "email",
+        _EMAIL_FIELD_RE,
+        "Qual é o seu e-mail? (será salvo no perfil)",
+    ),
+    (
+        "candidate_name",
+        "name",
+        _NAME_FIELD_RE,
+        "Qual é o seu nome completo? (será salvo no perfil)",
+    ),
+    (
+        "candidate_city",
+        "city",
+        _CITY_FIELD_RE,
+        "Qual é a sua cidade? (será salva no perfil)",
+    ),
+    (
+        "candidate_state",
+        "state",
+        _STATE_FIELD_RE,
+        "Qual é o seu estado / UF / província? (será salvo no perfil)",
+    ),
+    (
+        "candidate_country",
+        "country",
+        _COUNTRY_FIELD_RE,
+        "Qual é o seu país? (será salvo no perfil)",
+    ),
+    (
+        "candidate_cpf",
+        "cpf",
+        _CPF_FIELD_RE,
+        "Qual é o seu CPF / documento? (será salvo no perfil)",
+    ),
+    (
+        "candidate_linkedin",
+        "linkedin",
+        _LINKEDIN_FIELD_RE,
+        "Qual é a URL do seu LinkedIn? (será salva no perfil)",
+    ),
+    (
+        "candidate_current_company",
+        "current_company",
+        _COMPANY_FIELD_RE,
+        "Qual é a sua empresa atual / último empregador? (será salva no perfil)",
+    ),
+)
+
+
+def _field_hay(field: dict | None = None, *, label: str = "") -> str:
+    bits = [
+        label,
+        str((field or {}).get("label") or ""),
+        str((field or {}).get("placeholder") or ""),
+        str((field or {}).get("name") or ""),
+        str((field or {}).get("id") or ""),
+    ]
+    return " ".join(bits)
+
+
+def match_panel_field_spec(field: dict | None = None, *, label: str = "") -> tuple[str, str, str] | None:
+    """Retorna (profile_key, kind, ask_question) se o campo casa com dado do painel."""
+    hay = _field_hay(field, label=label)
+    if not hay.strip():
+        return None
+    for profile_key, kind, matcher, question in _PANEL_FIELD_SPECS:
+        if matcher.search(hay):
+            return profile_key, kind, question
+    return None
+
+
+def field_address_kind(field: dict | None = None, *, label: str = "") -> str | None:
+    """'street' | 'postal' | None a partir do label/placeholder/name do campo."""
+    spec = match_panel_field_spec(field, label=label)
+    if not spec:
+        return None
+    _key, kind, _q = spec
+    return kind if kind in {"street", "postal"} else None
+
+
+def address_ask_question(kind: str) -> str:
+    for _key, k, _matcher, question in _PANEL_FIELD_SPECS:
+        if k == kind:
+            return question
+    return "Preciso de um dado do seu perfil para preencher este campo. Pode informar?"
+
+
+def list_missing_panel_asks(cfg: dict | None, fields: list[dict]) -> list[str]:
+    """Perguntas obrigatórias: campos da página cujo valor no painel está vazio."""
+    cfg = cfg or {}
+    seen_keys: set[str] = set()
+    questions: list[str] = []
+    for field in fields or []:
+        spec = match_panel_field_spec(field)
+        if not spec:
+            continue
+        profile_key, _kind, question = spec
+        if profile_key in seen_keys:
+            continue
+        if str(cfg.get(profile_key) or "").strip():
+            continue
+        seen_keys.add(profile_key)
+        questions.append(question)
+    return questions
+
+
+def forced_missing_data_ask(cfg: dict | None, fields: list[dict]) -> str | None:
+    """Primeira pergunta obrigatória por dado do painel ausente na página atual."""
+    asks = list_missing_panel_asks(cfg, fields)
+    return asks[0] if asks else None
+
+
+def forced_address_ask_question(cfg: dict | None, fields: list[dict]) -> str | None:
+    """Compat: alias de forced_missing_data_ask (rua/CEP e demais campos do painel)."""
+    return forced_missing_data_ask(cfg, fields)
+
+
+def type_should_ask(
+    args: dict,
+    fields: list[dict],
+    cfg: dict | None,
+) -> str | None:
+    """Se a IA tentou digitar dado sem base no painel (ou placeholder) → ask."""
+    from form_rules import looks_like_fake_address
+
+    cfg = cfg or {}
+    text = str((args or {}).get("text") or "")
+    label = ""
+    field = None
+    idx = (args or {}).get("field")
+    if isinstance(idx, int):
+        for f in fields or []:
+            if f.get("index") == idx:
+                field = f
+                label = str(f.get("label") or "")
+                break
+    if not label:
+        label = str((args or {}).get("selector") or "")
+    if looks_like_fake_address(text):
+        spec = match_panel_field_spec(field, label=label)
+        if spec:
+            return spec[2]
+        return address_ask_question("street")
+    spec = match_panel_field_spec(field, label=label)
+    if not spec:
+        return None
+    profile_key, _kind, question = spec
+    if not str(cfg.get(profile_key) or "").strip():
+        return question
+    return None
+
+
+def address_type_should_ask(
+    args: dict,
+    fields: list[dict],
+    cfg: dict | None,
+) -> str | None:
+    """Compat: alias de type_should_ask."""
+    return type_should_ask(args, fields, cfg)
+
+
+def classify_address_ask_question(question: str) -> str | None:
+    q = question or ""
+    for _key, kind, matcher, _ask in _PANEL_FIELD_SPECS:
+        if matcher.search(q):
+            return kind
+    if re.search(r"endere[cç]o|rua\s*e\s*n", q, re.I):
+        return "street"
+    return None
+
+
+def classify_panel_ask_question(question: str) -> str | None:
+    """profile_key correspondente à pergunta do ask, se houver."""
+    q = question or ""
+    for profile_key, _kind, matcher, ask_q in _PANEL_FIELD_SPECS:
+        if matcher.search(q) or ask_q[:40].casefold() in q.casefold():
+            return profile_key
+    return None
+
+
+def persist_panel_ask_answer(
+    connect_fn,
+    cfg: dict,
+    *,
+    question: str,
+    answer: str,
+) -> str | None:
+    """Salva resposta no setting do painel (+ cfg em memória). Retorna o key ou None."""
+    text = (answer or "").strip()
+    key = classify_panel_ask_question(question)
+    if not key and classify_address_ask_question(question) == "street":
+        key = "candidate_street"
+    elif not key and classify_address_ask_question(question) == "postal":
+        key = "candidate_postal_code"
+    if not key or not text or not callable(connect_fn):
+        return None
+    cfg[key] = text
+    try:
+        with connect_fn() as db:
+            db.execute(
+                "INSERT INTO settings(key,value) VALUES(?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, text),
+            )
+    except Exception as exc:
+        LOG.warning("copiloto: falha ao salvar %s no perfil: %s", key, exc)
+        return key
+    LOG.info("copiloto: perfil atualizado %s=%s", key, text[:80])
+    return key
+
+
+def persist_address_answer(
+    connect_fn,
+    cfg: dict,
+    *,
+    question: str,
+    answer: str,
+) -> str | None:
+    """Compat: delega a persist_panel_ask_answer."""
+    key = persist_panel_ask_answer(connect_fn, cfg, question=question, answer=answer)
+    if not key:
+        return None
+    for profile_key, kind, _m, _q in _PANEL_FIELD_SPECS:
+        if profile_key == key:
+            return kind
+    return key
+
+
+def fill_panel_fields_from_profile(page, fields: list[dict], cfg: dict) -> list[str]:
+    """Após o humano responder, preenche na página os campos casados com o perfil."""
+    filled: list[str] = []
+    cfg = cfg or {}
+    for field in fields or []:
+        spec = match_panel_field_spec(field)
+        if not spec:
+            continue
+        profile_key, kind, _q = spec
+        value = str(cfg.get(profile_key) or "").strip()
+        if not value:
+            continue
+        sel = field_selector(field)
+        tag = str(field.get("tag") or "")
+        ok = False
+        if tag in {"select", "combobox"}:
+            ok = safe_select(page, sel, list(field.get("options") or []), value)
+        else:
+            ok = safe_fill(page, sel, value)
+        if ok:
+            filled.append(f"{kind}={value[:40]}")
+    return filled
+
+
+def fill_address_fields_from_profile(page, fields: list[dict], cfg: dict) -> list[str]:
+    """Compat: preenche qualquer campo do painel (inclui rua/CEP)."""
+    return fill_panel_fields_from_profile(page, fields, cfg)
+
+
+def missing_panel_block(cfg: dict | None, fields: list[dict]) -> str:
+    """Texto para o prompt: o que falta no painel e aparece na página."""
+    asks = list_missing_panel_asks(cfg, fields)
+    if not asks:
+        return "(nenhum campo do painel ausente nesta página)"
+    return "MUST ask the human — do NOT invent:\n" + "\n".join(f"- {q}" for q in asks)
 
 
 # ---------------------------------------------------------------------------
@@ -539,6 +867,7 @@ def build_copilot_prompt(
     panel_profile: str = "",
     allow_submit: bool = False,
     resume_path: str = "",
+    cfg: dict | None = None,
 ) -> str:
     """Prompt compacto com contexto total + snapshot da pagina + historico."""
     job = job or {}
@@ -562,12 +891,14 @@ def build_copilot_prompt(
         if (resume_path or "").strip()
         else "(missing — only then ask)"
     )
+    missing = missing_panel_block(cfg, fields)
     return (
         _action_vocab(allow_submit=allow_submit)
         + "\n\n=== STUCK BECAUSE ===\n" + _clip(reason, 300)
         + "\n\n=== RESUME FILE ===\n" + resume_line
         + "\n\n=== CANDIDATE FACTS ===\n" + (_clip(facts, 1200) or "(none)")
         + "\n\n=== PANEL PROFILE ===\n" + (_clip(panel_profile, 800) or "(none)")
+        + "\n\n=== MISSING FROM PANEL (ask — never invent) ===\n" + missing
         + "\n\n=== RESUME EXCERPT (prioritized) ===\n" + (excerpt or "(none)")
         + "\n\n=== JOB ===\n"
         + f"title={_clip(job.get('title'), 120)} | company={_clip(job.get('company'), 80)}\n"
@@ -686,7 +1017,12 @@ def exec_action(
             sel = resolve_selector(args, fields)
             if not sel:
                 return "no target", None
-            ok = safe_fill(page, sel, str(args.get("text", "")))
+            text = str(args.get("text", ""))
+            from form_rules import looks_like_fake_address
+
+            if looks_like_fake_address(text):
+                return "blocked placeholder address — use ask", None
+            ok = safe_fill(page, sel, text)
             return ("typed" if ok else "type failed"), None
         if action == "select":
             sel = resolve_selector(args, fields)
@@ -825,6 +1161,7 @@ def copilot_takeover(page, context, *, reason: str, cfg: dict, ai: dict,
     job = ai.get("job") or {}
     resume_summary = str(ai.get("resume_summary") or "")
     resume_json = str(ai.get("resume_json") or "")
+    cfg = dict(cfg or {})  # mutável: asks salvam rua/CEP/telefone etc. no perfil
     history: list[str] = []
     active = page
     open_ask_id: int | None = None
@@ -884,46 +1221,57 @@ def copilot_takeover(page, context, *, reason: str, cfg: dict, ai: dict,
                     no_progress_streak = 0
                     time.sleep(random.uniform(*_TURN_PAUSE))
                     fields, buttons, page_text = snapshot_page(active)
-            # Site com driver: handoff cedo. Site desconhecido: tenta Submit, senão segue.
-            if looks_ready_for_handoff(buttons, had_progress=history_has_progress(history)):
-                if allow_submit:
-                    finished = _maybe_finish(buttons, tag=f"turn {turn}")
-                    if finished:
-                        return finished
-                    ok, detail = try_heuristic_advance(active, buttons)
-                    if ok:
-                        history.append(f"turn {turn}: heuristic {detail}")
-                        LOG.info("copiloto: %s", history[-1])
-                        no_progress_streak = 0
-                        time.sleep(random.uniform(*_TURN_PAUSE))
-                        continue
-                else:
-                    ok, detail = try_heuristic_advance(active, buttons)
-                    if ok:
-                        history.append(f"turn {turn}: heuristic {detail}")
-                        LOG.info("copiloto: avanço heurístico + handoff — %s", detail)
+            # Dado do painel ausente + campo na página → pergunta no painel (sem chamar a IA).
+            forced_ask = forced_missing_data_ask(cfg, fields)
+            if forced_ask:
+                act = {
+                    "action": "ask",
+                    "args": {"question": forced_ask},
+                    "reason": "dado ausente no painel — obrigatório perguntar",
+                }
+                raw = json.dumps(act, ensure_ascii=False)
+            else:
+                # Site com driver: handoff cedo. Site desconhecido: tenta Submit, senão segue.
+                if looks_ready_for_handoff(buttons, had_progress=history_has_progress(history)):
+                    if allow_submit:
+                        finished = _maybe_finish(buttons, tag=f"turn {turn}")
+                        if finished:
+                            return finished
+                        ok, detail = try_heuristic_advance(active, buttons)
+                        if ok:
+                            history.append(f"turn {turn}: heuristic {detail}")
+                            LOG.info("copiloto: %s", history[-1])
+                            no_progress_streak = 0
+                            time.sleep(random.uniform(*_TURN_PAUSE))
+                            continue
                     else:
-                        LOG.info("copiloto: handoff ao bot (página pronta) — %s", detail)
-                    return SOLVED, f"destravado (handoff; {detail})", active
-            prompt = build_copilot_prompt(
-                reason=reason, facts=facts, resume_summary=resume_summary,
-                resume_json=resume_json, job=job, url=url, fields=fields,
-                buttons=buttons, page_text=page_text, history=history,
-                panel_profile=panel_profile_block(cfg),
-                allow_submit=allow_submit,
-                resume_path=resume_path,
-            )
-            raw = call_ai_with_rate_limit_retry(
-                call_fn=call_ai_text,
-                prompt=prompt,
-                provider=provider,
-                model=model,
-                api_key=api_key,
-                history=history,
-                turn=turn,
-                connect_fn=connect_fn if callable(connect_fn) else None,
-                open_ask_id=open_ask_id,
-            )
+                        ok, detail = try_heuristic_advance(active, buttons)
+                        if ok:
+                            history.append(f"turn {turn}: heuristic {detail}")
+                            LOG.info("copiloto: avanço heurístico + handoff — %s", detail)
+                        else:
+                            LOG.info("copiloto: handoff ao bot (página pronta) — %s", detail)
+                        return SOLVED, f"destravado (handoff; {detail})", active
+                prompt = build_copilot_prompt(
+                    reason=reason, facts=facts, resume_summary=resume_summary,
+                    resume_json=resume_json, job=job, url=url, fields=fields,
+                    buttons=buttons, page_text=page_text, history=history,
+                    panel_profile=panel_profile_block(cfg),
+                    allow_submit=allow_submit,
+                    resume_path=resume_path,
+                    cfg=cfg,
+                )
+                raw = call_ai_with_rate_limit_retry(
+                    call_fn=call_ai_text,
+                    prompt=prompt,
+                    provider=provider,
+                    model=model,
+                    api_key=api_key,
+                    history=history,
+                    turn=turn,
+                    connect_fn=connect_fn if callable(connect_fn) else None,
+                    open_ask_id=open_ask_id,
+                )
         except AiUnavailableError as exc:
             _fail_open_ask()
             return abort_close(active, context, f"IA indisponivel no meio do fluxo: {exc}")
@@ -967,6 +1315,23 @@ def copilot_takeover(page, context, *, reason: str, cfg: dict, ai: dict,
                     step_args = step.get("args") if isinstance(step.get("args"), dict) else {}
                     args = step_args
                     why = str(step.get("reason") or why)[:160]
+                    break
+
+        # type com dado ausente/placeholder → vira ask (não deixa inventar).
+        if action not in {"ask", "abort", "done"}:
+            for step in expand_action_steps(act):
+                if str(step.get("action") or "").strip().lower() != "type":
+                    continue
+                step_args = step.get("args") if isinstance(step.get("args"), dict) else {}
+                ask_q = type_should_ask(step_args, fields, cfg)
+                if ask_q:
+                    history.append(
+                        f"turn {turn}: type bloqueado (dado ausente/inventado) → ask no painel"
+                    )
+                    LOG.info("copiloto: %s", history[-1])
+                    action = "ask"
+                    args = {"question": ask_q}
+                    why = "dado ausente no painel — obrigatório perguntar"
                     break
 
         if action == "done":
@@ -1071,6 +1436,14 @@ def copilot_takeover(page, context, *, reason: str, cfg: dict, ai: dict,
                     no_progress_streak = 0
             lang = str((job or {}).get("language") or "en")
             facts = load_facts(connect_fn, lang) or (facts + f"\n{question}: {answer}").strip()
+            persist_panel_ask_answer(connect_fn, cfg, question=question, answer=str(answer or ""))
+            try:
+                filled_now = fill_panel_fields_from_profile(active, fields, cfg)
+                if filled_now:
+                    history.append(f"turn {turn}: perfil → preenchido ({', '.join(filled_now)})")
+                    LOG.info("copiloto: %s", history[-1])
+            except Exception as exc:
+                LOG.debug("copiloto: fill pós-ask falhou: %s", exc)
             history.append(f"turn {turn}: ask -> answered ({_clip(answer, 80)})")
             open_ask_id = ask_id
             no_progress_streak = 0

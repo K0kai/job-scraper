@@ -14,10 +14,12 @@ DEFAULT_RULES: list[dict[str, Any]] = [
     {"key": "phone", "aliases": "phone,telephone,tel,telefone,celular,mobile,whatsapp", "mode": "text", "value_from": "candidate_phone", "value": "", "sort_order": 30},
     {"key": "linkedin", "aliases": "linkedin,linkedin url,profile url", "mode": "text", "value_from": "candidate_linkedin", "value": "", "sort_order": 40},
     {"key": "city", "aliases": "city,cidade,cidade atual,current city,localidade", "mode": "text", "value_from": "candidate_city", "value": "", "sort_order": 50},
-    {"key": "state", "aliases": "state,estado,province,provincia,província,uf,region,estado/provincia", "mode": "text", "value_from": "candidate_state", "value": "", "sort_order": 51},
-    {"key": "country", "aliases": "country of origin,país de origem,pais de origem,country,país,pais,nationality country,select a country", "mode": "select", "value_from": "candidate_country", "value": "", "sort_order": 52},
-    {"key": "current_company", "aliases": "current company,empresa atual,current employer,most recent employer,employer name,nome da empresa,company you work,where do you currently work,currently work", "mode": "text", "value_from": "candidate_current_company", "value": "", "sort_order": 53},
-    {"key": "cpf", "aliases": "cpf,cadastro de pessoa física,documento,tax id,tax identification,id number,cpf number,número do documento", "mode": "text", "value_from": "candidate_cpf", "value": "", "sort_order": 55},
+    {"key": "street_address", "aliases": "street address,address line,endereço,endereco,rua,logradouro,street name,nome da rua,address 1,address line 1", "mode": "text", "value_from": "candidate_street", "value": "", "sort_order": 50},
+    {"key": "postal_code", "aliases": "zip,postal code,cep,codigo postal,código postal,postcode,zip code,código cep", "mode": "text", "value_from": "candidate_postal_code", "value": "", "sort_order": 51},
+    {"key": "state", "aliases": "state,estado,province,provincia,província,uf,region,estado/provincia", "mode": "text", "value_from": "candidate_state", "value": "", "sort_order": 52},
+    {"key": "country", "aliases": "country of origin,país de origem,pais de origem,country,país,pais,nationality country,select a country", "mode": "select", "value_from": "candidate_country", "value": "", "sort_order": 53},
+    {"key": "current_company", "aliases": "current company,empresa atual,current employer,most recent employer,employer name,nome da empresa,company you work,where do you currently work,currently work", "mode": "text", "value_from": "candidate_current_company", "value": "", "sort_order": 54},
+    {"key": "cpf", "aliases": "cpf,cadastro de pessoa física,documento,tax id,tax identification,id number,cpf number,número do documento", "mode": "text", "value_from": "candidate_cpf", "value": "", "sort_order": 56},
     {"key": "salary", "aliases": "salary,compensation,expected salary,salary expectation,faixa salarial,pretensão,pretensão salarial,remuneração,pay,salario,expectativa salarial", "mode": "salary", "value_from": "", "value": "", "sort_order": 60},
     {"key": "contract_type", "aliases": "contract type,type of contract,employment type,tipo de contratacao,contratacao,modelo de contratacao,regime", "mode": "select", "value_from": "candidate_contract_type", "value": "", "sort_order": 65},
     {"key": "cover_letter", "aliases": "cover letter,carta,carta de apresentação,message,mensagem,additional information,comments", "mode": "cover_letter", "value_from": "", "value": "", "sort_order": 70},
@@ -29,6 +31,19 @@ def normalize(text: str) -> str:
     folded = unicodedata.normalize("NFKD", text or "")
     folded = "".join(ch for ch in folded if not unicodedata.combining(ch))
     return re.sub(r"[^a-z0-9]+", " ", folded.casefold()).strip()
+
+
+_FAKE_ADDRESS_RE = re.compile(
+    r"\b(exemplo|example|sample|dummy|placeholder|lorem|teste|fake|"
+    r"123\s*main|main\s*street|rua\s*exemplo|street\s*example|"
+    r"endere[cç]o\s*exemplo|your\s*address\s*here)\b",
+    re.I,
+)
+
+
+def looks_like_fake_address(text: str) -> bool:
+    """Detecta endereço/CEP inventado ou placeholder — não deve ir para o formulário."""
+    return bool(_FAKE_ADDRESS_RE.search(text or ""))
 
 
 _EMPLOYER_SPLIT_RE = re.compile(r"\s+[—–]\s+")
