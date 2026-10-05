@@ -17,6 +17,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote_plus, urlparse
 from urllib.request import Request, urlopen
 
+from dbutil import open_connection, using_postgres
 from apply_channels import apply_via_browser, apply_via_email, record_blocked, send_smtp_email
 from dates_br import BRASILIA, format_brasilia, format_brasilia_date, format_cycle_label_display, format_cycle_range, parse_utc
 
@@ -46,8 +47,10 @@ from panel_log import attach_to_logger, clear_logs, ensure_log_table, list_logs,
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(ROOT, "jobs.db")
-RESUMES_DIR = os.path.join(ROOT, "resumes")
-COPILOT_UPLOADS_DIR = os.path.join(ROOT, "copilot_uploads")
+RESUMES_DIR = os.environ.get("RESUMES_DIR", os.path.join(ROOT, "resumes"))
+COPILOT_UPLOADS_DIR = os.environ.get(
+    "COPILOT_UPLOADS_DIR", os.path.join(ROOT, "copilot_uploads")
+)
 FAVICON_PATH = os.path.join(ROOT, "assets", "public", "favicon.ico")
 HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "8765"))
@@ -178,14 +181,50 @@ def now_iso() -> str:
 
 
 def connect() -> sqlite3.Connection:
-    from dbutil import open_connection
-
     return open_connection(DB_PATH, timeout=60.0)
 
 
 def initialize() -> None:
     """Cria o banco e aplica pequenas migrações compatíveis com versões anteriores."""
     os.makedirs(RESUMES_DIR, exist_ok=True)
+    if using_postgres():
+        required_tables = {
+            "settings", "jobs", "runs", "ai_decisions", "cover_letters", "resumes",
+            "form_field_rules", "applications", "form_answers", "ai_answer_cache",
+            "copilot_asks", "queue_jobs", "event_logs",
+        }
+        with connect() as db:
+            rows = db.execute(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_schema = current_schema()"
+            ).fetchall()
+            available = {row["table_name"] for row in rows}
+            missing = sorted(required_tables - available)
+            if missing:
+                raise RuntimeError(
+                    "Neon schema is incomplete. Run the PostgreSQL schema SQL in the Neon console; "
+                    "missing tables: " + ", ".join(missing)
+                )
+            for key, value in DEFAULT_SETTINGS.items():
+                db.execute(
+                    "INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO NOTHING",
+                    (key, value),
+                )
+            ensure_default_rules(db)
+            db.execute(
+                "UPDATE settings SET value='65' WHERE key='minimum_match_score' AND value='80'"
+            )
+            db.execute(
+                "UPDATE settings SET value='' WHERE key='apify_linkedin_filter_hash' "
+                "AND COALESCE((SELECT value FROM settings WHERE key='apify_linkedin_geo_v2'), '') <> '1'"
+            )
+            db.execute(
+                "INSERT INTO settings(key,value) VALUES('apify_linkedin_geo_v2','1') "
+                "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value"
+            )
+            ensure_log_table(db)
+        return
+
     with connect() as db:
         db.executescript(SCHEMA)
         # Additions are applied in place so an existing jobs.db remains usable.
@@ -289,7 +328,10 @@ def initialize() -> None:
             db.execute("ALTER TABLE ai_decisions ADD COLUMN apply_result TEXT NOT NULL DEFAULT ''")
         ensure_default_rules(db)
         for key, value in DEFAULT_SETTINGS.items():
-            db.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (key, value))
+            db.execute(
+                "INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO NOTHING",
+                (key, value),
+            )
         # Default antigo (80) era rígido demais com a triagem generosa.
         db.execute(
             "UPDATE settings SET value='65' WHERE key='minimum_match_score' AND value='80'"
@@ -2265,8 +2307,11 @@ class Collector:
         started = now_iso()
         log_event("info", "collector", "Início do ciclo de busca.")
         with connect() as db:
-            cursor = db.execute("INSERT INTO runs(started_at,state) VALUES(?, 'running')", (started,))
-            run_id = cursor.lastrowid
+            row = db.execute(
+                "INSERT INTO runs(started_at,state) VALUES(?, 'running') RETURNING id",
+                (started,),
+            ).fetchone()
+            run_id = row["id"]
         cfg = settings()
         keyword_terms = terms(cfg.get("keywords", ""))
         location_terms = terms(cfg.get("locations", ""))
@@ -2298,8 +2343,8 @@ class Collector:
                         continue
                     language, language_confidence = detect_language(job["title"] + "\n" + re.sub(r"<[^>]+>", " ", job["description"]))
                     with connect() as db:
-                        cursor = db.execute("""INSERT OR IGNORE INTO jobs(source,source_id,title,company,location,description,url,posted_at,first_seen_at,fingerprint,language,language_confidence)
-                          VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""", (job["source"], job["source_id"], job["title"], job["company"], job["location"], job["description"], job["url"], job["posted_at"],  now_iso(), fingerprint(job), language, language_confidence))
+                        cursor = db.execute("""INSERT INTO jobs(source,source_id,title,company,location,description,url,posted_at,first_seen_at,fingerprint,language,language_confidence)
+                          VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(fingerprint) DO NOTHING""", (job["source"], job["source_id"], job["title"], job["company"], job["location"], job["description"], job["url"], job["posted_at"],  now_iso(), fingerprint(job), language, language_confidence))
                         inserted = max(cursor.rowcount, 0)
                     found += inserted
                     if inserted:
@@ -2603,12 +2648,12 @@ def _worth_sort_clause(kind: str) -> str:
         return "COALESCE(match_score, 0) DESC"
     if kind == WORTH_SORT_POSTED_ASC:
         return (
-            "(CASE WHEN IFNULL(jobs.posted_at,'')='' THEN 1 ELSE 0 END) ASC, "
+            "(CASE WHEN COALESCE(jobs.posted_at,'')='' THEN 1 ELSE 0 END) ASC, "
             "jobs.posted_at ASC"
         )
     if kind == WORTH_SORT_POSTED_DESC:
         return (
-            "(CASE WHEN IFNULL(jobs.posted_at,'')='' THEN 1 ELSE 0 END) ASC, "
+            "(CASE WHEN COALESCE(jobs.posted_at,'')='' THEN 1 ELSE 0 END) ASC, "
             "jobs.posted_at DESC"
         )
     return ""

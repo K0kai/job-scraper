@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 from panel_log import log_event
+from dbutil import using_postgres
 
 LOG = logging.getLogger("job-scraper")
 
@@ -125,6 +126,9 @@ class JobQueue:
         return open_connection(self.db_path, timeout=60.0)
 
     def _ensure_schema(self) -> None:
+        # Neon is provisioned with the complete schema before the app starts.
+        if using_postgres():
+            return
         with self._connect() as db:
             db.execute(
                 """CREATE TABLE IF NOT EXISTS queue_jobs (
@@ -266,10 +270,10 @@ class JobQueue:
                     log_event("info", "queue", f"Job #{existing['id']} ({kind}) já na fila; reutilizando.")
                     return int(existing["id"])
         with self._connect() as db:
-            cur = db.execute(
+            row = db.execute(
                 """INSERT INTO queue_jobs(
                      kind,payload,status,attempts,max_attempts,next_run_at,expires_at,last_error,result,created_at,updated_at)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?) RETURNING id""",
                 (
                     kind,
                     payload_json,
@@ -283,8 +287,8 @@ class JobQueue:
                     _iso(now),
                     _iso(now),
                 ),
-            )
-            job_id = int(cur.lastrowid)
+            ).fetchone()
+            job_id = int(row["id"])
         log_event("info", "queue", f"Enfileirado #{job_id} ({kind}).")
         return job_id
 

@@ -545,7 +545,7 @@ def cache_get(connect_fn: ConnectFn | None, question: str) -> str | None:
                     "UPDATE ai_answer_cache SET hits=hits+1 WHERE question_norm=?", (key,)
                 )
                 return str(row["answer"])
-    except sqlite3.Error as exc:
+    except Exception as exc:
         LOG.debug("cache_get falhou: %s", exc)
     return None
 
@@ -574,7 +574,7 @@ def cache_put(
                      model=excluded.model, updated_at=excluded.updated_at""",
                 (key, question[:500], kind, answer[:4000], provider, model, now_iso, now_iso),
             )
-    except sqlite3.Error as exc:
+    except Exception as exc:
         LOG.debug("cache_put falhou: %s", exc)
 
 

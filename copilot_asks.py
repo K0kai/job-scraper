@@ -7,6 +7,8 @@ import sqlite3
 import time
 from typing import Callable
 
+from dbutil import using_postgres
+
 LOG = logging.getLogger("job-scraper")
 
 STATUS_PENDING = "pending"
@@ -43,15 +45,16 @@ def ensure_table(db: sqlite3.Connection) -> None:
           answered_at TEXT NOT NULL DEFAULT ''
         )"""
     )
-    for ddl in (
-        "ALTER TABLE copilot_asks ADD COLUMN hint TEXT NOT NULL DEFAULT ''",
-        "ALTER TABLE copilot_asks ADD COLUMN kind TEXT NOT NULL DEFAULT 'text'",
-        "ALTER TABLE copilot_asks ADD COLUMN file_path TEXT NOT NULL DEFAULT ''",
-    ):
-        try:
-            db.execute(ddl)
-        except sqlite3.OperationalError:
-            pass
+    if not using_postgres():
+        for ddl in (
+            "ALTER TABLE copilot_asks ADD COLUMN hint TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE copilot_asks ADD COLUMN kind TEXT NOT NULL DEFAULT 'text'",
+            "ALTER TABLE copilot_asks ADD COLUMN file_path TEXT NOT NULL DEFAULT ''",
+        ):
+            try:
+                db.execute(ddl)
+            except sqlite3.OperationalError:
+                pass
 
 
 def create_ask(
@@ -72,12 +75,12 @@ def create_ask(
             f"UPDATE copilot_asks SET status=? WHERE status IN ({','.join('?' * len(PANEL_OPEN_STATUSES))})",
             (STATUS_EXPIRED, *PANEL_OPEN_STATUSES),
         )
-        cur = db.execute(
+        row = db.execute(
             """INSERT INTO copilot_asks(job_id, question, status, answer, hint, kind, file_path, created_at, answered_at)
-               VALUES (?,?,?,?,?,?,?,?,?)""",
+               VALUES (?,?,?,?,?,?,?,?,?) RETURNING id""",
             (job_id, q, STATUS_PENDING, "", "", ask_kind, "", now_iso, ""),
-        )
-        return int(cur.lastrowid)
+        ).fetchone()
+        return int(row["id"])
 
 
 def get_pending_ask(connect_fn: ConnectFn) -> dict | None:

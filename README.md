@@ -38,6 +38,15 @@ python app.py
 
 Abra `http://127.0.0.1:8765`. Não exponha a porta na internet: o painel **não tem autenticação**.
 
+## Deploy com Neon/PostgreSQL
+
+- A aplicação usa SQLite local quando `DATABASE_URL` não está definida e PostgreSQL quando ela aponta para Neon.
+- Execute no Neon SQL Editor o schema PostgreSQL completo (tabelas, índices e valores padrão) antes de iniciar a aplicação.
+- Para copiar os dados locais para Neon, pare o serviço hospedado e rode `python migrate_sqlite_to_neon.py` no computador que contém `jobs.db`, com `DATABASE_URL` definido para a conexão Neon. O script importa tabelas e dados, preserva as configurações locais e substitui as regras iniciais/logs de primeiro boot pelas versões locais.
+- Configure a mesma `DATABASE_URL` como variável secreta no Render. Nunca a salve no repositório.
+- Currículos e arquivos enviados ficam no sistema de arquivos, não no banco; configure um disco persistente no Render e defina `RESUMES_DIR` e `COPILOT_UPLOADS_DIR` para diretórios nesse disco. Copie os arquivos locais para lá antes de usar os registros migrados.
+- O painel não tem autenticação. Não o exponha publicamente até adicionar proteção de acesso.
+
 ## Privacidade e o que não versionar
 
 Já ignorados pelo Git (entre outros):

@@ -3,3 +3,4 @@ lingua-language-detector>=2.1,<3
 pypdf>=5,<7
 playwright>=1.40,<2
 pydoll-python>=3,<4
+psycopg[binary]>=3.2,<4
