@@ -99,7 +99,7 @@ Max 5 steps per batch. Available actions (args in parentheses):
   close    ()                                                        # close the active tab
   js       (code="<inline JS, no return stmt, use `document`>")
   done     ()                                                        # unblocked; hand back to caller
-  ask      (question="<what data is missing>")                       # pause; human answers in the panel
+  ask      (question="<ONE concrete question naming the exact field label>")
   abort    (reason="<why it cannot be automated>")                   # give up -> yellow note
 
 Rules:
@@ -111,6 +111,13 @@ Rules:
   and every other blank. Guessing, placeholders ("Rua Exemplo", "123 Main St",
   fake CEP, "N/A", "TBD"), or copying the job's company/location is FORBIDDEN.
   When unsure even a little → `ask`. Do not probe with wait/scroll/mouse first.
+- HARD RULE — `ask.question` MUST be ONE specific question a human can answer
+  in a single reply. ALWAYS quote the exact on-page field label (from FIELDS),
+  e.g. `O formulário pede «Em uma escala de 1-10, avalie Python». Qual nota
+  (1–10) devo marcar?` or `Qual CEP preencher em «Postal code»?`.
+  FORBIDDEN vague asks: "required fields need confirmation", "subjective
+  ratings", "custom form needs input", "preciso de um dado", or any summary
+  that does not name the field. Ask ONE field at a time; never bundle.
 - Be frugal: prefer ONE batch that fills/clicks only what you already know, then
   click Next/Continue/Review (never Submit) OR emit `done` so the bot resumes.
   If you cannot unblock after asking, `abort` quickly (do not burn turns guessing).
@@ -318,14 +325,113 @@ def list_missing_panel_asks(cfg: dict | None, fields: list[dict]) -> list[str]:
         spec = match_panel_field_spec(field)
         if not spec:
             continue
-        profile_key, _kind, question = spec
+        profile_key, _kind, base_q = spec
         if profile_key in seen_keys:
             continue
         if str(cfg.get(profile_key) or "").strip():
             continue
         seen_keys.add(profile_key)
-        questions.append(question)
+        label = str(field.get("label") or "").strip() or str(field.get("placeholder") or "").strip()
+        if label:
+            questions.append(f"O formulário pede «{_clip(label, 120)}». {base_q}")
+        else:
+            questions.append(base_q)
     return questions
+
+
+_VAGUE_ASK_RE = re.compile(
+    r"required\s+fields?|human\s+confirmation|avoid\s+guessing|specific\s+input|"
+    r"subjective\s+ratings?|custom\s+application\s+form|needs?\s+human|"
+    r"dados?\s+(faltantes?|necess|pendente|adicionais)|"
+    r"precisa(mos)?\s+de\s+(um\s+)?dado|informa[cç][oõ]es?\s+adicionais|"
+    r"missing\s+data|confirmation\s+to\s+avoid|sem\s+chutar|"
+    r"preencher\s+campos?\s+obrigat|campos?\s+obrigat[oó]rios?",
+    re.I,
+)
+
+
+def is_vague_ask(question: str) -> bool:
+    """True se a pergunta não aponta um campo concreto que o humano consiga responder."""
+    q = (question or "").strip()
+    if len(q) < 12:
+        return True
+    if _VAGUE_ASK_RE.search(q):
+        return True
+    # Sem rótulo citado e sem "qual …" direcionado → provavelmente vago.
+    has_quoted_label = bool(re.search(r"[«»\"“”'].{3,}|«.{3,}»", q))
+    has_direct_qual = bool(
+        re.search(
+            r"\bqual\b|\bquais\b|\bwhat\b|\bwhich\b|\binforme\b|\bdigite\b|"
+            r"\bpreencha\b|\bcep\b|\bendere[cç]o\b|\btelefone\b|\be-?mail\b",
+            q,
+            re.I,
+        )
+    )
+    if not has_quoted_label and not has_direct_qual and len(q) > 80:
+        return True
+    return False
+
+
+def concrete_ask_from_page(cfg: dict | None, fields: list[dict]) -> str | None:
+    """Monta UMA pergunta concreta a partir dos campos vazios da página."""
+    missing = list_missing_panel_asks(cfg, fields)
+    if missing:
+        return missing[0]
+    # Campos required sem regra de painel — pede o rótulo literal.
+    for field in fields or []:
+        if not field.get("required"):
+            continue
+        label = str(field.get("label") or "").strip()
+        if not label or len(label) < 2:
+            continue
+        tag = str(field.get("tag") or "")
+        opts = [str(o) for o in (field.get("options") or []) if str(o).strip()]
+        if tag in {"select", "combobox"} and opts:
+            sample = ", ".join(opts[:8])
+            more = "…" if len(opts) > 8 else ""
+            return (
+                f"O formulário pede «{_clip(label, 140)}». "
+                f"Qual opção escolher? Opções: {sample}{more}"
+            )
+        return (
+            f"O formulário pede «{_clip(label, 140)}». "
+            f"Qual valor devo preencher nesse campo?"
+        )
+    # Qualquer campo com label longo que pareça pergunta/escala.
+    for field in fields or []:
+        label = str(field.get("label") or "").strip()
+        if len(label) < 16:
+            continue
+        low = label.casefold()
+        if any(tok in low for tok in ("escala", "scale", "1-10", "1 – 10", "rate ", "avalie", "experi")):
+            opts = [str(o) for o in (field.get("options") or []) if str(o).strip()]
+            if opts:
+                return (
+                    f"O formulário pede «{_clip(label, 140)}». "
+                    f"Qual nota/opção marcar? ({', '.join(opts[:10])})"
+                )
+            return f"O formulário pede «{_clip(label, 140)}». Qual valor responder?"
+    return None
+
+
+def clarify_ask_question(question: str, fields: list[dict], cfg: dict | None = None) -> str:
+    """Reescreve asks vagos da IA em uma pergunta com rótulo do campo."""
+    q = (question or "").strip()
+    if q and not is_vague_ask(q):
+        return q
+    concrete = concrete_ask_from_page(cfg, fields)
+    if concrete:
+        LOG.info("copiloto: ask vago reescrito → %s", concrete[:140])
+        return concrete
+    if q:
+        return (
+            f"{q.rstrip('.')}. "
+            "Por favor diga o rótulo EXATO do campo na página e o valor a preencher."
+        )
+    return (
+        "Há um campo obrigatório em branco nesta página. "
+        "Qual o rótulo do campo e qual valor devo preencher?"
+    )
 
 
 def forced_missing_data_ask(cfg: dict | None, fields: list[dict]) -> str | None:
@@ -1359,6 +1465,7 @@ def copilot_takeover(page, context, *, reason: str, cfg: dict, ai: dict,
             return abort_close(active, context, why or "a IA nao conseguiu automatizar")
         if action == "ask":
             question = str(args.get("question") or why or "").strip()
+            question = clarify_ask_question(question, fields, cfg)
             if not question:
                 history.append(f"turn {turn}: ask sem pergunta")
                 no_progress_streak += 1
