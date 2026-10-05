@@ -345,7 +345,11 @@ _VAGUE_ASK_RE = re.compile(
     r"dados?\s+(faltantes?|necess|pendente|adicionais)|"
     r"precisa(mos)?\s+de\s+(um\s+)?dado|informa[cç][oõ]es?\s+adicionais|"
     r"missing\s+data|confirmation\s+to\s+avoid|sem\s+chutar|"
-    r"preencher\s+campos?\s+obrigat|campos?\s+obrigat[oó]rios?",
+    r"preencher\s+campos?\s+obrigat|campos?\s+obrigat[oó]rios?|"
+    r"regra\s+estrita|confirma[cç][aã]o\s+humana|pr[eé]-?definido|"
+    r"escala\s*/\s*profici[eê]ncia|profici[eê]ncia\s+exige|"
+    r"valor\s+exato|n[aã]o\s+houver\s+valor|diga\s+o\s+r[oó]tulo\s+exato|"
+    r"r[oó]tulo\s+exato\s+do\s+campo",
     re.I,
 )
 
@@ -358,18 +362,108 @@ def is_vague_ask(question: str) -> bool:
     if _VAGUE_ASK_RE.search(q):
         return True
     # Sem rótulo citado e sem "qual …" direcionado → provavelmente vago.
-    has_quoted_label = bool(re.search(r"[«»\"“”'].{3,}|«.{3,}»", q))
+    has_quoted_label = bool(re.search(r"[«»\"“”'].{3,}", q))
     has_direct_qual = bool(
         re.search(
             r"\bqual\b|\bquais\b|\bwhat\b|\bwhich\b|\binforme\b|\bdigite\b|"
-            r"\bpreencha\b|\bcep\b|\bendere[cç]o\b|\btelefone\b|\be-?mail\b",
+            r"\bpreencha\b|\bcep\b|\bendere[cç]o\b|\btelefone\b|\be-?mail\b|"
+            r"\bnota\b|\bop[cç][aã]o\b",
             q,
             re.I,
         )
     )
-    if not has_quoted_label and not has_direct_qual and len(q) > 80:
+    if has_quoted_label and has_direct_qual:
+        return False
+    if not has_quoted_label and (not has_direct_qual or len(q) > 100):
         return True
     return False
+
+
+def _field_label(field: dict) -> str:
+    return (
+        str(field.get("label") or "").strip()
+        or str(field.get("placeholder") or "").strip()
+        or str(field.get("name") or "").strip()
+        or str(field.get("id") or "").strip()
+    )
+
+
+def _ask_for_page_field(field: dict) -> str:
+    """Pergunta concreta citando o rótulo (e opções, se houver)."""
+    label = _field_label(field) or "campo sem rótulo"
+    opts = [str(o).strip() for o in (field.get("options") or []) if str(o).strip()]
+    tag = str(field.get("tag") or "")
+    ftype = str(field.get("type") or "").casefold()
+    if opts:
+        sample = ", ".join(opts[:10])
+        more = "…" if len(opts) > 10 else ""
+        return (
+            f"O formulário pede «{_clip(label, 160)}». "
+            f"Qual opção/nota marcar? Opções: {sample}{more}"
+        )
+    if tag == "input" and ftype == "number":
+        return (
+            f"O formulário pede «{_clip(label, 160)}». "
+            f"Qual número preencher? (geralmente 1–10)"
+        )
+    return (
+        f"O formulário pede «{_clip(label, 160)}». "
+        f"Qual valor devo preencher nesse campo?"
+    )
+
+
+def _iter_skill_scale_fields(fields: list[dict]) -> list[dict]:
+    """Campos de escala/proficiência 1–10 (select, combobox ou number)."""
+    try:
+        from ats_answers import label_looks_like_skill_rating, options_look_like_numeric_scale
+    except Exception:
+        label_looks_like_skill_rating = None  # type: ignore
+        options_look_like_numeric_scale = None  # type: ignore
+
+    out: list[dict] = []
+    for field in fields or []:
+        label = _field_label(field)
+        opts = [str(o) for o in (field.get("options") or []) if str(o).strip()]
+        tag = str(field.get("tag") or "")
+        ftype = str(field.get("type") or "").casefold()
+        looks_scale = False
+        if callable(label_looks_like_skill_rating) and label_looks_like_skill_rating(label):
+            looks_scale = True
+        elif callable(options_look_like_numeric_scale) and options_look_like_numeric_scale(opts):
+            looks_scale = True
+        else:
+            low = label.casefold()
+            if any(
+                tok in low
+                for tok in (
+                    "escala",
+                    "scale",
+                    "1-10",
+                    "1 – 10",
+                    "1 a 10",
+                    "profici",
+                    "rate ",
+                    "avalie",
+                    "experi",
+                    "skill",
+                    "habilidade",
+                    "conheciment",
+                )
+            ):
+                looks_scale = True
+            if tag in {"select", "combobox"} and opts:
+                nums = []
+                for o in opts:
+                    m = re.match(r"^\s*(\d{1,2})\s*$", o)
+                    if m:
+                        nums.append(int(m.group(1)))
+                if len(nums) >= 3 and min(nums) >= 1 and max(nums) <= 10:
+                    looks_scale = True
+            if tag == "input" and ftype == "number" and looks_scale:
+                pass
+        if looks_scale:
+            out.append(field)
+    return out
 
 
 def concrete_ask_from_page(cfg: dict | None, fields: list[dict]) -> str | None:
@@ -377,40 +471,30 @@ def concrete_ask_from_page(cfg: dict | None, fields: list[dict]) -> str | None:
     missing = list_missing_panel_asks(cfg, fields)
     if missing:
         return missing[0]
-    # Campos required sem regra de painel — pede o rótulo literal.
+
+    # Escalas / proficiência primeiro (é o que a IA mais vagueia).
+    for field in _iter_skill_scale_fields(fields):
+        return _ask_for_page_field(field)
+
+    # Campos required sem regra de painel.
     for field in fields or []:
         if not field.get("required"):
             continue
-        label = str(field.get("label") or "").strip()
-        if not label or len(label) < 2:
+        if not _field_label(field):
             continue
-        tag = str(field.get("tag") or "")
-        opts = [str(o) for o in (field.get("options") or []) if str(o).strip()]
-        if tag in {"select", "combobox"} and opts:
-            sample = ", ".join(opts[:8])
-            more = "…" if len(opts) > 8 else ""
-            return (
-                f"O formulário pede «{_clip(label, 140)}». "
-                f"Qual opção escolher? Opções: {sample}{more}"
-            )
-        return (
-            f"O formulário pede «{_clip(label, 140)}». "
-            f"Qual valor devo preencher nesse campo?"
-        )
-    # Qualquer campo com label longo que pareça pergunta/escala.
+        return _ask_for_page_field(field)
+
+    # Qualquer select/combobox com opções (ainda sem valor óbvio no perfil).
     for field in fields or []:
-        label = str(field.get("label") or "").strip()
-        if len(label) < 16:
-            continue
-        low = label.casefold()
-        if any(tok in low for tok in ("escala", "scale", "1-10", "1 – 10", "rate ", "avalie", "experi")):
-            opts = [str(o) for o in (field.get("options") or []) if str(o).strip()]
-            if opts:
-                return (
-                    f"O formulário pede «{_clip(label, 140)}». "
-                    f"Qual nota/opção marcar? ({', '.join(opts[:10])})"
-                )
-            return f"O formulário pede «{_clip(label, 140)}». Qual valor responder?"
+        opts = [str(o) for o in (field.get("options") or []) if str(o).strip()]
+        if str(field.get("tag") or "") in {"select", "combobox"} and opts and _field_label(field):
+            return _ask_for_page_field(field)
+
+    # Último recurso: primeiro campo com rótulo legível.
+    for field in fields or []:
+        label = _field_label(field)
+        if len(label) >= 3:
+            return _ask_for_page_field(field)
     return None
 
 
@@ -421,23 +505,37 @@ def clarify_ask_question(question: str, fields: list[dict], cfg: dict | None = N
         return q
     concrete = concrete_ask_from_page(cfg, fields)
     if concrete:
-        LOG.info("copiloto: ask vago reescrito → %s", concrete[:140])
+        LOG.info("copiloto: ask vago reescrito → %s", concrete[:160])
         return concrete
-    if q:
+    # Nunca peça o rótulo ao humano — liste o que a página mostra.
+    labels = []
+    for field in fields or []:
+        lab = _field_label(field)
+        if lab and lab not in labels:
+            labels.append(lab)
+        if len(labels) >= 6:
+            break
+    if labels:
+        listed = "; ".join(f"«{_clip(lab, 80)}»" for lab in labels)
         return (
-            f"{q.rstrip('.')}. "
-            "Por favor diga o rótulo EXATO do campo na página e o valor a preencher."
+            "Não consegui identificar sozinho o campo faltante. "
+            f"Qual destes preencher e com qual valor? {listed}"
         )
     return (
-        "Há um campo obrigatório em branco nesta página. "
-        "Qual o rótulo do campo e qual valor devo preencher?"
+        "Há um campo obrigatório em branco nesta página do formulário. "
+        "Qual o texto do campo que você está vendo e qual valor devo usar?"
     )
 
 
 def forced_missing_data_ask(cfg: dict | None, fields: list[dict]) -> str | None:
-    """Primeira pergunta obrigatória por dado do painel ausente na página atual."""
+    """Primeira pergunta obrigatória: painel ausente ou escala 1–10 na página."""
     asks = list_missing_panel_asks(cfg, fields)
-    return asks[0] if asks else None
+    if asks:
+        return asks[0]
+    scales = _iter_skill_scale_fields(fields)
+    if scales:
+        return _ask_for_page_field(scales[0])
+    return None
 
 
 def forced_address_ask_question(cfg: dict | None, fields: list[dict]) -> str | None:
