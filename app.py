@@ -4593,6 +4593,17 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/favicon.ico":
             self.send_favicon()
             return
+        if path == "/health":
+            try:
+                with connect() as db:
+                    db.execute("SELECT 1")
+                self.send_extension_json({"ok": True, "service": "job-scraper", "database": "ok"})
+            except Exception:
+                self.send_extension_json(
+                    {"ok": False, "service": "job-scraper", "database": "unavailable"},
+                    status=503,
+                )
+            return
         if path == "/live":
             qs = parse_qs(parsed.query)
             worth_page = 1
@@ -5074,7 +5085,7 @@ class Handler(BaseHTTPRequestHandler):
 
     #: endpoints de polling — o browser bate a cada poucos segundos; sem isso
     #: o terminal/LOG enche de linha repetida e sota o que importa.
-    QUIET_PATHS = ("/live", "/favicon.ico")
+    QUIET_PATHS = ("/live", "/health", "/favicon.ico")
 
     def log_message(self, fmt: str, *args: object) -> None:
         line = fmt % args
