@@ -47,6 +47,7 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(ROOT, "jobs.db")
 RESUMES_DIR = os.path.join(ROOT, "resumes")
 COPILOT_UPLOADS_DIR = os.path.join(ROOT, "copilot_uploads")
+FAVICON_PATH = os.path.join(ROOT, "assets", "public", "favicon.ico")
 HOST = "127.0.0.1"
 PORT = 8765
 POLL_SECONDS = 15 * 60
@@ -3611,6 +3612,7 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
         f"{esc(notice) if notice else ''}</div>"
     )
     return f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Radar de Vagas</title>
+<link rel="icon" href="/favicon.ico" type="image/x-icon">
 <style>{PAGE_CSS}</style></head><body>
 <div class="shell">
 <aside class="sidebar">
@@ -4396,6 +4398,22 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def send_favicon(self) -> None:
+        try:
+            with open(FAVICON_PATH, "rb") as fh:
+                data = fh.read()
+        except OSError:
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "image/x-icon")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "public, max-age=86400")
+        self.end_headers()
+        self.wfile.write(data)
+
     def send_json(self, payload: dict, status: int = 200) -> None:
         data = json.dumps(payload).encode("utf-8")
         self.send_response(status)
@@ -4428,6 +4446,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         path = parsed.path
+        if path == "/favicon.ico":
+            self.send_favicon()
+            return
         if path == "/live":
             qs = parse_qs(parsed.query)
             worth_page = 1
