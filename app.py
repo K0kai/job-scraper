@@ -17,6 +17,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote_plus, urlparse
 from urllib.request import Request, urlopen
 
+from apply_channels import apply_via_browser, apply_via_email, record_blocked, send_smtp_email
 from dates_br import BRASILIA, format_brasilia, format_brasilia_date, format_cycle_label_display, format_cycle_range, parse_utc
 
 from form_rules import ensure_default_rules, list_rules, save_rules_from_form
