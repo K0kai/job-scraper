@@ -321,6 +321,8 @@ def build_choices_prompt(
     resume_json: str,
     facts: str,
 ) -> str:
+    from experience_priority import EXPERIENCE_PRIORITY_RULE
+
     language = job.get("language") or "en"
     language_name = "Portuguese" if language == "pt" else "English"
     options_block = "\n".join(f"- {opt}" for opt in options)
@@ -329,6 +331,8 @@ def build_choices_prompt(
 Choose {limit}. Use ONLY the resume analysis and candidate facts. Never invent anything.
 Return the chosen option TEXTS verbatim, one per line, and nothing else.
 If the facts are insufficient to choose, reply with exactly: CANNOT_ANSWER
+
+{EXPERIENCE_PRIORITY_RULE}
 
 Question: {question}
 Options:

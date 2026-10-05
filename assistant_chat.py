@@ -10,6 +10,7 @@ from typing import Any
 
 from ai_client import call_ai_text
 from ats_copilot import panel_profile_block
+from experience_priority import EXPERIENCE_PRIORITY_RULE
 from resume_pipeline import AiUnavailableError, compose_analysis_dossier, get_resume
 
 MAX_QUESTION_CHARS = 4000
@@ -119,6 +120,8 @@ Use ONLY the candidate context below. Never invent employers, projects, metrics,
 If the context is insufficient, reply with a single short sentence starting with "FALTA:" (or "MISSING:" if the question is in English) naming exactly what is missing — do not invent a guess.
 Do not wrap the answer in quotes unless the form value itself needs quotes.
 Do not add explanations, markdown, or preamble.
+
+{EXPERIENCE_PRIORITY_RULE}
 
 Candidate context:
 {context}

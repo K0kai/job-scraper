@@ -119,12 +119,16 @@ def lookslike_open_question(label: str, tag: str = "textarea") -> bool:
 def build_open_question_prompt(
     *, question: str, job: dict, resume_summary: str, resume_json: str, facts: str
 ) -> str:
+    from experience_priority import EXPERIENCE_PRIORITY_RULE
+
     language = job.get("language") or "en"
     language_name = "Portuguese" if language == "pt" else "English"
     return f"""Answer this job-application screening question in {language_name}.
 Use ONLY the resume analysis and candidate facts. Never invent projects, employers, metrics, or skills.
 If the facts are insufficient, reply with exactly: INSUFFICIENT_FACTS
 Return only the answer text.
+
+{EXPERIENCE_PRIORITY_RULE}
 
 Question: {question}
 Candidate facts: {facts or '[none]'}

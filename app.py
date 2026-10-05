@@ -412,6 +412,8 @@ def detect_language(text: str) -> tuple[str, float]:
 
 def ai_generate_letter(provider: str, model: str, language: str, job: dict, cfg: dict[str, str]) -> str:
     """Pede somente a carta; o modelo não recebe, cria ou altera o arquivo de currículo."""
+    from experience_priority import EXPERIENCE_PRIORITY_RULE
+
     provider = provider.casefold().strip()
     language_name = "Portuguese" if language == "pt" else "English"
     facts_key = "candidate_facts_pt" if language == "pt" else "candidate_facts_en"
@@ -419,6 +421,8 @@ def ai_generate_letter(provider: str, model: str, language: str, job: dict, cfg:
     name = cfg.get("candidate_name", "").strip()
     prompt = f"""Write a concise, specific cover letter in {language_name} for this job application.
 Use only the candidate facts provided below. Never invent experience, qualifications, results, employers, dates, or skills. If facts are sparse, keep the letter brief and make no unsupported claims. Do not claim the candidate already applied. Return only the letter, with no subject line or commentary.
+
+{EXPERIENCE_PRIORITY_RULE}
 
 Candidate name: {name or '[candidate name]'}
 Candidate-provided facts:

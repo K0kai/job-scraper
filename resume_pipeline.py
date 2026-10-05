@@ -119,6 +119,62 @@ def resume_match_snippets(db: sqlite3.Connection, *, max_chars: int = 3500) -> d
     return out
 
 
+def _experience_is_current(item: object) -> bool:
+    """Detecta papel atual a partir de período/texto (Atual, Present, Current…)."""
+    if isinstance(item, dict):
+        bits = [
+            str(item.get("period") or ""),
+            str(item.get("role") or ""),
+            str(item.get("employer") or ""),
+            str(item.get("is_current") or ""),
+        ]
+        hay = " ".join(bits)
+    else:
+        hay = str(item or "")
+    return bool(
+        re.search(
+            r"\batual\b|\bpresent\b|\bcurrent\b|\bhoje\b|\buntil\s+now\b|"
+            r"\bto\s+present\b|\baté\s+o\s+momento\b|is_current\s*[:=]\s*true",
+            hay,
+            re.I,
+        )
+    )
+
+
+def _format_experience_item(item: object) -> str:
+    if isinstance(item, dict):
+        role = str(item.get("role") or "").strip()
+        employer = str(item.get("employer") or "").strip()
+        period = str(item.get("period") or "").strip()
+        head = " — ".join(p for p in (role, employer) if p) or str(item)[:220]
+        if period:
+            head = f"{head} ({period})"
+        if _experience_is_current(item):
+            head = f"[CURRENT ROLE] {head}"
+        parts = [head]
+        for key in ("responsibilities", "highlights"):
+            val = item.get(key)
+            if isinstance(val, list):
+                for line in val:
+                    text = str(line).strip()
+                    if text:
+                        parts.append(f"  - {text[:300]}")
+            elif str(val or "").strip():
+                parts.append(f"  - {str(val).strip()[:300]}")
+        return "\n".join(parts)
+    text = str(item).strip()
+    if _experience_is_current(text):
+        return f"[CURRENT ROLE] {text}"
+    return text
+
+
+def _ordered_experience(experience: object) -> list[object]:
+    """Mantém a ordem do currículo (em geral mais recente primeiro); sem reordenar por 'atual'."""
+    if not isinstance(experience, list) or not experience:
+        return []
+    return list(experience)
+
+
 def compose_analysis_dossier(analysis: dict, language: str) -> str:
     """Monta um dossiê longo e estruturado para match e visualização no painel."""
     language_name = "Português" if language == "pt" else "English"
@@ -147,7 +203,15 @@ def compose_analysis_dossier(analysis: dict, language: str) -> str:
     _section("Competências técnicas", analysis.get("technical_skills") or analysis.get("skills"))
     _section("Ferramentas e plataformas", analysis.get("tools"))
     _section("Soft skills", analysis.get("soft_skills"))
-    _section("Experiência profissional (cronológica)", analysis.get("experience"))
+    exp_items = _ordered_experience(analysis.get("experience"))
+    if exp_items:
+        formatted = [_format_experience_item(item) for item in exp_items]
+        formatted = [f for f in formatted if f.strip()]
+        if formatted:
+            lines.append(
+                "Experiência profissional (todas as funções — não omitir nenhuma):\n- "
+                + "\n- ".join(formatted)
+            )
     _section("Projetos e automações relevantes", analysis.get("projects"))
     _section("Conquistas / resultados mensuráveis", analysis.get("achievements"))
     _section("Formação", analysis.get("education"))
@@ -180,6 +244,13 @@ Be thorough: cover every role, every notable skill, tool, project, achievement, 
 Do NOT invent employers, dates, skills, metrics, or claims that are not supported by the resume.
 If something is missing, use empty string or empty array — never guess.
 
+Ordering / emphasis rules:
+- List experience NEWEST FIRST. Mark ongoing roles with is_current=true and period ending in Present/Atual/Current.
+- In headline and professional_profile, cover the FULL arc: include BOTH current and recent past roles when both exist.
+  Do not write a profile that only mentions one employer if the resume has two substantial roles.
+  Emphasize by relevance/stack, not by which role has more metrics — keep both visible.
+- Keep ALL roles in the experience array; do not drop any.
+
 Return ONLY JSON with these keys:
 - headline (string, 1 sentence positioning statement in {language_name})
 - professional_profile (string, 2-5 paragraphs in {language_name} covering career arc, stacks, domains, and strengths — dense, specific, not generic)
@@ -189,7 +260,7 @@ Return ONLY JSON with these keys:
 - technical_skills (array of strings — exhaustive list of technologies/languages/frameworks mentioned)
 - tools (array of strings — IDEs, cloud, CI/CD, databases, OS, etc.)
 - soft_skills (array of strings — only if evidenced)
-- experience (array of objects OR detailed strings; prefer objects with keys: role, employer, period, responsibilities (array), highlights (array))
+- experience (array of objects OR detailed strings; prefer objects with keys: role, employer, period, is_current (boolean), responsibilities (array), highlights (array); newest first)
 - projects (array of strings — automations, systems, notable deliverables)
 - achievements (array of strings — quantified results when present)
 - education (array of strings)
