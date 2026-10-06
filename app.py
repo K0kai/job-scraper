@@ -497,27 +497,27 @@ def _record_ai_usage(
         pass
 
 
-def get_ai_key(provider: str) -> str:
-    # The key is kept in the operating system credential vault, never in SQLite.
-    try:
-        import keyring
-        return keyring.get_password("job-scraper", provider) or ""
-    except Exception:
-        return ""
+SECRET_ENV_VARS = {
+    "gemini": ("GEMINI_API_KEY", "GOOGLE_API_KEY"),
+    "openai": ("OPENAI_API_KEY",),
+    "adzuna_app_id": ("ADZUNA_APP_ID",),
+    "adzuna_app_key": ("ADZUNA_APP_KEY",),
+    "apify_token": ("APIFY_TOKEN", "APIFY_API_TOKEN"),
+    "smtp_password": ("SMTP_PASSWORD",),
+}
+SECRET_SETTING_PREFIX = "__encrypted_secret__:"
+SECRET_MASTER_KEY_ENV = "SECRET_ENCRYPTION_KEY"
 
 
-def save_ai_key(provider: str, key: str) -> None:
-    try:
-        import keyring
-        if key.strip():
-            keyring.set_password("job-scraper", provider, key.strip())
-        else:
-            keyring.delete_password("job-scraper", provider)
-    except Exception as exc:
-        raise RuntimeError("Não foi possível acessar o cofre seguro do sistema. Instale as dependências do app.") from exc
+def _secret_from_environment(name: str) -> str:
+    for env_name in SECRET_ENV_VARS.get(name.casefold(), ()):
+        value = os.environ.get(env_name, "").strip()
+        if value:
+            return value
+    return ""
 
 
-def secret_get(name: str) -> str:
+def _secret_from_keyring(name: str) -> str:
     try:
         import keyring
         return keyring.get_password("job-scraper", name) or ""
@@ -525,13 +525,82 @@ def secret_get(name: str) -> str:
         return ""
 
 
-def secret_set(name: str, value: str) -> None:
+def _secret_from_database(name: str) -> str | None:
+    with connect() as db:
+        row = db.execute(
+            "SELECT value FROM settings WHERE key=?",
+            (SECRET_SETTING_PREFIX + name.casefold(),),
+        ).fetchone()
+    if not row:
+        return None
+    master_key = os.environ.get(SECRET_MASTER_KEY_ENV, "").strip()
+    if not master_key:
+        raise RuntimeError(f"Configure {SECRET_MASTER_KEY_ENV} para descriptografar os segredos salvos.")
+    try:
+        from cryptography.fernet import Fernet, InvalidToken
+
+        return Fernet(master_key.encode("ascii")).decrypt(row["value"].encode("ascii")).decode("utf-8")
+    except Exception as exc:
+        raise RuntimeError(
+            f"Não foi possível descriptografar o segredo '{name}'. Confira {SECRET_MASTER_KEY_ENV}; "
+            "ela precisa ser a mesma usada quando o segredo foi salvo."
+        ) from exc
+
+
+def _secret_save(name: str, value: str, *, delete_empty: bool = False) -> None:
+    master_key = os.environ.get(SECRET_MASTER_KEY_ENV, "").strip()
+    if master_key:
+        try:
+            from cryptography.fernet import Fernet
+
+            encrypted = Fernet(master_key.encode("ascii")).encrypt(value.strip().encode("utf-8")).decode("ascii")
+        except Exception as exc:
+            raise RuntimeError(f"{SECRET_MASTER_KEY_ENV} inválida. Gere uma chave Fernet válida.") from exc
+        db_key = SECRET_SETTING_PREFIX + name.casefold()
+        with connect() as db:
+            if not value.strip() and delete_empty:
+                db.execute("DELETE FROM settings WHERE key=?", (db_key,))
+            elif value.strip():
+                db.execute(
+                    "INSERT INTO settings(key,value) VALUES(?,?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
+                    (db_key, encrypted),
+                )
+        return
+    if os.environ.get("RENDER"):
+        raise RuntimeError(
+            f"Configure {SECRET_MASTER_KEY_ENV} no Render para salvar segredos criptografados no banco."
+        )
     try:
         import keyring
+
         if value.strip():
             keyring.set_password("job-scraper", name, value.strip())
+        elif delete_empty:
+            keyring.delete_password("job-scraper", name)
     except Exception as exc:
-        raise RuntimeError("Não foi possível acessar o cofre seguro do sistema.") from exc
+        raise RuntimeError(
+            f"Não foi possível acessar o cofre local. Configure {SECRET_MASTER_KEY_ENV} para usar o banco criptografado."
+        ) from exc
+
+
+def get_ai_key(provider: str) -> str:
+    return secret_get(provider)
+
+
+def save_ai_key(provider: str, key: str) -> None:
+    _secret_save(provider, key, delete_empty=True)
+
+
+def secret_get(name: str) -> str:
+    stored = _secret_from_database(name)
+    if stored is not None:
+        return stored
+    return _secret_from_environment(name) or _secret_from_keyring(name)
+
+
+def secret_set(name: str, value: str) -> None:
+    _secret_save(name, value)
 
 
 def create_cover_letter(job_id: int, resume_language: str | None = None) -> int:
