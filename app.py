@@ -4527,10 +4527,25 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
         if (submitter) submitter.disabled = false;
       }});
   }});
+  var healthHeartbeatInFlight = false;
+  function keepServerAwake() {{
+    if (healthHeartbeatInFlight) return;
+    healthHeartbeatInFlight = true;
+    fetch("/health", {{ cache: "no-store", credentials: "same-origin" }})
+      .catch(function () {{}})
+      .then(function () {{ healthHeartbeatInFlight = false; }});
+  }}
+  keepServerAwake();
+  setInterval(keepServerAwake, 5 * 60 * 1000);
   setInterval(refresh, 1500);
   setInterval(updateAllCountdowns, 1000);
   updateAllCountdowns();
-  document.addEventListener("visibilitychange", function () {{ if (!document.hidden) refresh(); }});
+  document.addEventListener("visibilitychange", function () {{
+    if (!document.hidden) {{
+      refresh();
+      keepServerAwake();
+    }}
+  }});
 }})();
 </script></body></html>'''
 
