@@ -52,7 +52,6 @@ def log_event(level: str, source: str, message: str) -> None:
     with _lock:
         try:
             with _connect() as db:
-                ensure_log_table(db)
                 db.execute(
                     "INSERT INTO event_logs(created_at,level,source,message) VALUES(?,?,?,?)",
                     (stamp, level, source, message),
@@ -70,7 +69,6 @@ def log_event(level: str, source: str, message: str) -> None:
 def list_logs(limit: int = 200) -> list[sqlite3.Row]:
     limit = max(1, min(500, int(limit)))
     with _connect() as db:
-        ensure_log_table(db)
         return list(db.execute("SELECT * FROM event_logs ORDER BY id DESC LIMIT ?", (limit,)))
 
 

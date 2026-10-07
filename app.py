@@ -2,6 +2,7 @@
 # O host e a porta podem ser sobrescritos pelo ambiente de deploy (ex.: Render).
 from __future__ import annotations
 
+import gzip
 import hashlib
 import html
 import json
@@ -23,7 +24,6 @@ from dates_br import BRASILIA, format_brasilia, format_brasilia_date, format_cyc
 
 from form_rules import ensure_default_rules, list_rules, save_rules_from_form
 from job_queue import (
-    ACTIVE_STATUSES,
     KIND_APPLY,
     KIND_RESUME,
     KIND_WORTH_REVERIFY,
@@ -78,6 +78,7 @@ CREATE TABLE IF NOT EXISTS jobs (
 );
 CREATE INDEX IF NOT EXISTS jobs_status_idx ON jobs(status);
 CREATE INDEX IF NOT EXISTS jobs_seen_idx ON jobs(first_seen_at DESC);
+CREATE INDEX IF NOT EXISTS jobs_status_seen_idx ON jobs(status, first_seen_at DESC);
 CREATE TABLE IF NOT EXISTS runs (
   id INTEGER PRIMARY KEY,
   started_at TEXT NOT NULL,
@@ -95,6 +96,7 @@ CREATE TABLE IF NOT EXISTS ai_decisions (
   letter_required INTEGER NOT NULL,
   reason TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS ai_decisions_job_latest_idx ON ai_decisions(job_id, id DESC);
 """
 
 DEFAULT_SETTINGS = {
@@ -199,6 +201,14 @@ def initialize() -> None:
                     (key, value),
                 )
             ensure_default_rules(db)
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS ai_decisions_job_latest_idx "
+                "ON ai_decisions(job_id, id DESC)"
+            )
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS jobs_status_seen_idx "
+                "ON jobs(status, first_seen_at DESC)"
+            )
             db.execute(
                 "UPDATE settings SET value='65' WHERE key='minimum_match_score' AND value='80'"
             )
@@ -989,12 +999,9 @@ def enqueue_worth_reverify() -> str:
 
 def worth_reverify_busy() -> bool:
     try:
-        for row in queue.list_jobs(limit=80):
-            if str(row["kind"]) == KIND_WORTH_REVERIFY and str(row["status"]) in ACTIVE_STATUSES:
-                return True
+        return queue.has_active_kind(KIND_WORTH_REVERIFY)
     except Exception:
         return False
-    return False
 
 
 queue = JobQueue(
@@ -2630,7 +2637,9 @@ def worth_html(
             ).fetchone()["n"]
         )
         rows = db.execute(
-            f"""SELECT jobs.*, cover_letters.body AS cover_letter,
+            f"""SELECT jobs.id, jobs.title, jobs.company, jobs.location, jobs.source,
+                      jobs.url, jobs.posted_at, jobs.first_seen_at, jobs.description, jobs.notes,
+                      cover_letters.body AS cover_letter,
                       {match_expr} AS match_score
                FROM jobs
                LEFT JOIN cover_letters ON cover_letters.job_id = jobs.id
@@ -2646,7 +2655,9 @@ def worth_html(
         offset = (page - 1) * page_size
         with connect() as db:
             rows = db.execute(
-                f"""SELECT jobs.*, cover_letters.body AS cover_letter,
+                f"""SELECT jobs.id, jobs.title, jobs.company, jobs.location, jobs.source,
+                          jobs.url, jobs.posted_at, jobs.first_seen_at, jobs.description, jobs.notes,
+                          cover_letters.body AS cover_letter,
                           {match_expr} AS match_score
                    FROM jobs
                    LEFT JOIN cover_letters ON cover_letters.job_id = jobs.id
@@ -2886,84 +2897,99 @@ def live_countdowns(status: dict | None = None) -> dict[str, dict[str, str]]:
 
 def live_payload(
     *,
+    view: str = "all",
     worth_page: int = 1,
     worth_min_match: int = 0,
     worth_sort: str = WORTH_SORT_NONE,
     worth_date_from: str = "",
     worth_date_to: str = "",
 ) -> dict:
+    allowed_views = {"all", "painel", "vale", "filas", "logs", "uso", "curriculos", "busca", "ia", "assistente"}
+    view = view if view in allowed_views else "all"
     status = collector.snapshot()
-    counts, jobs, runs = load_dashboard()
-    collecting = status["state"] in {"running", "stopping"}
-    stats = stats_html(counts)
-    jobs_body = job_rows_html(jobs, collecting)
-    history = history_html(runs)
-    logs = logs_html()
-    queue = queue_html()
+    from copilot_asks import get_pending_ask
+
+    cfg_live = settings()
+    payload = {
+        "state": status["state"],
+        "state_label": state_label_for(status["state"]),
+        "message": status["message"],
+        "countdowns": live_countdowns(status),
+        "copilot_ask": get_pending_ask(connect),
+        "copilot_ask_sound": (cfg_live.get("copilot_ask_sound") or "1") == "1",
+        "copilot_ask_sound_volume": _copilot_ask_volume(cfg_live),
+    }
+    dashboard_views = {"all", "painel"}
+    if view in dashboard_views:
+        counts, jobs, runs = load_dashboard()
+        collecting = status["state"] in {"running", "stopping"}
+        stats = stats_html(counts)
+        jobs_body = job_rows_html(jobs, collecting)
+        history = history_html(runs)
+        payload.update({
+            "stats_html": stats,
+            "stats_hash": _live_hash(stats),
+            "jobs_html": jobs_body,
+            "jobs_hash": _live_hash(jobs_body),
+            "history_html": history,
+            "history_hash": _live_hash(history),
+        })
+
     worth_min_match = max(0, min(100, int(worth_min_match or 0)))
     worth_page = max(1, int(worth_page or 1))
     worth_sort = normalize_worth_sort(worth_sort)
     worth_date_from = (worth_date_from or "").strip()
     worth_date_to = (worth_date_to or "").strip()
-    # Clamp page so "ignorar" na última página não pede um OFFSET vazio.
-    worth = worth_html(
-        page=worth_page,
-        min_match=worth_min_match,
-        sort=worth_sort,
-        date_from=worth_date_from,
-        date_to=worth_date_to,
-    )
-    # worth_html já clampou page no HTML (data-worth-current); espelha no payload.
-    try:
-        m = re.search(r'data-worth-current="(\d+)"', worth or "")
-        if m:
-            worth_page = max(1, int(m.group(1)))
-    except Exception:
-        pass
-    linkedin_filter = linkedin_filter_panel_html()
-    usage = usage_dashboard_html()
-    countdowns = live_countdowns(status)
+    if view in {"all", "vale"}:
+        # Clamp page so "ignorar" na última página não pede um OFFSET vazio.
+        worth = worth_html(
+            page=worth_page,
+            min_match=worth_min_match,
+            sort=worth_sort,
+            date_from=worth_date_from,
+            date_to=worth_date_to,
+        )
+        try:
+            m = re.search(r'data-worth-current="(\d+)"', worth or "")
+            if m:
+                worth_page = max(1, int(m.group(1)))
+        except Exception:
+            pass
+        payload.update({
+            "worth_html": worth,
+            "worth_hash": _live_hash(worth),
+            "worth_page": worth_page,
+            "worth_min_match": worth_min_match,
+            "worth_sort": worth_sort,
+            "worth_date_from": worth_date_from,
+            "worth_date_to": worth_date_to,
+        })
+
+    if view in {"all", "logs"}:
+        logs = logs_html()
+        payload.update({"logs_html": logs, "logs_hash": _live_hash(logs)})
+    if view in {"all", "filas"}:
+        queue_view = queue_html()
+        payload.update({"queue_html": queue_view, "queue_hash": _live_hash(queue_view)})
+    if view in {"all", "busca", "ia"}:
+        linkedin_filter = linkedin_filter_panel_html()
+        payload.update({"linkedin_filter_html": linkedin_filter, "linkedin_filter_hash": _live_hash(linkedin_filter)})
+    if view in {"all", "uso"}:
+        usage = usage_dashboard_html()
+        payload.update({"usage_html": usage, "usage_hash": _live_hash(usage)})
+    if view in {"all", "curriculos"}:
+        payload["resume_status"] = resume_status_payload()
+
+    countdowns = payload["countdowns"]
     collector_cd = countdowns.get("collector") or countdown_entry(state="stopped")
     next_in = next_run_countdown_seconds(collector_cd.get("at") or None)
-    from copilot_asks import get_pending_ask
-
-    pending_ask = get_pending_ask(connect)
-    cfg_live = settings()
-    return {
-        "state": status["state"],
-        "state_label": state_label_for(status["state"]),
-        "message": status["message"],
-        "countdowns": countdowns,
+    payload.update({
         # aliases legados do timer do coletor
         "next_run_at": collector_cd.get("at") or None,
         "next_run_in_seconds": next_in,
         "next_run_label": format_countdown_label(collector_cd, labels=COLLECTOR_COUNTDOWN_LABELS),
-        "stats_html": stats,
-        "stats_hash": _live_hash(stats),
-        "jobs_html": jobs_body,
-        "jobs_hash": _live_hash(jobs_body),
-        "history_html": history,
-        "history_hash": _live_hash(history),
-        "logs_html": logs,
-        "logs_hash": _live_hash(logs),
-        "queue_html": queue,
-        "queue_hash": _live_hash(queue),
-        "worth_html": worth,
-        "worth_hash": _live_hash(worth),
-        "worth_page": worth_page,
-        "worth_min_match": worth_min_match,
-        "worth_sort": worth_sort,
-        "worth_date_from": worth_date_from,
-        "worth_date_to": worth_date_to,
-        "resume_status": resume_status_payload(),
-        "linkedin_filter_html": linkedin_filter,
-        "linkedin_filter_hash": _live_hash(linkedin_filter),
-        "usage_html": usage,
-        "usage_hash": _live_hash(usage),
-        "copilot_ask": pending_ask,
-        "copilot_ask_sound": (cfg_live.get("copilot_ask_sound") or "1") == "1",
-        "copilot_ask_sound_volume": _copilot_ask_volume(cfg_live),
-    }
+    })
+    return payload
 
 
 def _live_hash(text: str) -> str:
@@ -3098,7 +3124,7 @@ def resume_status_payload() -> dict[str, dict[str, str]]:
     return {"pt": resume_status_parts("pt"), "en": resume_status_parts("en")}
 
 
-def resume_panels_html() -> str:
+def resume_panels_html(*, include_status: bool = True) -> str:
     blocks = []
     for lang, label in (("pt", "Português"), ("en", "English")):
         blocks.append(
@@ -3110,7 +3136,11 @@ def resume_panels_html() -> str:
             f'<input type="checkbox" name="force_reanalyze" value="1" style="width:auto;margin-right:6px">'
             f'Forçar nova análise mesmo se o arquivo for idêntico</label>'
             f'<button style="margin-top:8px">Enviar e analisar</button></form>'
-            f'<div id="resume-status-{lang}">{resume_status_html_for(lang)}</div></div>'
+            f'<div id="resume-status-{lang}">'
+            + (resume_status_html_for(lang) if include_status else (
+                f'<div id="resume-meta-{lang}"></div><div id="resume-dossier-{lang}"></div>'
+            ))
+            + "</div></div>"
         )
     return '<div class="form-grid">' + "".join(blocks) + "</div>"
 
@@ -3425,13 +3455,14 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
         labels=COLLECTOR_COUNTDOWN_LABELS,
         style="margin-left:14px",
     )
-    resume_panel = resume_panels_html()
+    resume_panel = resume_panels_html(include_status=False)
     rules_panel = form_rules_html()
-    logs_view = logs_html()
-    queue_view = queue_html()
-    worth_view = worth_html()
-    usage_view = usage_dashboard_html()
-    linkedin_filter_view = linkedin_filter_panel_html(cfg)
+    # Large/slow panels load on demand via /live when their tab is opened.
+    logs_view = '<div class="log-empty">Abra esta aba para carregar os logs.</div>'
+    queue_view = '<p class="hint">Abra esta aba para carregar a fila.</p>'
+    worth_view = '<p class="hint">Abra esta aba para carregar as vagas.</p>'
+    usage_view = '<p class="hint">Abra esta aba para carregar uso e cotas.</p>'
+    linkedin_filter_view = '<p class="hint">Carregando filtro ao abrir a aba.</p>'
     notice_class = {
         "success": "notice notice-ok",
         "info": "notice notice-info",
@@ -3537,6 +3568,7 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
 <script>
 (function () {{
   var inFlight = false;
+  var panelReady = false;
   function formatCountdownClient(sec) {{
     sec = Math.max(0, Math.floor(sec));
     var h = Math.floor(sec / 3600);
@@ -3586,6 +3618,7 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
         panel.classList.toggle("active", panel.id === "tab-" + name);
       }});
       try {{ localStorage.setItem("radar-tab", name); }} catch (e) {{}}
+      if (panelReady) refresh(true);
     }});
   }});
   try {{
@@ -3648,6 +3681,7 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
     if (hintEl) hintEl.textContent = hint || (busy ? "Aguardando a IA…" : "");
   }}
   function syncCopilotAsk(data) {{
+    if (!Object.prototype.hasOwnProperty.call(data, "copilot_ask")) return;
     if (typeof data.copilot_ask_sound !== "undefined") {{
       copilotAskSoundOn = !!data.copilot_ask_sound;
     }}
@@ -3739,6 +3773,7 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
   var worthForceUpdate = false;
   var liveReqGen = 0;
   var pendingWorthRefresh = false;
+  var pendingViewRefresh = false;
   try {{
     var savedPage = parseInt(localStorage.getItem("radar-worth-page"), 10);
     if (savedPage > 0) worthPage = savedPage;
@@ -3842,7 +3877,7 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
       liveReqGen += 1;
       return;
     }}
-    refresh();
+    refresh(true);
   }}
   function setWorthIgnoreConfirm(open) {{
     var modal = document.getElementById("worth-ignore-modal");
@@ -3971,13 +4006,18 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
       if (!ignoreModal.hidden) setWorthIgnoreConfirm(false);
     }});
   }}
-  function refresh() {{
-    if (inFlight || document.hidden) return;
+  function refresh(force) {{
+    if (document.hidden) return;
+    if (inFlight) {{
+      if (force) pendingViewRefresh = true;
+      return;
+    }}
     inFlight = true;
     pendingWorthRefresh = false;
     var reqGen = ++liveReqGen;
     fetch(
       "/live?worth_page=" + encodeURIComponent(worthPage)
+        + "&view=" + encodeURIComponent(document.querySelector(".tab.active")?.getAttribute("data-tab") || "painel")
         + "&worth_min_match=" + encodeURIComponent(worthMinMatch)
         + "&worth_sort=" + encodeURIComponent(worthSort || "")
         + "&worth_date_from=" + encodeURIComponent(worthDateFrom || "")
@@ -4065,9 +4105,11 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
       .catch(function () {{}})
       .then(function () {{
         inFlight = false;
-        if (pendingWorthRefresh) {{
-          worthForceUpdate = true;
-          refresh();
+        if (pendingWorthRefresh || pendingViewRefresh) {{
+          if (pendingWorthRefresh) worthForceUpdate = true;
+          pendingWorthRefresh = false;
+          pendingViewRefresh = false;
+          refresh(true);
         }} else {{
           worthForceUpdate = false;
         }}
@@ -4316,7 +4358,9 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
   }}
   keepServerAwake();
   setInterval(keepServerAwake, 5 * 60 * 1000);
-  setInterval(refresh, 1500);
+  panelReady = true;
+  if ((document.querySelector(".tab.active")?.getAttribute("data-tab") || "painel") !== "painel") refresh(true);
+  setInterval(refresh, 10000);
   setInterval(updateAllCountdowns, 1000);
   updateAllCountdowns();
   document.addEventListener("visibilitychange", function () {{
@@ -4385,11 +4429,21 @@ def parse_multipart(handler: BaseHTTPRequestHandler) -> tuple[dict[str, str], di
 
 class Handler(BaseHTTPRequestHandler):
     """Trata as ações do painel sem depender de um servidor web externo."""
+    def _compress_response(self, data: bytes) -> tuple[bytes, bool]:
+        accepts_gzip = "gzip" in (self.headers.get("Accept-Encoding") or "").casefold()
+        if len(data) < 1024 or not accepts_gzip:
+            return data, False
+        compressed = gzip.compress(data, compresslevel=5)
+        return (compressed, True) if len(compressed) < len(data) else (data, False)
+
     def send_page(self, body: str, status: int = 200) -> None:
-        data = body.encode("utf-8")
+        data, compressed = self._compress_response(body.encode("utf-8"))
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
+        if compressed:
+            self.send_header("Content-Encoding", "gzip")
+            self.send_header("Vary", "Accept-Encoding")
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(data)
@@ -4411,20 +4465,26 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def send_json(self, payload: dict, status: int = 200) -> None:
-        data = json.dumps(payload).encode("utf-8")
+        data, compressed = self._compress_response(json.dumps(payload).encode("utf-8"))
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
+        if compressed:
+            self.send_header("Content-Encoding", "gzip")
+            self.send_header("Vary", "Accept-Encoding")
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(data)
 
     def send_extension_json(self, payload: dict, status: int = 200) -> None:
         """Read-only, allow-listed profile data for the local autofill extension."""
-        data = json.dumps(payload).encode("utf-8")
+        data, compressed = self._compress_response(json.dumps(payload).encode("utf-8"))
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
+        if compressed:
+            self.send_header("Content-Encoding", "gzip")
+            self.send_header("Vary", "Accept-Encoding")
         self.send_header("Cache-Control", "no-store")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
@@ -4469,6 +4529,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/live":
             qs = parse_qs(parsed.query)
+            view = (qs.get("view") or ["painel"])[0].strip()
+            if view not in {"painel", "vale", "filas", "logs", "uso", "curriculos", "busca", "ia", "assistente"}:
+                view = "painel"
             worth_page = 1
             worth_min_match = 0
             worth_sort = WORTH_SORT_NONE
@@ -4490,6 +4553,7 @@ class Handler(BaseHTTPRequestHandler):
             worth_sort = normalize_worth_sort(raw_sort)
             self.send_json(
                 live_payload(
+                    view=view,
                     worth_page=worth_page,
                     worth_min_match=worth_min_match,
                     worth_sort=worth_sort,

@@ -329,6 +329,14 @@ class JobQueue:
                 )
             )
 
+    def has_active_kind(self, kind: str) -> bool:
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT 1 FROM queue_jobs WHERE kind=? AND status IN ('pending','running','retry_wait') LIMIT 1",
+                (kind,),
+            ).fetchone()
+        return row is not None
+
     def cancel(self, job_id: int) -> bool:
         now = _iso(_utc_now())
         with self._connect() as db:

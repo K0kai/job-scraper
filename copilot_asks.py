@@ -86,7 +86,6 @@ def create_ask(
 def get_pending_ask(connect_fn: ConnectFn) -> dict | None:
     """Ask visível no painel: só pending (ainda sem resposta do humano)."""
     with connect_fn() as db:
-        ensure_table(db)
         # Asks antigos em awaiting_ai (spinner eterno) → fecha na leitura.
         db.execute(
             "UPDATE copilot_asks SET status=?, hint=? WHERE status=?",
