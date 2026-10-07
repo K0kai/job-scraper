@@ -3568,6 +3568,8 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
 <script>
 (function () {{
   var inFlight = false;
+  var liveController = null;
+  var inFlightView = "";
   var panelReady = false;
   function formatCountdownClient(sec) {{
     sec = Math.max(0, Math.floor(sec));
@@ -4008,21 +4010,29 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
   }}
   function refresh(force) {{
     if (document.hidden) return;
+    var activeView = document.querySelector(".tab.active")?.getAttribute("data-tab") || "painel";
     if (inFlight) {{
-      if (force) pendingViewRefresh = true;
+      if (force) {{
+        pendingViewRefresh = true;
+        // Uma resposta lenta da seção anterior não deve bloquear a seção que
+        // o usuário acabou de abrir.
+        if (activeView !== inFlightView && liveController) liveController.abort();
+      }}
       return;
     }}
     inFlight = true;
     pendingWorthRefresh = false;
     var reqGen = ++liveReqGen;
+    inFlightView = activeView;
+    liveController = typeof AbortController !== "undefined" ? new AbortController() : null;
     fetch(
       "/live?worth_page=" + encodeURIComponent(worthPage)
-        + "&view=" + encodeURIComponent(document.querySelector(".tab.active")?.getAttribute("data-tab") || "painel")
+        + "&view=" + encodeURIComponent(activeView)
         + "&worth_min_match=" + encodeURIComponent(worthMinMatch)
         + "&worth_sort=" + encodeURIComponent(worthSort || "")
         + "&worth_date_from=" + encodeURIComponent(worthDateFrom || "")
         + "&worth_date_to=" + encodeURIComponent(worthDateTo || ""),
-      {{ headers: {{ Accept: "application/json" }} }}
+      {{ headers: {{ Accept: "application/json" }}, signal: liveController ? liveController.signal : undefined }}
     )
       .then(function (response) {{ return response.ok ? response.json() : Promise.reject(); }})
       .then(function (data) {{
@@ -4104,6 +4114,8 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
       }})
       .catch(function () {{}})
       .then(function () {{
+        liveController = null;
+        inFlightView = "";
         inFlight = false;
         if (pendingWorthRefresh || pendingViewRefresh) {{
           if (pendingWorthRefresh) worthForceUpdate = true;
@@ -4321,6 +4333,13 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
     if (submitter && submitter.name) {{
       body.set(submitter.name, submitter.value);
     }}
+    // O status da vaga só depende de uma gravação pequena. Esconda a linha
+    // imediatamente para a interface não esperar a latência do Render.
+    var optimisticRow = null;
+    if (path === "/job-status" && body.get("status") === "applied") {{
+      optimisticRow = form.closest("tr");
+      if (optimisticRow) optimisticRow.hidden = true;
+    }}
     fetch(path, {{
       method: "POST",
       body: body,
@@ -4330,6 +4349,7 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
       .then(function (r) {{ return r.json().then(function (data) {{ return {{ okHttp: r.ok, data: data }}; }}); }})
       .then(function (res) {{
         var data = res.data || {{}};
+        if (optimisticRow && data.ok === false) optimisticRow.hidden = false;
         showNotice(data.notice || (data.ok ? "OK" : "Falha"), data.kind || (data.ok ? "success" : "error"));
         if (path === "/upload-resume" && data.ok !== false) {{
           var fileInput = form.querySelector('input[type="file"]');
@@ -4342,6 +4362,7 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
         }}
       }})
       .catch(function () {{
+        if (optimisticRow) optimisticRow.hidden = false;
         showNotice("Falha de comunicação com o painel.", "error");
       }})
       .then(function () {{
