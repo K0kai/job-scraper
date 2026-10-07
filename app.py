@@ -2743,8 +2743,8 @@ def worth_html(
         letter = job["cover_letter"] or ""
         notes = job["notes"] or ""
         open_job = (
-            f'<a class="subtle" href="{esc(job["url"])}" target="_blank" rel="noreferrer" '
-            'title="Abra a vaga no Chrome e use Job Autofill">Abrir vaga + extensão</a>'
+            f'<a class="worth-open-button" href="{esc(job["url"])}" target="_blank" rel="noreferrer" '
+            'title="Abrir vaga em uma nova aba">Abrir Vaga</a>'
             if job.get("url") else ""
         )
         posted_raw = (job["posted_at"] or "").strip()
@@ -3380,6 +3380,8 @@ color:#c9c9d1;border:1px solid var(--line);border-radius:10px;padding:12px;max-h
 .worth-match{font-weight:700;white-space:nowrap}
 .worth-actions{white-space:nowrap}
 .worth-actions form{display:inline}
+.worth-open-button{display:inline-block;margin-right:4px;padding:6px 10px;border:1px solid var(--accent);border-radius:9px;background:var(--accent);color:var(--white);font-size:13px;font-weight:600;line-height:1.5;text-decoration:none;vertical-align:middle;transition:filter .12s,background .12s}
+.worth-open-button:hover{filter:brightness(.92);background:var(--accent2);border-color:var(--accent2);color:var(--white)}
 .worth-details{font-size:12.5px}
 .worth-table-wrap{margin-top:0}
 .worth-list{display:grid;gap:14px}
