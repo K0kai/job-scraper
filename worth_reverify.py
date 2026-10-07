@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
+import threading
 import time
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
@@ -10,6 +12,8 @@ from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 LOG = logging.getLogger("job-scraper")
+_LINKEDIN_LIVENESS_LOCK = threading.Lock()
+_LINKEDIN_LIVENESS_LOCK_WAIT_SECONDS = 20 * 60
 
 ConnectFn = Callable[[], Any]
 AbortFn = Callable[[], bool]
@@ -43,7 +47,6 @@ INACTIVE_RE = re.compile(
 )
 
 ACTIVE_RE = re.compile(
-    r"easy\s*apply|candidatura\s*simplificada|"
     r"apply\s+now|candidatar(-se)?|enviar\s+candidatura|"
     r"submit\s+application|apply\s+for\s+this\s+(job|role)|"
     r"finalizar\s+candidatura",
@@ -111,7 +114,7 @@ USER_AGENT = "JobScraperLocal/0.1 (personal job search; liveness check)"
 DEFAULT_PAGE_WAIT_MS = 25_000
 DEFAULT_POLL_MS = 500
 # Após o 1º sinal de "ativa", espera mais este tempo por um banner de fechamento
-# que o SPA LinkedIn costuma hidratar depois do Easy Apply de similares.
+# que o SPA LinkedIn pode hidratar com atraso.
 ACTIVE_CONFIRM_GRACE_MS = 5_000
 
 LINKEDIN_JOB_ID_RE = re.compile(
@@ -245,7 +248,7 @@ def page_has_load_error(body: str) -> bool:
 
 
 def read_liveness_text(page) -> str:
-    """Prefere o card principal da vaga (evita Easy Apply de similares)."""
+    """Prefere o card principal da vaga para evitar texto de vagas similares."""
     try:
         snippet = page.evaluate(
             """() => {
@@ -284,8 +287,8 @@ def wait_page_liveness_signal(
 ) -> tuple[str, str]:
     """Espera sinal claro (ativa/inativa) no HTML; senão timeout → unknown.
 
-    Inativa retorna na hora. Ativa só no fim do prazo — no LinkedIn o Easy Apply
-    de vagas similares costuma aparecer antes do banner de vaga fechada.
+    Inativa retorna na hora. Ativa só no fim do prazo, pois sinais da página
+    podem aparecer antes do banner definitivo de vaga fechada.
     """
     deadline = time.monotonic() + max(0.05, timeout_ms / 1000.0)
     last_detail = "sem leitura"
@@ -358,14 +361,12 @@ class LinkedInLivenessSession:
             persistent_launch_kwargs,
             resolve_sync_playwright,
         )
-        from linkedin_apply import _LINKEDIN_LOCK, _LOCK_WAIT_SECONDS, default_profile_dir
-
-        profile = (self.cfg.get("linkedin_chrome_profile") or "").strip() or default_profile_dir(
-            self.project_root
+        profile = (self.cfg.get("linkedin_chrome_profile") or "").strip() or os.path.join(
+            self.project_root, "linkedin_browser_profile"
         )
-        acquired = _LINKEDIN_LOCK.acquire(timeout=min(120, _LOCK_WAIT_SECONDS))
+        acquired = _LINKEDIN_LIVENESS_LOCK.acquire(timeout=min(120, _LINKEDIN_LIVENESS_LOCK_WAIT_SECONDS))
         if not acquired:
-            raise RuntimeError("perfil Chrome ocupado (Easy Apply em andamento)")
+            raise RuntimeError("perfil Chrome ocupado por outra reverificação")
         self._lock_held = True
         try:
             module = resolve_sync_playwright(self.cfg)
@@ -407,9 +408,7 @@ class LinkedInLivenessSession:
         self._playwright = None
         if self._lock_held:
             try:
-                from linkedin_apply import _LINKEDIN_LOCK
-
-                _LINKEDIN_LOCK.release()
+                _LINKEDIN_LIVENESS_LOCK.release()
             except Exception:
                 pass
             self._lock_held = False

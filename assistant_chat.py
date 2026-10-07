@@ -9,7 +9,7 @@ import sqlite3
 from typing import Any
 
 from ai_client import call_ai_text
-from ats_copilot import panel_profile_block
+from candidate_context import panel_profile_block
 from experience_priority import EXPERIENCE_PRIORITY_RULE
 from resume_pipeline import AiUnavailableError, compose_analysis_dossier, get_resume
 

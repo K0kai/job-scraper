@@ -107,7 +107,7 @@ def review_salary_value(
     if not (provider and model and api_key):
         return value, meta
 
-    from ats_copilot import panel_profile_block
+    from candidate_context import panel_profile_block
     from ai_client import call_ai_text
 
     prompt = build_salary_review_prompt(

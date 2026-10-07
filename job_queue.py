@@ -19,11 +19,10 @@ LOG = logging.getLogger("job-scraper")
 
 KIND_RESUME = "resume_analysis"
 KIND_APPLY = "job_apply"
-KIND_LINKEDIN = "linkedin_apply"
 KIND_WORTH_REVERIFY = "worth_reverify"
 ACTIVE_STATUSES = ("pending", "running", "retry_wait")
-# Compartilham perfil Chrome — no máximo um desses kinds em running.
-BROWSER_PROFILE_KINDS = (KIND_LINKEDIN, KIND_WORTH_REVERIFY)
+# LinkedIn vacancy checks share one persistent Chrome profile.
+BROWSER_PROFILE_KINDS = (KIND_WORTH_REVERIFY,)
 TERMINAL_STATUSES = ("succeeded", "failed", "cancelled")
 # Teto absoluto do jitter de retry (evita intervalos de horas).
 BACKOFF_CAP_SECONDS = 20 * 60
@@ -76,10 +75,9 @@ def is_retryable_error(exc: BaseException) -> bool:
     if "operationalerror" in name and "locked" in str(exc).casefold():
         return True
     msg = str(exc).casefold()
-    # LinkedIn assisted apply: never auto-retry auth/browser human steps.
+    # Never retry browser/login steps that require a person.
     linkedin_human = (
-        "login", "checkpoint", "captcha", "authwall", "easy apply",
-        "linkedin pediu", "perfil chrome", "manual",
+        "login", "checkpoint", "captcha", "authwall", "perfil chrome", "manual",
     )
     if any(token in msg for token in linkedin_human):
         return False
@@ -200,24 +198,19 @@ class JobQueue:
     def recover_stale_running(self) -> int:
         """Jobs 'running' sem processo vivo (ex.: após restart).
 
-        linkedin_apply is cancelled (not requeued): restarting mid-login must not
-        slam Chrome again before the user finishes signing in.
+        Legacy browser-application jobs are cancelled; other interrupted work is requeued.
         """
         now = _utc_now()
         _, _, ttl_hours = self._limits()
         with self._connect() as db:
-            cur_li = db.execute(
+            cur_legacy = db.execute(
                 """UPDATE queue_jobs
                    SET status='cancelled', updated_at=?,
-                       last_error=CASE
-                         WHEN last_error='' THEN
-                           'Interrompido no reinício — faça login no perfil Chrome e clique Easy Apply de novo.'
-                         ELSE last_error
-                       END
-                   WHERE status='running' AND kind=?""",
-                (_iso(now), KIND_LINKEDIN),
+                       last_error='Candidatura pelo navegador removida; use a extensão no Chrome para formulários.'
+                   WHERE kind='linkedin_apply' AND status IN ('pending','running','retry_wait')""",
+                (_iso(now),),
             )
-            cancelled_li = int(cur_li.rowcount or 0)
+            cancelled_legacy = int(cur_legacy.rowcount or 0)
             cur = db.execute(
                 """UPDATE queue_jobs
                    SET status='pending', next_run_at=?, expires_at=?, updated_at=?,
@@ -228,7 +221,7 @@ class JobQueue:
                    WHERE status='running'""",
                 (_iso(now), _iso(now + timedelta(hours=ttl_hours)), _iso(now)),
             )
-            return int(cur.rowcount or 0) + cancelled_li
+            return int(cur.rowcount or 0) + cancelled_legacy
 
     def respread_retry_waits(self) -> int:
         """Reespalha next_run_at de jobs em retry_wait para quebrar sincronização (ex.: 429 em massa)."""
@@ -366,7 +359,8 @@ class JobQueue:
                 """UPDATE queue_jobs
                    SET status='pending', next_run_at=?, expires_at=?, updated_at=?,
                        last_error='', attempts=0, max_attempts=?, result=''
-                   WHERE id=? AND status IN ('retry_wait','failed','cancelled','running')""",
+                   WHERE id=? AND kind!='linkedin_apply'
+                     AND status IN ('retry_wait','failed','cancelled','running')""",
                 (_iso(now), _iso(now + timedelta(hours=ttl_hours)), _iso(now), max_attempts, job_id),
             )
             ok = cur.rowcount > 0
@@ -383,7 +377,7 @@ class JobQueue:
         placeholders = ",".join("?" * len(statuses))
         with self._connect() as db:
             rows = db.execute(
-                f"SELECT id FROM queue_jobs WHERE status IN ({placeholders})",
+                f"SELECT id FROM queue_jobs WHERE kind!='linkedin_apply' AND status IN ({placeholders})",
                 statuses,
             ).fetchall()
             ids = [int(row["id"]) for row in rows if int(row["id"]) not in live]
@@ -436,7 +430,7 @@ class JobQueue:
                 (now_s, now_s),
             )
             browser_busy = self._browser_profile_busy(db)
-            # Fetch extra candidates so filtering Easy Apply still fills worker slots.
+            # Fetch extra candidates so browser-profile jobs do not starve other work.
             fetch_n = max(limit * 4, limit + 8)
             rows = db.execute(
                 """SELECT * FROM queue_jobs

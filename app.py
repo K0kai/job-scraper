@@ -18,21 +18,17 @@ from urllib.parse import parse_qs, quote_plus, urlparse
 from urllib.request import Request, urlopen
 
 from dbutil import open_connection, using_postgres
-from apply_channels import apply_via_browser, apply_via_email, record_blocked, send_smtp_email
+from apply_channels import apply_via_email, record_blocked, send_smtp_email
 from dates_br import BRASILIA, format_brasilia, format_brasilia_date, format_cycle_label_display, format_cycle_range, parse_utc
 
 from form_rules import ensure_default_rules, list_rules, save_rules_from_form
 from job_queue import (
     ACTIVE_STATUSES,
     KIND_APPLY,
-    KIND_LINKEDIN,
     KIND_RESUME,
     KIND_WORTH_REVERIFY,
     JobQueue,
-    NonRetryableError,
 )
-from linkedin_apply import apply_via_linkedin, default_profile_dir
-from ats_router import find_handler
 from resume_pipeline import (
     AiUnavailableError,
     get_resume,
@@ -154,15 +150,7 @@ DEFAULT_SETTINGS = {
     "queue_max_workers": "3",
     "queue_max_attempts": "40",
     "queue_ttl_hours": "24",
-    # LinkedIn Easy Apply — assisted only (never auto-submit). ToS risk remains.
-    "linkedin_easy_apply": "0",
-    "linkedin_risk_ack": "0",
-    # review = preenche e voce envia; auto = robô tenta enviar sozinho
-    "apply_mode": "review",
     "linkedin_chrome_profile": "",
-    "linkedin_min_gap_minutes": "3",
-    "linkedin_human_wait_minutes": "12",
-    "linkedin_login_wait_minutes": "25",
     # Som no painel quando o copiloto pede um dado (Web Audio)
     "copilot_ask_sound": "1",
     "copilot_ask_sound_volume": "0.55",
@@ -784,13 +772,6 @@ def is_linkedin_job(job: dict) -> bool:
     return "linkedin.com" in blob or "linkedin" in str(job.get("source") or "").casefold()
 
 
-def is_assisted_apply_job(job: dict) -> bool:
-    """LinkedIn Easy Apply / external Apply, ou carreira direta de ATS suportado."""
-    if is_linkedin_job(job):
-        return True
-    return find_handler(str(job.get("url") or "")) is not None
-
-
 def mark_worth_looking(job_id: int, *, score: int, reason: str, detail: str) -> None:
     note = (
         f"Vale a pena olhar (score {score}/100). {detail} "
@@ -810,7 +791,7 @@ def mark_worth_looking(job_id: int, *, score: int, reason: str, detail: str) -> 
 
 def process_auto_job(job_id: int) -> str:
 
-    """Triagem com análise do currículo; LinkedIn vai para 'worth'. E-mail/browser só se auto_apply estiver no fluxo."""
+    """Triagem com análise do currículo; candidatura automática fica limitada a e-mail."""
     cfg = settings()
     with connect() as db:
         job_row = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
@@ -870,22 +851,15 @@ def process_auto_job(job_id: int) -> str:
         letter_row = db.execute("SELECT * FROM cover_letters WHERE job_id=?", (job_id,)).fetchone()
     cover_body = letter_row["body"] if letter_row else ""
     stamp = now_iso()
-    provider = cfg.get("ai_provider", "gemini").casefold()
-    model = cfg.get("ai_model", "gemini-2.5-flash").strip()
-    api_key = get_ai_key(provider)
     score = int(decision["match_score"])
 
-    # LinkedIn: triagem automática nunca dispara Easy Apply.
-    # Easy Apply só via botão em "Vale a pena olhar" (quando linkedin_easy_apply=1).
+    # Candidaturas via página web ficam para o usuário no Chrome com a extensão.
     if is_linkedin_job(job):
         mark_worth_looking(
             job_id,
             score=score,
             reason=decision["reason"],
-            detail=(
-                "LinkedIn — carta preparada. Use Easy Apply em Vale a pena olhar "
-                "se quiser candidatar por esse fluxo."
-            ),
+            detail="Vaga do LinkedIn — carta preparada. Abra no Chrome e use Job Autofill para preencher manualmente.",
         )
         return f"vaga {job_id}: vale a pena olhar (LinkedIn, score {score})"
 
@@ -902,29 +876,12 @@ def process_auto_job(job_id: int) -> str:
     )
     channel = "email"
     if not ok:
-        ok, detail = apply_via_browser(
-            connect,
-            job,
-            cfg,
-            cover_letter=cover_body,
-            resume_path=resume["stored_path"],
-            resume_id=int(resume["id"]),
-            cover_letter_id=cover_id,
-            resume_summary=resume["analysis_summary"] or "",
-            resume_json=resume["analysis_json"] or "",
-            provider=provider,
-            model=model,
-            api_key=api_key,
-            now_iso=now_iso(),
-        )
-        channel = "browser"
-    if not ok:
         record_blocked(connect, job_id, detail, now_iso(), int(resume["id"]), cover_id)
         mark_worth_looking(
             job_id,
             score=score,
             reason=decision["reason"],
-            detail=f"Match bom, mas envio automático falhou ({channel}): {detail}",
+            detail=f"Envio por e-mail indisponível ({detail}). Abra a vaga no Chrome e use Job Autofill.",
         )
         return f"vaga {job_id}: vale a pena olhar — {detail}"
     with connect() as db:
@@ -994,173 +951,6 @@ def handle_job_apply_job(payload: dict) -> str:
     return process_auto_job(job_id)
 
 
-def process_worth_easy_apply(job_id: int, *, queue_job_id: int | None = None, on_progress=None) -> str:
-    """Easy Apply assistido a partir de 'Vale a pena olhar' — sem nova busca/triagem."""
-    cfg = settings()
-    if cfg.get("linkedin_easy_apply") != "1":
-        raise ValueError("Ative Easy Apply LinkedIn (e o aceite de risco) no painel.")
-    if cfg.get("linkedin_risk_ack") != "1":
-        raise ValueError("Confirme o aviso de risco/ToS no painel antes do Easy Apply.")
-
-    from queue_progress import make_progress_fn, noop_progress
-
-    progress = on_progress if callable(on_progress) else make_progress_fn(queue, queue_job_id)
-    if not callable(progress):
-        progress = noop_progress
-
-    with connect() as db:
-        job_row = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
-    if not job_row:
-        raise ValueError("Vaga removida.")
-    job = dict(job_row)
-    if job.get("status") not in {"worth", "prepared", "review", "blocked"}:
-        raise ValueError(f"Status '{job.get('status')}' não permite Easy Apply manual.")
-    if not is_linkedin_job(job) and find_handler(str(job.get("url") or "")) is None:
-        raise ValueError("Esta vaga não é LinkedIn nem ATS suportado — use e-mail/formulário ou candidatura manual.")
-
-    with connect() as db:
-        decision = db.execute(
-            """SELECT match_score, reason, resume_language FROM ai_decisions
-               WHERE job_id=? ORDER BY id DESC LIMIT 1""",
-            (job_id,),
-        ).fetchone()
-        letter_row = db.execute("SELECT * FROM cover_letters WHERE job_id=?", (job_id,)).fetchone()
-
-    resume_language = (
-        (decision["resume_language"] if decision else None)
-        or job.get("language")
-        or "en"
-    ).casefold()
-    if resume_language not in {"pt", "en"}:
-        resume_language = "en"
-
-    with connect() as db:
-        resume = get_resume(db, resume_language)
-    if not resume or not (resume["analysis_summary"] or "").strip():
-        raise ValueError(f"Sem currículo analisado em {resume_language}.")
-
-    cover_id = int(letter_row["id"]) if letter_row else None
-    cover_body = letter_row["body"] if letter_row else ""
-    if not cover_body.strip():
-        try:
-            cover_id = create_cover_letter(job_id, resume_language=resume_language)
-        except AiUnavailableError:
-            raise
-        with connect() as db:
-            letter_row = db.execute("SELECT * FROM cover_letters WHERE job_id=?", (job_id,)).fetchone()
-        cover_body = letter_row["body"] if letter_row else ""
-        cover_id = int(letter_row["id"]) if letter_row else cover_id
-
-    stamp = now_iso()
-    provider = cfg.get("ai_provider", "gemini").casefold()
-    model = cfg.get("ai_model", "gemini-2.5-flash").strip()
-    api_key = get_ai_key(provider)
-    score = int(decision["match_score"]) if decision and decision["match_score"] is not None else 0
-    reason = (decision["reason"] if decision else "") or "Easy Apply manual a partir de Vale a pena olhar"
-
-    log_event("info", "linkedin", f"Easy Apply manual enfileirado/iniciado para vaga #{job_id}: {job.get('title')}")
-    progress(f"vaga #{job_id}: {job.get('title') or 'sem título'} — abrindo Chrome")
-    ok, detail = apply_via_linkedin(
-        connect,
-        job,
-        cfg,
-        cover_letter=cover_body,
-        resume_path=resume["stored_path"],
-        resume_id=int(resume["id"]),
-        cover_letter_id=cover_id,
-        resume_summary=resume["analysis_summary"] or "",
-        resume_json=resume["analysis_json"] or "",
-        provider=provider,
-        model=model,
-        api_key=api_key,
-        now_iso=stamp,
-        project_root=ROOT,
-        on_progress=progress,
-    )
-    channel = "linkedin"
-    if ok:
-        dry = "dry-run" in detail.casefold()
-        human_sent = detail.casefold().startswith(("assisted:", "auto:"))
-        # Mesma regra do fluxo automático: só sucesso real tira a vaga do worth.
-        job_status = "applied" if human_sent else ("worth" if dry else "applied")
-        with connect() as db:
-            if job_status == "applied":
-                db.execute(
-                    "UPDATE jobs SET status=?, applied_at=?, notes=? WHERE id=?",
-                    (job_status, now_iso(), detail[:900], job_id),
-                )
-            else:
-                db.execute(
-                    "UPDATE jobs SET status=?, notes=? WHERE id=?",
-                    (job_status, detail[:900], job_id),
-                )
-            db.execute(
-                """INSERT INTO ai_decisions(job_id,decided_at,match_score,should_apply,letter_required,reason,resume_language,apply_channel,apply_result)
-                   VALUES(?,?,?,?,?,?,?,?,?)""",
-                (job_id, now_iso(), score, 1, 1, reason[:1000], resume_language, channel, detail[:500]),
-            )
-        log_event(
-            "success" if human_sent else "info",
-            "linkedin",
-            f"Vaga #{job_id} Easy Apply (worth): {detail}",
-        )
-        return f"vaga {job_id}: {detail}"
-
-    record_blocked(connect, job_id, detail, now_iso(), int(resume["id"]), cover_id)
-    mark_worth_looking(
-        job_id,
-        score=score,
-        reason=reason,
-        detail=f"Easy Apply LinkedIn falhou ou indisponível: {detail}",
-    )
-    # Queue must show failed (not succeeded) — do not auto-retry auth/UI misses.
-    raise NonRetryableError(f"Easy Apply sem sucesso (vaga #{job_id}): {detail}")
-
-
-def handle_linkedin_apply_job(payload: dict) -> str:
-    job_id = int(payload.get("job_id") or 0)
-    if not job_id:
-        raise ValueError("job_id ausente no payload da fila.")
-    qid = payload.get("_queue_job_id")
-    try:
-        queue_job_id = int(qid) if qid is not None else None
-    except (TypeError, ValueError):
-        queue_job_id = None
-    return process_worth_easy_apply(job_id, queue_job_id=queue_job_id)
-
-
-def enqueue_worth_easy_apply(job_id: int) -> str:
-    """Valida e enfileira Easy Apply; o worker abre o Chrome (não bloqueia o POST)."""
-    cfg = settings()
-    if cfg.get("linkedin_easy_apply") != "1":
-        return "Ative Easy Apply LinkedIn no painel (Perfil/IA)."
-    if cfg.get("linkedin_risk_ack") != "1":
-        return "Confirme o aviso de risco/ToS no painel antes de usar Easy Apply."
-    with connect() as db:
-        job_row = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
-    if not job_row:
-        return "Vaga não encontrada."
-    job = dict(job_row)
-    if job.get("status") not in {"worth", "prepared", "blocked"}:
-        return f"Só é possível Easy Apply a partir de Vale a pena olhar (status atual: {job.get('status')})."
-    if not is_assisted_apply_job(job):
-        return "Esta vaga não parece LinkedIn nem ATS suportado (InHire, Greenhouse, Lever, Gupy)."
-    qid = queue.enqueue(KIND_LINKEDIN, {"job_id": job_id}, dedupe_key=f"linkedin:{job_id}")
-    with connect() as db:
-        # A vaga PERMANECE em 'worth' enquanto está na fila/processando — sair de
-        # lá só com resultado real (enviada). Se o worker morrer, ela não sumiu.
-        db.execute(
-            "UPDATE jobs SET notes=? WHERE id=? AND status IN ('worth','prepared','blocked')",
-            (
-                f"Na fila do Easy Apply (fila #{qid}) — a vaga continua em Vale a pena olhar "
-                "ate sair o resultado. Fique atento à janela do Chrome.",
-                job_id,
-            ),
-        )
-    log_event("info", "linkedin", f"Vaga #{job_id} enfileirada para Easy Apply/InHire (fila #{qid}).")
-    return f"Candidatura assistida enfileirada (fila #{qid}). No Chrome: revise, captcha e Enviar são com você."
-
-
 def handle_worth_reverify_job(payload: dict) -> str:
     from worth_reverify import format_summary, reverify_worth_jobs
 
@@ -1212,7 +1002,6 @@ queue = JobQueue(
     handlers={
         KIND_RESUME: handle_resume_analysis_job,
         KIND_APPLY: handle_job_apply_job,
-        KIND_LINKEDIN: handle_linkedin_apply_job,
         KIND_WORTH_REVERIFY: handle_worth_reverify_job,
     },
     get_settings=settings,
@@ -2545,8 +2334,8 @@ def queue_html(limit: int = 100) -> str:
     kind_label = {
         KIND_RESUME: "Análise de currículo",
         KIND_APPLY: "Candidatura",
-        KIND_LINKEDIN: "Easy Apply LinkedIn",
         KIND_WORTH_REVERIFY: "Reverificar Vale olhar",
+        "linkedin_apply": "Candidatura por navegador (retirada)",
     }
     status_label = {
         "pending": "Pendente",
@@ -2565,7 +2354,7 @@ def queue_html(limit: int = 100) -> str:
                 f'<form method="post" action="/queue-cancel" class="js-process-form" style="display:inline">'
                 f'<input type="hidden" name="id" value="{jid}"><button class="subtle" type="submit">Cancelar</button></form>'
             )
-        if row["status"] in {"retry_wait", "failed", "cancelled", "running"}:
+        if row["kind"] != "linkedin_apply" and row["status"] in {"retry_wait", "failed", "cancelled", "running"}:
             actions.append(
                 f'<form method="post" action="/queue-retry" class="js-process-form" style="display:inline">'
                 f'<input type="hidden" name="id" value="{jid}"><button class="subtle" type="submit">Reenfileirar</button></form>'
@@ -2946,8 +2735,6 @@ def worth_html(
         )
         return toolbar + empty
 
-    cfg = settings()
-    easy_on = cfg.get("linkedin_easy_apply") == "1" and cfg.get("linkedin_risk_ack") == "1"
     body_rows: list[str] = []
     for job in rows:
         score = job["match_score"]
@@ -2955,20 +2742,11 @@ def worth_html(
         desc = re.sub(r"<[^>]+>", " ", job["description"] or "")[:1200]
         letter = job["cover_letter"] or ""
         notes = job["notes"] or ""
-        linkedin = is_assisted_apply_job(dict(job))
-        easy_btn = ""
-        if linkedin:
-            if easy_on:
-                easy_btn = (
-                    f'<form method="post" action="/worth-easy-apply" class="js-process-form" style="display:inline">'
-                    f'<input type="hidden" name="id" value="{int(job["id"])}">'
-                    f'<button type="submit" class="red-accent-button" title="Easy Apply">'
-                    f"Easy Apply</button></form>"
-                )
-            else:
-                easy_btn = (
-                    '<button type="button" class="subtle" disabled title="Ative Easy Apply + risco">EA off</button>'
-                )
+        open_job = (
+            f'<a class="subtle" href="{esc(job["url"])}" target="_blank" rel="noreferrer" '
+            'title="Abra a vaga no Chrome e use Job Autofill">Abrir vaga + extensão</a>'
+            if job.get("url") else ""
+        )
         posted_raw = (job["posted_at"] or "").strip()
         posted_label = format_brasilia_date(posted_raw) if posted_raw else "—"
         seen_label = format_brasilia(job["first_seen_at"])
@@ -2988,7 +2766,7 @@ def worth_html(
             f"<td>{esc(seen_label)}</td>"
             f"<td>{esc(posted_label)}</td>"
             f"<td>{details}</td>"
-            f'<td class="worth-actions">{easy_btn}'
+            f'<td class="worth-actions">{open_job}'
             f'<form method="post" action="/job-status" class="js-process-form" style="display:inline">'
             f'<input type="hidden" name="id" value="{int(job["id"])}">'
             f'<button class="subtle" name="status" value="applied" type="submit">Aplicada</button>'
@@ -3682,7 +3460,7 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
 <button type="button" class="tab" data-tab="curriculos">Currículos</button>
 <button type="button" class="tab" data-tab="perfil">Perfil &amp; diversidade</button>
 <button type="button" class="tab" data-tab="ia">IA &amp; integrações</button>
-<button type="button" class="tab" data-tab="automacao">Automação &amp; LinkedIn</button>
+<button type="button" class="tab" data-tab="automacao">Automação</button>
 <button type="button" class="tab" data-tab="smtp">SMTP</button>
 </nav>
 <div class="sidebar-foot"><span id="collector-state">{esc(state_label)}</span><br><span id="collector-countdown">{collector_timer_html}</span></div>
@@ -3704,11 +3482,11 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
 
 <div id="tab-ia" class="tab-panel"><section class="panel"><h2>IA &amp; integrações</h2><form method="post" action="/ai-settings"><div class="form-grid"><label>Provedor de IA<select name="ai_provider"><option value="gemini" {'selected' if cfg.get('ai_provider') == 'gemini' else ''}>Gemini</option><option value="openai" {'selected' if cfg.get('ai_provider') == 'openai' else ''}>OpenAI</option></select></label><label>Modelo<input name="ai_model" value="{esc(cfg.get('ai_model','gemini-2.5-flash'))}"></label><label>Motor de navegador<select name="browser_engine"><option value="pydoll" {'selected' if cfg.get('browser_engine','pydoll') == 'pydoll' else ''}>Pydoll (CDP, stealth — padrão)</option><option value="playwright" {'selected' if cfg.get('browser_engine','pydoll') == 'playwright' else ''}>Playwright (fallback)</option></select></label><label>Chave de IA (vazio mantém a salva)<input type="password" name="api_key" autocomplete="new-password"></label><label>Adzuna App ID<input name="adzuna_app_id" value=""></label><label>Adzuna API key<input type="password" name="adzuna_app_key" value=""></label><label>Token Apify<input type="password" name="apify_token" value="" autocomplete="new-password"></label></div><label style="margin-top:14px">Fatos profissionais em português<textarea name="candidate_facts_pt" rows="3">{esc(cfg.get('candidate_facts_pt',''))}</textarea></label><label style="margin-top:12px">Professional facts in English<textarea name="candidate_facts_en" rows="3">{esc(cfg.get('candidate_facts_en',''))}</textarea></label><p class="hint">Chaves vão para o cofre do sistema. Os fatos alimentam a IA nas perguntas abertas e de opções.</p><button style="margin-top:14px">Salvar IA e integrações</button></form></section><section class="panel"><h2>Regras de formulário (navegador)</h2><form method="post" action="/profile-settings">{rules_panel}<p class="hint">Modo <code>salary</code> escolhe automaticamente BRL×USD pela moeda do campo e aplica o multiplicador PJ ao valor BRL quando a contratação preferida é PJ; "Valor fixo" só é usado como desempate. No modo <code>select</code>, coloque em "Valor fixo" o texto da opção preferida. Perguntas abertas sem regra usam a IA.</p><button>Salvar regras</button></form></section></div>
 
-<div id="tab-automacao" class="tab-panel"><section class="panel"><h2>Automação &amp; LinkedIn</h2><form method="post" action="/automation-settings"><label style="margin:0 0 12px;display:flex;gap:8px;align-items:flex-start"><input type="checkbox" name="auto_apply" value="1" {'checked' if cfg.get('auto_apply') == '1' else ''} style="width:auto;margin-top:3px"> <span>Após a coleta, enfileirar e triar vagas novas automaticamente (e-mail SMTP / formulário público quando possível). <em>Não</em> dispara Easy Apply LinkedIn.</span></label><label style="margin:0 0 12px;display:flex;gap:8px;align-items:flex-start"><input type="checkbox" name="linkedin_easy_apply" value="1" {'checked' if cfg.get('linkedin_easy_apply') == '1' else ''} style="width:auto;margin-top:3px"> <span>Habilitar Easy Apply LinkedIn (ATS externo incluso) — só pelo botão em <strong>Vale a pena olhar</strong>, nunca na triagem automática</span></label><fieldset style="margin:0 0 14px;border:1px solid var(--line);border-radius:10px;padding:12px 14px"><legend style="padding:0 6px;color:var(--muted);font-size:13px">Modo de envio</legend><label style="margin:0 0 8px;display:flex;gap:8px;align-items:flex-start"><input type="radio" name="apply_mode" value="review" {'checked' if (cfg.get('apply_mode') or 'review') != 'auto' else ''} style="width:auto;margin-top:3px"> <span><strong>Revisar e enviar eu mesmo</strong> — o robô/IA preenche tudo; você confere e clica Enviar</span></label><label style="margin:0;display:flex;gap:8px;align-items:flex-start"><input type="radio" name="apply_mode" value="auto" {'checked' if cfg.get('apply_mode') == 'auto' else ''} style="width:auto;margin-top:3px"> <span><strong>Enviar automaticamente</strong> — tenta concluir sozinho (só marca enviado com confirmação na página; captcha pode ainda pedir você)</span></label></fieldset><label style="margin:0 0 18px;display:flex;gap:8px;align-items:flex-start"><input type="checkbox" name="linkedin_risk_ack" value="1" {'checked' if cfg.get('linkedin_risk_ack') == '1' else ''} style="width:auto;margin-top:3px"> <span>Li e aceito: automação no LinkedIn pode violar os termos deles e gerar restrição/banimento; uso por minha conta e risco</span></label><div class="form-grid"><label>Score mínimo (%)<input name="minimum_match_score" type="number" min="0" max="100" value="{esc(cfg.get('minimum_match_score','80'))}"></label><label>Workers da fila (vagas em paralelo)<input name="queue_max_workers" type="number" min="1" max="8" value="{esc(cfg.get('queue_max_workers','3'))}"></label><label>Máx. tentativas por job<input name="queue_max_attempts" type="number" min="1" max="200" value="{esc(cfg.get('queue_max_attempts','40'))}"></label><label>TTL da fila (horas)<input name="queue_ttl_hours" type="number" min="1" max="168" value="{esc(cfg.get('queue_ttl_hours','24'))}"></label><label>Intervalo mínimo entre Easy Apply (min, 1–30)<input name="linkedin_min_gap_minutes" type="number" min="1" max="30" value="{esc(cfg.get('linkedin_min_gap_minutes','3'))}"></label><label>Tempo para você revisar/enviar (min)<input name="linkedin_human_wait_minutes" type="number" min="3" max="45" value="{esc(cfg.get('linkedin_human_wait_minutes','12'))}"></label><label>Tempo para login manual (min)<input name="linkedin_login_wait_minutes" type="number" min="5" max="60" value="{esc(cfg.get('linkedin_login_wait_minutes','25'))}"></label><label>Perfil Chrome dedicado<input name="linkedin_chrome_profile" value="{esc(cfg.get('linkedin_chrome_profile') or '')}" placeholder="{esc(default_profile_dir(ROOT))}"></label><label>Volume do som do copiloto (0–100)<input name="copilot_ask_sound_volume" type="number" min="0" max="100" value="{esc(str(int(round(_copilot_ask_volume(cfg) * 100))))}"></label></div><label style="margin:12px 0 18px;display:flex;gap:8px;align-items:flex-start"><input type="checkbox" name="copilot_ask_sound" value="1" {'checked' if cfg.get('copilot_ask_sound', '1') == '1' else ''} style="width:auto;margin-top:3px"> <span>Tocar som de notificação no painel quando o copiloto pedir um dado</span></label><p class="hint">Triagem automática manda LinkedIn para <em>Vale a pena olhar</em> com a carta pronta. Easy Apply só roda quando você clica o botão nessa aba (e só com o aceite de risco). Modo <em>revisão</em> preenche e você envia; modo <em>auto</em> tenta enviar sozinho.</p><button style="margin-top:14px">Salvar automação</button></form></section></div>
+<div id="tab-automacao" class="tab-panel"><section class="panel"><h2>Automação</h2><form method="post" action="/automation-settings"><label style="margin:0 0 12px;display:flex;gap:8px;align-items:flex-start"><input type="checkbox" name="auto_apply" value="1" {'checked' if cfg.get('auto_apply') == '1' else ''} style="width:auto;margin-top:3px"> <span>Após a coleta, enfileirar e triar vagas novas automaticamente. O envio automático fica limitado a e-mail SMTP; formulários são preenchidos por você no Chrome com a extensão.</span></label><div class="form-grid"><label>Score mínimo (%)<input name="minimum_match_score" type="number" min="0" max="100" value="{esc(cfg.get('minimum_match_score','80'))}"></label><label>Workers da fila (vagas em paralelo)<input name="queue_max_workers" type="number" min="1" max="8" value="{esc(cfg.get('queue_max_workers','3'))}"></label><label>Máx. tentativas por job<input name="queue_max_attempts" type="number" min="1" max="200" value="{esc(cfg.get('queue_max_attempts','40'))}"></label><label>TTL da fila (horas)<input name="queue_ttl_hours" type="number" min="1" max="168" value="{esc(cfg.get('queue_ttl_hours','24'))}"></label><label>Perfil Chrome para reverificar vagas LinkedIn<input name="linkedin_chrome_profile" value="{esc(cfg.get('linkedin_chrome_profile') or '')}" placeholder="{esc(os.path.join(ROOT, 'linkedin_browser_profile'))}"></label><label>Volume do som do copiloto (0–100)<input name="copilot_ask_sound_volume" type="number" min="0" max="100" value="{esc(str(int(round(_copilot_ask_volume(cfg) * 100))))}"></label></div><label style="margin:12px 0 18px;display:flex;gap:8px;align-items:flex-start"><input type="checkbox" name="copilot_ask_sound" value="1" {'checked' if cfg.get('copilot_ask_sound', '1') == '1' else ''} style="width:auto;margin-top:3px"> <span>Tocar som de notificação no painel quando o copiloto pedir um dado</span></label><p class="hint">Vagas de formulário ficam em <em>Vale a pena olhar</em>. Abra a vaga no Chrome e use Job Autofill; revise e envie manualmente.</p><button style="margin-top:14px">Salvar automação</button></form></section></div>
 
 <div id="tab-smtp" class="tab-panel"><section class="panel"><h2>SMTP</h2><form method="post" action="/smtp-settings"><div class="form-grid"><label>Host<input name="smtp_host" value="{esc(cfg.get('smtp_host',''))}"></label><label>Porta<input name="smtp_port" type="number" value="{esc(cfg.get('smtp_port','587'))}"></label><label>Usuário<input name="smtp_user" value="{esc(cfg.get('smtp_user',''))}"></label><label>Remetente (From)<input name="smtp_from" value="{esc(cfg.get('smtp_from',''))}"></label><label>Senha (vazio mantém)<input type="password" name="smtp_password" autocomplete="new-password"></label><label>TLS<select name="smtp_use_tls"><option value="1" {'selected' if cfg.get('smtp_use_tls','1')=='1' else ''}>Sim (STARTTLS)</option><option value="0" {'selected' if cfg.get('smtp_use_tls')=='0' else ''}>Não</option></select></label></div><div class="actions"><button>Salvar SMTP</button></div></form><form method="post" action="/smtp-test" style="margin-top:8px"><button class="subtle" type="submit">Enviar e-mail de teste</button></form></section></div>
 
-<div id="tab-vale" class="tab-panel"><section class="panel"><h2>Vale a pena olhar</h2><p class="hint">Vagas LinkedIn com bom match (triagem automática <em>nunca</em> candidata sozinha) ou em que e-mail/formulário automático falhou. Use <strong>Easy Apply</strong> só quando quiser candidatar — o fluxo abre o Chrome e você controla o envio.</p><div id="worth-body">{worth_view}</div></section></div>
+<div id="tab-vale" class="tab-panel"><section class="panel"><h2>Vale a pena olhar</h2><p class="hint">Vagas que merecem revisão manual ou cujo envio por e-mail não foi possível. Abra a vaga no Chrome e use a extensão Job Autofill para preencher o formulário.</p><div id="worth-body">{worth_view}</div></section></div>
 
 <div id="worth-ignore-modal" class="modal" hidden>
   <div class="modal-backdrop" data-worth-ignore-dismiss></div>
@@ -4459,7 +4237,6 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
     "/queue-clear": 1,
     "/clear-logs": 1,
     "/usage-refresh": 1,
-    "/worth-easy-apply": 1,
     "/worth-reverify": 1,
     "/job-status": 1,
     "/worth-ignore-all": 1,
@@ -4514,7 +4291,7 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
           var fileInput = form.querySelector('input[type="file"]');
           if (fileInput) fileInput.value = "";
         }}
-        if (path === "/job-status" || path === "/worth-ignore-all" || path === "/worth-reverify" || path === "/worth-easy-apply") {{
+        if (path === "/job-status" || path === "/worth-ignore-all" || path === "/worth-reverify") {{
           requestWorthRefresh();
         }} else {{
           refresh();
@@ -4738,6 +4515,35 @@ class Handler(BaseHTTPRequestHandler):
                     "linkedin": (cfg.get("candidate_linkedin") or "").strip(),
                 }
             })
+            return
+        if path == "/api/autofill-rules":
+            # Share only field labels/aliases with the browser extension. Rule
+            # values, resume paths, facts, and other profile details stay server-side.
+            extension_keys = {
+                "full_name": "fullName",
+                "email": "email",
+                "phone": "phone",
+                "linkedin": "linkedin",
+                "city": "city",
+                "street_address": "streetAddress",
+                "postal_code": "zip",
+                "state": "state",
+                "country": "country",
+                "current_company": "currentCompany",
+                "cpf": "cpf",
+                "salary": "salaryExpectation",
+                "contract_type": "contractType",
+            }
+            with connect() as db:
+                rules = list_rules(db)
+            fields = []
+            for rule in rules:
+                key = extension_keys.get(str(rule["key"]).casefold())
+                if not key or str(rule["mode"]).casefold() == "skip":
+                    continue
+                aliases = [part.strip() for part in re.split(r"[,\n;]", str(rule["aliases"] or "")) if part.strip()]
+                fields.append({"key": key, "aliases": aliases})
+            self.send_extension_json({"fields": fields})
             return
         self.send_page(render_page())
 
@@ -4974,19 +4780,8 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/automation-settings":
             if "auto_apply" not in form:
                 form["auto_apply"] = "0"
-            if "linkedin_easy_apply" not in form:
-                form["linkedin_easy_apply"] = "0"
-            if "linkedin_risk_ack" not in form:
-                form["linkedin_risk_ack"] = "0"
             if "copilot_ask_sound" not in form:
                 form["copilot_ask_sound"] = "0"
-            from apply_mode import normalize_apply_mode
-
-            form["apply_mode"] = normalize_apply_mode(form.get("apply_mode"))
-            # Assisted-only: strip legacy flags if present in form posts.
-            form.pop("linkedin_stop_before_submit", None)
-            form.pop("linkedin_max_per_day", None)
-            form.pop("inhire_pcd", None)
             try:
                 vol = float(form.get("copilot_ask_sound_volume") or "55")
                 if vol > 1.0:
@@ -4999,9 +4794,7 @@ class Handler(BaseHTTPRequestHandler):
                 "info",
                 "settings",
                 f"Automação salva (auto_apply={form.get('auto_apply')}, "
-                f"linkedin_easy_apply={form.get('linkedin_easy_apply')}, "
-                f"apply_mode={form.get('apply_mode')}, "
-                f"risk_ack={form.get('linkedin_risk_ack')}).",
+                f"copilot_ask_sound={form.get('copilot_ask_sound')}).",
             )
             self.redirect("Automação salva.")
         elif path == "/smtp-settings":
@@ -5088,22 +4881,6 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/stop":
             collector.stop()
             self.respond_notice("Solicitação para parar enviada.")
-        elif path == "/worth-easy-apply":
-            job_id = int(form["id"]) if form.get("id", "").isdigit() else 0
-            if not job_id:
-                self.respond_notice("ID da vaga inválido.", notice_kind="error", ok=False)
-                return
-            note = enqueue_worth_easy_apply(job_id)
-            kind = (
-                "error"
-                if note.startswith("Ative")
-                or note.startswith("Confirme")
-                or note.startswith("Só")
-                or note.startswith("Esta")
-                or note.startswith("Vaga não")
-                else "info"
-            )
-            self.respond_notice(note, notice_kind=kind, ok=kind != "error")
         elif path == "/job-status":
             if form.get("status") in STATUSES and form.get("id", "").isdigit():
                 with connect() as db:
