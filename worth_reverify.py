@@ -1,20 +1,14 @@
-"""Reverifica vagas em 'worth': HTTP primeiro; browser para LinkedIn/inconclusivo."""
+"""Browser-free liveness checks for jobs in the review list."""
 from __future__ import annotations
 
 import logging
-import os
 import re
-import threading
-import time
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 
 LOG = logging.getLogger("job-scraper")
-_LINKEDIN_LIVENESS_LOCK = threading.Lock()
-_LINKEDIN_LIVENESS_LOCK_WAIT_SECONDS = 20 * 60
-
 ConnectFn = Callable[[], Any]
 AbortFn = Callable[[], bool]
 
@@ -23,54 +17,48 @@ ACTIVE = "active"
 UNKNOWN = "unknown"
 
 INACTIVE_RE = re.compile(
-    # LinkedIn EN: "applicants" / "applications" / "candidates".
     r"no\s+longer\s+accept\w*\s+(?:applications?|applicants?|candidates?)|"
-    r"no\s+longer\s+open|"
-    r"this\s+job\s+is\s+no\s+longer\s+available|"
-    r"job\s+has\s+been\s+filled|"
-    r"position\s+has\s+been\s+filled|"
-    # "not accepting applications (now|right now|at this time)"
+    r"no\s+longer\s+open|this\s+job\s+is\s+no\s+longer\s+available|"
+    r"job\s+has\s+been\s+filled|position\s+has\s+been\s+filled|"
     r"(?:is\s+)?not\s+(?:currently\s+)?accepting\s+(?:applications?|applicants?|candidates?)|"
-    # LinkedIn PT: "Não aceita mais candidaturas" / "Não aceita candidaturas agora"
-    r"n[aã]o\s+aceita(?:mos)?\s+(?:mais\s+)?candidaturas|"
-    r"closed-job(?:__flavor)?|"
+    r"n[aã]o\s+aceita(?:mos)?\s+(?:mais\s+)?candidaturas|closed-job(?:__flavor)?|"
     r"esta\s+vaga\s+n[aã]o\s+est[aá]\s+mais\s+aceitando|"
     r"esta\s+vaga\s+n[aã]o\s+est[aá]\s+mais\s+dispon[ií]vel|"
-    r"vaga\s+(encerrada|expirada|indispon[ií]vel)|"
+    r"vaga\s+(?:encerrada|expirada|indispon[ií]vel)|"
     r"n[aã]o\s+est(?:[aá]|amos)\s+mais\s+aceitando\s+candidaturas|"
     r"n[aã]o\s+estamos\s+mais\s+recebendo\s+candidaturas|"
-    r"\bcandidaturas?\s+encerradas?\b|"
-    r"inscri[cç][oõ]es?\s+encerradas?|"
-    r"application\s+deadline\s+has\s+passed|"
-    r"this\s+position\s+is\s+closed",
+    r"\bcandidaturas?\s+encerradas?\b|inscri[cç][oõ]es?\s+encerradas?|"
+    r"application\s+deadline\s+has\s+passed|this\s+position\s+is\s+closed",
     re.I,
 )
-
 ACTIVE_RE = re.compile(
     r"apply\s+now|candidatar(-se)?|enviar\s+candidatura|"
-    r"submit\s+application|apply\s+for\s+this\s+(job|role)|"
-    r"finalizar\s+candidatura",
+    r"submit\s+application|apply\s+for\s+this\s+(job|role)|finalizar\s+candidatura",
     re.I,
 )
+LINKEDIN_JOB_ID_RE = re.compile(
+    r"linkedin\.com/(?:[\w.-]+/)?jobs/view/(?:[\w%-]*?-)?(\d+)", re.I
+)
+GUEST_APPLY_MARKERS = (
+    "public_jobs_apply-link-onsite",
+    "public_jobs_apply-link-offsite",
+    "job-details-topcard-apply-modal",
+    "topcard-apply",
+)
+USER_AGENT = "JobScraper/1.0 (public job availability check)"
 
 
 def text_indicates_closed(text: str) -> bool:
-    """True se o texto deixa claro que a vaga não aceita mais candidaturas."""
     return bool(INACTIVE_RE.search(text or ""))
 
 
 def apify_item_indicates_closed(item: dict) -> bool:
-    """Usado só no filtro de coleta Apify — sinais no payload, sem HTTP/browser."""
+    """Detect closed-job flags in public Apify actor results during collection."""
     if not isinstance(item, dict):
         return False
     for key in (
-        "closed",
-        "isClosed",
-        "jobClosed",
-        "applicationsClosed",
-        "isJobClosed",
-        "expired",
-        "isExpired",
+        "closed", "isClosed", "jobClosed", "applicationsClosed", "isJobClosed",
+        "expired", "isExpired",
     ):
         val = item.get(key)
         if val is True or str(val).strip().casefold() in {"1", "true", "yes"}:
@@ -83,536 +71,149 @@ def apify_item_indicates_closed(item: dict) -> bool:
     blob = " ".join(
         str(item.get(k) or "")
         for k in (
-            "title",
-            "position",
-            "jobTitle",
-            "displayTitle",
-            "descriptionText",
-            "descriptionHtml",
-            "description",
-            "jobDescription",
-            "jobDescriptionHTML",
-            "closedJobText",
-            "jobStateMessage",
+            "title", "position", "jobTitle", "displayTitle", "descriptionText",
+            "descriptionHtml", "description", "jobDescription", "jobDescriptionHTML",
+            "closedJobText", "jobStateMessage",
         )
     )
     return text_indicates_closed(blob)
 
 
-# Erro transitório do LinkedIn — não é sinal de vaga ativa/fechada; não esperar timeout.
-LOAD_ERROR_RE = re.compile(
-    r"n[aã]o\s+foi\s+poss[ií]vel\s+carregar\s+a\s+p[aá]gina|"
-    r"couldn[’’']?t\s+load\s+(the\s+)?page|"
-    r"could\s+not\s+load\s+(the\s+)?page|"
-    r"unable\s+to\s+load\s+(the\s+)?page|"
-    r"page\s+isn[’’']?t\s+available|"
-    r"something\s+went\s+wrong",
-    re.I,
-)
-
-USER_AGENT = "JobScraperLocal/0.1 (personal job search; liveness check)"
-DEFAULT_PAGE_WAIT_MS = 25_000
-DEFAULT_POLL_MS = 500
-# Após o 1º sinal de "ativa", espera mais este tempo por um banner de fechamento
-# que o SPA LinkedIn pode hidratar com atraso.
-ACTIVE_CONFIRM_GRACE_MS = 5_000
-
-LINKEDIN_JOB_ID_RE = re.compile(
-    r"linkedin\.com/(?:[\w.-]+/)?jobs/view/(?:[\w%-]*?-)?(\d+)",
-    re.I,
-)
-# Controles de candidatura no HTML guest (mais estáveis que o texto do botão).
-GUEST_APPLY_MARKERS = (
-    "public_jobs_apply-link-onsite",
-    "public_jobs_apply-link-offsite",
-    "job-details-topcard-apply-modal",
-    "topcard-apply",
-)
-
-
-def needs_browser_check(url: str) -> bool:
-    host = (urlparse(url or "").netloc or "").casefold()
-    return "linkedin.com" in host
-
-
 def extract_linkedin_job_id(url: str) -> str | None:
     raw = (url or "").strip()
-    if not raw:
-        return None
-    m = LINKEDIN_JOB_ID_RE.search(raw)
-    if m:
-        return m.group(1)
+    match = LINKEDIN_JOB_ID_RE.search(raw)
+    if match:
+        return match.group(1)
     try:
-        from urllib.parse import parse_qs, urlparse as _up
-
-        qs = parse_qs(_up(raw).query or "")
+        query = parse_qs(urlparse(raw).query or "")
         for key in ("currentJobId", "jobId", "trkJobId"):
-            vals = qs.get(key) or []
-            if vals and str(vals[0]).isdigit():
-                return str(vals[0])
+            values = query.get(key) or []
+            if values and str(values[0]).isdigit():
+                return str(values[0])
     except Exception:
         pass
     return None
 
 
-def classify_http(status: int, body: str) -> str:
-    if status in {404, 410, 451}:
-        return INACTIVE
-    if status >= 500 or status in {401, 403}:
-        return UNKNOWN
-    text = body or ""
-    if INACTIVE_RE.search(text):
-        return INACTIVE
-    if ACTIVE_RE.search(text):
-        return ACTIVE
-    if status != 200:
-        return UNKNOWN
-    return UNKNOWN
-
-
-def fetch_url_text(
-    url: str,
-    *,
-    timeout: float = 20.0,
-    accept_language: str = "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
-) -> tuple[int, str]:
+def fetch_url_text(url: str, *, timeout: float = 12.0) -> tuple[int, str]:
     req = Request(
         url,
         headers={
             "User-Agent": USER_AGENT,
             "Accept": "text/html,application/xhtml+xml",
-            "Accept-Language": accept_language,
+            "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
         },
         method="GET",
     )
     try:
-        with urlopen(req, timeout=timeout) as resp:
-            raw = resp.read(400_000)
-            charset = "utf-8"
-            ctype = (resp.headers.get_content_charset() or "").strip()
-            if ctype:
-                charset = ctype
+        with urlopen(req, timeout=timeout) as response:
+            raw = response.read(300_000)
+            charset = response.headers.get_content_charset() or "utf-8"
             try:
-                text = raw.decode(charset, errors="replace")
+                body = raw.decode(charset, errors="replace")
             except LookupError:
-                text = raw.decode("utf-8", errors="replace")
-            return int(resp.status), text
+                body = raw.decode("utf-8", errors="replace")
+            return int(response.status), body
     except HTTPError as exc:
-        raw = exc.read(200_000) if hasattr(exc, "read") else b""
-        try:
-            text = raw.decode("utf-8", errors="replace")
-        except Exception:
-            text = ""
-        return int(exc.code), text
-    except URLError:
+        raw = exc.read(100_000) if hasattr(exc, "read") else b""
+        return int(exc.code), raw.decode("utf-8", errors="replace")
+    except (URLError, TimeoutError, OSError):
         return 0, ""
     except Exception:
         return 0, ""
 
 
-def check_http_liveness(url: str, *, timeout: float = 20.0) -> tuple[str, str]:
-    if not (url or "").strip():
-        return UNKNOWN, "URL vazia"
-    status, body = fetch_url_text(url, timeout=timeout)
-    if status == 0:
-        return UNKNOWN, "falha de rede"
-    verdict = classify_http(status, body)
-    return verdict, f"HTTP {status}"
+def classify_http(status: int, body: str) -> str:
+    if status in {404, 410, 451}:
+        return INACTIVE
+    if status >= 500 or status in {0, 401, 403}:
+        return UNKNOWN
+    if INACTIVE_RE.search(body or ""):
+        return INACTIVE
+    if ACTIVE_RE.search(body or ""):
+        return ACTIVE
+    return UNKNOWN
 
 
-def check_linkedin_guest_liveness(job_id: str, *, timeout: float = 20.0) -> tuple[str, str]:
-    """Checa vaga LinkedIn via endpoint guest (sem login). Preferível ao SPA."""
+def check_linkedin_guest_liveness(job_id: str, *, timeout: float = 12.0) -> tuple[str, str]:
+    """Use LinkedIn's publicly accessible guest job-posting endpoint, without login/browser."""
     jid = str(job_id or "").strip()
     if not jid.isdigit():
-        return UNKNOWN, "guest: job id inválido"
-    url = f"https://www.linkedin.com/jobs-guest/jobs/api/jobPosting/{jid}"
-    status, body = fetch_url_text(url, timeout=timeout)
+        return UNKNOWN, "ID público da vaga indisponível"
+    status, body = fetch_url_text(
+        f"https://www.linkedin.com/jobs-guest/jobs/api/jobPosting/{jid}", timeout=timeout
+    )
     if status == 0:
-        return UNKNOWN, "guest: falha de rede"
-    if status in {404, 410, 451}:
-        return INACTIVE, f"guest HTTP {status}"
-    if status >= 500 or status in {401, 403}:
-        return UNKNOWN, f"guest HTTP {status}"
+        return UNKNOWN, "endpoint público indisponível"
     verdict = classify_http(status, body)
     if verdict == INACTIVE:
-        return INACTIVE, "guest: vaga fechada"
+        return INACTIVE, f"endpoint público HTTP {status} indica vaga encerrada"
     if any(marker in body for marker in GUEST_APPLY_MARKERS):
-        return ACTIVE, "guest: candidatura disponível"
+        return ACTIVE, "endpoint público mostra candidatura disponível"
     if verdict == ACTIVE:
-        return ACTIVE, "guest: sinal de candidatura"
-    return UNKNOWN, f"guest HTTP {status} sem sinal claro"
+        return ACTIVE, "endpoint público mostra sinal de candidatura"
+    return UNKNOWN, f"endpoint público HTTP {status} sem sinal conclusivo"
 
 
-def page_has_load_error(body: str) -> bool:
-    return bool(LOAD_ERROR_RE.search(body or ""))
-
-
-def read_liveness_text(page) -> str:
-    """Prefere o card principal da vaga para evitar texto de vagas similares."""
-    try:
-        snippet = page.evaluate(
-            """() => {
-              const sels = [
-                '.job-details-jobs-unified-top-card',
-                '.jobs-unified-top-card',
-                '.jobs-details-top-card',
-                '.jobs-details__main-content',
-                'main'
-              ];
-              for (const s of sels) {
-                const el = document.querySelector(s);
-                if (el && el.innerText && el.innerText.trim().length > 20) {
-                  return el.innerText.slice(0, 12000);
-                }
-              }
-              return (document.body && document.body.innerText || '').slice(0, 12000);
-            }"""
-        )
-        if isinstance(snippet, str) and snippet.strip():
-            return snippet
-    except Exception:
-        pass
-    try:
-        return page.content() or ""
-    except Exception:
-        return ""
-
-
-def wait_page_liveness_signal(
-    page,
-    *,
-    timeout_ms: int = DEFAULT_PAGE_WAIT_MS,
-    poll_ms: int = DEFAULT_POLL_MS,
-    should_abort: AbortFn | None = None,
-) -> tuple[str, str]:
-    """Espera sinal claro (ativa/inativa) no HTML; senão timeout → unknown.
-
-    Inativa retorna na hora. Ativa só no fim do prazo, pois sinais da página
-    podem aparecer antes do banner definitivo de vaga fechada.
-    """
-    deadline = time.monotonic() + max(0.05, timeout_ms / 1000.0)
-    last_detail = "sem leitura"
-    saw_active = False
-    active_since: float | None = None
-    grace_s = max(0.0, ACTIVE_CONFIRM_GRACE_MS / 1000.0)
-    while True:
-        if should_abort and should_abort():
-            return UNKNOWN, "abortado"
-        final_url = getattr(page, "url", "") or ""
-        host_path = final_url.casefold()
-        if any(tok in host_path for tok in ("/login", "authwall", "/checkpoint", "/challenge")):
-            return UNKNOWN, "login/authwall LinkedIn"
-        body = ""
-        try:
-            body = read_liveness_text(page)
-        except Exception as exc:
-            last_detail = f"content: {exc}"
-            body = ""
-        if page_has_load_error(body):
-            return UNKNOWN, "não foi possível carregar a página"
-        verdict = classify_http(200, body)
-        now = time.monotonic()
-        if verdict == INACTIVE:
-            return INACTIVE, "browser: vaga fechada"
-        if verdict == ACTIVE:
-            saw_active = True
-            if active_since is None:
-                active_since = now
-            last_detail = "sinal de candidatura (aguardando possível fechamento)"
-            if grace_s <= 0 or now >= active_since + grace_s:
-                return ACTIVE, "browser: candidatura disponível"
-        else:
-            last_detail = "HTML ainda sem sinal claro"
-        if now >= deadline:
-            if saw_active:
-                return ACTIVE, "browser: candidatura disponível"
-            return UNKNOWN, f"timeout esperando sinal ({last_detail})"
-        try:
-            page.wait_for_timeout(max(1, int(poll_ms)))
-        except Exception:
-            time.sleep(max(0.001, poll_ms / 1000.0))
-
-
-class LinkedInLivenessSession:
-    """Uma sessão Chrome para várias URLs LinkedIn (não abre/fecha por vaga)."""
-
-    def __init__(
-        self,
-        *,
-        cfg: dict[str, str] | None = None,
-        project_root: str = "",
-        page_timeout_ms: int = DEFAULT_PAGE_WAIT_MS,
-        goto_timeout_ms: int = 60_000,
-        should_abort: AbortFn | None = None,
-    ) -> None:
-        self.cfg = cfg or {}
-        self.project_root = project_root or "."
-        self.page_timeout_ms = page_timeout_ms
-        self.goto_timeout_ms = goto_timeout_ms
-        self.should_abort = should_abort
-        self._playwright = None
-        self._context = None
-        self._page = None
-        self._lock_held = False
-
-    def __enter__(self) -> "LinkedInLivenessSession":
-        from browser_engine import (
-            BACKGROUND_RUN_ARGS,
-            persistent_launch_kwargs,
-            resolve_sync_playwright,
-        )
-        profile = (self.cfg.get("linkedin_chrome_profile") or "").strip() or os.path.join(
-            self.project_root, "linkedin_browser_profile"
-        )
-        acquired = _LINKEDIN_LIVENESS_LOCK.acquire(timeout=min(120, _LINKEDIN_LIVENESS_LOCK_WAIT_SECONDS))
-        if not acquired:
-            raise RuntimeError("perfil Chrome ocupado por outra reverificação")
-        self._lock_held = True
-        try:
-            module = resolve_sync_playwright(self.cfg)
-            sync_playwright = module.sync_playwright
-            self._playwright = sync_playwright().start()
-            launch_kwargs = persistent_launch_kwargs(
-                profile,
-                headless=False,
-                viewport={"width": 1280, "height": 900},
-                locale="en-US",
-                args=list(BACKGROUND_RUN_ARGS),
-            )
-            try:
-                self._context = self._playwright.chromium.launch_persistent_context(
-                    channel="chrome", **launch_kwargs
-                )
-            except Exception:
-                self._context = self._playwright.chromium.launch_persistent_context(**launch_kwargs)
-            self._page = self._context.pages[0] if self._context.pages else self._context.new_page()
-            LOG.info("worth-reverify: sessão Chrome aberta para lote LinkedIn")
-            return self
-        except Exception:
-            self.__exit__(None, None, None)
-            raise
-
-    def __exit__(self, exc_type, exc, tb) -> bool:
-        try:
-            if self._context is not None:
-                self._context.close()
-        except Exception:
-            pass
-        self._context = None
-        self._page = None
-        try:
-            if self._playwright is not None:
-                self._playwright.stop()
-        except Exception:
-            pass
-        self._playwright = None
-        if self._lock_held:
-            try:
-                _LINKEDIN_LIVENESS_LOCK.release()
-            except Exception:
-                pass
-            self._lock_held = False
-        LOG.info("worth-reverify: sessão Chrome fechada")
-        return False
-
-    def check_url(self, url: str) -> tuple[str, str]:
-        if self._page is None:
-            return UNKNOWN, "sessão Chrome ausente"
-        try:
-            self._page.goto(url, wait_until="domcontentloaded", timeout=self.goto_timeout_ms)
-        except Exception as exc:
-            return UNKNOWN, f"goto: {exc}"
-        # Pausa inicial para o shell SPA começar a hidratar.
-        try:
-            self._page.wait_for_timeout(2000)
-        except Exception:
-            time.sleep(2.0)
-        try:
-            self._page.mouse.wheel(0, 400)
-        except Exception:
-            pass
-        verdict, detail = wait_page_liveness_signal(
-            self._page,
-            timeout_ms=self.page_timeout_ms,
-            poll_ms=DEFAULT_POLL_MS,
-            should_abort=self.should_abort,
-        )
-        # Erro de carga do LinkedIn: um reload e tenta de novo; se persistir, segue o lote.
-        if verdict == UNKNOWN and "carregar a página" in detail.casefold():
-            LOG.info("worth-reverify: load error em %s — reload 1x", url)
-            try:
-                self._page.reload(wait_until="domcontentloaded", timeout=self.goto_timeout_ms)
-            except Exception as exc:
-                return UNKNOWN, f"reload: {exc}"
-            try:
-                self._page.wait_for_timeout(2000)
-            except Exception:
-                time.sleep(2.0)
-            verdict, detail = wait_page_liveness_signal(
-                self._page,
-                timeout_ms=self.page_timeout_ms,
-                poll_ms=DEFAULT_POLL_MS,
-                should_abort=self.should_abort,
-            )
-            if verdict == UNKNOWN and "carregar a página" in detail.casefold():
-                return UNKNOWN, "não foi possível carregar a página (após reload)"
-        return verdict, detail
-
-
-def check_job_liveness(
-    job: dict,
-    *,
-    cfg: dict[str, str] | None = None,
-    project_root: str = "",
-    http_timeout: float = 20.0,
-    browser_session: LinkedInLivenessSession | None = None,
-) -> tuple[str, str]:
+def check_job_liveness(job: dict, *, http_timeout: float = 12.0) -> tuple[str, str]:
     url = (job.get("url") or "").strip()
     if not url:
         return UNKNOWN, "sem URL"
-
-    if needs_browser_check(url):
+    if "linkedin.com" in (urlparse(url).netloc or "").casefold():
         job_id = extract_linkedin_job_id(url)
         if job_id:
-            try:
-                guest_verdict, guest_detail = check_linkedin_guest_liveness(
-                    job_id, timeout=http_timeout
-                )
-            except Exception as exc:
-                guest_verdict, guest_detail = UNKNOWN, f"guest: {exc}"
-            if guest_verdict in {INACTIVE, ACTIVE}:
-                return guest_verdict, guest_detail
-            LOG.info(
-                "worth-reverify: guest inconclusivo job #%s (%s); caindo p/ browser",
-                job.get("id"),
-                guest_detail,
-            )
-        if browser_session is not None:
-            return browser_session.check_url(url)
-        # Fallback isolado (testes / chamada avulsa): abre sessão só para esta URL.
-        try:
-            with LinkedInLivenessSession(cfg=cfg, project_root=project_root) as session:
-                return session.check_url(url)
-        except Exception as exc:
-            return UNKNOWN, f"browser: {exc}"
-
-    http_verdict, http_detail = check_http_liveness(url, timeout=http_timeout)
-    return http_verdict, http_detail
+            return check_linkedin_guest_liveness(job_id, timeout=http_timeout)
+    status, body = fetch_url_text(url, timeout=http_timeout)
+    if status == 0:
+        return UNKNOWN, "falha de rede ou timeout"
+    verdict = classify_http(status, body)
+    return verdict, f"HTTP {status}" + (" sem sinal conclusivo" if verdict == UNKNOWN else "")
 
 
 def reverify_worth_jobs(
     connect_fn: ConnectFn,
     *,
-    cfg: dict[str, str] | None = None,
-    project_root: str = "",
     should_abort: AbortFn | None = None,
+    http_timeout: float = 12.0,
 ) -> dict[str, int | bool]:
-    """Percorre todas as vagas status=worth; ignora só inactive claro.
-
-    LinkedIn: uma sessão Chrome para o lote inteiro. Respeita should_abort entre vagas.
-    """
+    """Check all worth jobs over public HTTP; only clear evidence can mark inactive."""
     with connect_fn() as db:
-        rows = [
-            dict(r)
-            for r in db.execute(
-                "SELECT id, url, title, company, source, status FROM jobs WHERE status='worth' ORDER BY id ASC"
-            ).fetchall()
-        ]
-
+        rows = [dict(r) for r in db.execute(
+            "SELECT id, url, title, company, source FROM jobs WHERE status='worth' ORDER BY id ASC"
+        ).fetchall()]
     summary: dict[str, int | bool] = {
-        "checked": 0,
-        "ignored": 0,
-        "active": 0,
-        "unknown": 0,
-        "aborted": False,
+        "checked": 0, "ignored": 0, "active": 0, "unknown": 0, "aborted": False,
     }
-    linkedin_jobs = [j for j in rows if needs_browser_check(j.get("url") or "")]
-    other_jobs = [j for j in rows if not needs_browser_check(j.get("url") or "")]
-
-    def _apply(job: dict, verdict: str, detail: str) -> None:
+    for job in rows:
+        if should_abort and should_abort():
+            summary["aborted"] = True
+            break
+        try:
+            verdict, detail = check_job_liveness(job, http_timeout=http_timeout)
+        except Exception as exc:
+            verdict, detail = UNKNOWN, str(exc)
         summary["checked"] = int(summary["checked"]) + 1
         if verdict == INACTIVE:
             with connect_fn() as db:
                 db.execute(
                     "UPDATE jobs SET status='ignored', notes=? WHERE id=? AND status='worth'",
-                    (
-                        f"Ignorada na reverificação (inativa): {detail}"[:500],
-                        int(job["id"]),
-                    ),
+                    (f"Ignorada na verificação diária (inativa): {detail}"[:500], int(job["id"])),
                 )
             summary["ignored"] = int(summary["ignored"]) + 1
-            LOG.info("worth-reverify: job #%s ignored (%s)", job["id"], detail)
+            LOG.info("worth-check: vaga #%s marcada inativa (%s)", job["id"], detail)
         elif verdict == ACTIVE:
             summary["active"] = int(summary["active"]) + 1
         else:
             summary["unknown"] = int(summary["unknown"]) + 1
-            LOG.info("worth-reverify: job #%s kept (%s / %s)", job["id"], verdict, detail)
-
-    def _aborted() -> bool:
-        return bool(should_abort and should_abort())
-
-    for job in other_jobs:
-        if _aborted():
-            summary["aborted"] = True
-            LOG.warning("worth-reverify: abortado (cancel) após %s checadas", summary["checked"])
-            return summary
-        try:
-            verdict, detail = check_job_liveness(job, cfg=cfg, project_root=project_root)
-        except Exception as exc:
-            verdict, detail = UNKNOWN, str(exc)
-        _apply(job, verdict, detail)
-
-    if not linkedin_jobs:
-        return summary
-    if _aborted():
-        summary["aborted"] = True
-        return summary
-
-    try:
-        with LinkedInLivenessSession(
-            cfg=cfg, project_root=project_root, should_abort=should_abort
-        ) as session:
-            for job in linkedin_jobs:
-                if _aborted():
-                    summary["aborted"] = True
-                    LOG.warning(
-                        "worth-reverify: abortado (cancel) no meio do lote LinkedIn "
-                        "após %s checadas",
-                        summary["checked"],
-                    )
-                    break
-                try:
-                    verdict, detail = check_job_liveness(
-                        job,
-                        cfg=cfg,
-                        project_root=project_root,
-                        browser_session=session,
-                    )
-                except Exception as exc:
-                    verdict, detail = UNKNOWN, str(exc)
-                _apply(job, verdict, detail)
-    except Exception as exc:
-        LOG.warning("worth-reverify: sessão LinkedIn falhou (%s)", exc)
-        # Se a sessão nem abriu, as LI ainda não foram checadas — marca unknown.
-        already = int(summary["checked"]) - len(other_jobs)
-        if already < 0:
-            already = 0
-        for job in linkedin_jobs[already:]:
-            if _aborted():
-                summary["aborted"] = True
-                break
-            _apply(job, UNKNOWN, f"browser: {exc}")
-
+            LOG.info("worth-check: vaga #%s mantida inconclusiva (%s)", job["id"], detail)
     return summary
 
 
 def format_summary(summary: dict[str, int | bool]) -> str:
-    base = (
-        f"Reverificação: {summary.get('checked', 0)} checadas, "
-        f"{summary.get('ignored', 0)} ignoradas (inativas), "
+    result = (
+        f"Verificação diária: {summary.get('checked', 0)} checadas, "
+        f"{summary.get('ignored', 0)} inativas removidas, "
         f"{summary.get('active', 0)} ativas, "
         f"{summary.get('unknown', 0)} inconclusivas mantidas."
     )
-    if summary.get("aborted"):
-        return base + " Interrompida por cancelamento."
-    return base
+    return result + (" Interrompida por cancelamento." if summary.get("aborted") else "")

@@ -152,7 +152,7 @@ DEFAULT_SETTINGS = {
     "queue_max_workers": "3",
     "queue_max_attempts": "40",
     "queue_ttl_hours": "24",
-    "linkedin_chrome_profile": "",
+    "worth_reverify_last_daily": "",
     # Som no painel quando o copiloto pede um dado (Web Audio)
     "copilot_ask_sound": "1",
     "copilot_ask_sound_volume": "0.55",
@@ -964,44 +964,73 @@ def handle_job_apply_job(payload: dict) -> str:
 def handle_worth_reverify_job(payload: dict) -> str:
     from worth_reverify import format_summary, reverify_worth_jobs
 
-    queue_job_id = payload.get("_queue_job_id")
-    try:
-        qid = int(queue_job_id) if queue_job_id is not None else None
-    except (TypeError, ValueError):
-        qid = None
-
-    def should_abort() -> bool:
-        return bool(qid is not None and queue.is_cancelled(qid))
-
-    summary = reverify_worth_jobs(
-        connect,
-        cfg=settings(),
-        project_root=ROOT,
-        should_abort=should_abort,
-    )
+    summary = reverify_worth_jobs(connect)
     msg = format_summary(summary)
-    log_event("info", "worth-reverify", msg)
+    log_event("info", "worth-check", msg)
     return msg
 
 
-def enqueue_worth_reverify() -> str:
+def _claim_daily_worth_check(today: str) -> bool:
+    """Atomically claim today's run, even when Render starts multiple instances."""
     with connect() as db:
-        n = int(db.execute("SELECT COUNT(*) AS n FROM jobs WHERE status='worth'").fetchone()["n"] or 0)
-    if n <= 0:
-        return "Nenhuma vaga em Vale a pena olhar para reverificar."
-    qid = queue.enqueue(KIND_WORTH_REVERIFY, {}, dedupe_key="worth-reverify")
-    log_event("info", "worth-reverify", f"Lote de reverificação enfileirado (fila #{qid}, {n} vaga(s)).")
-    return (
-        f"Reverificação enfileirada (fila #{qid}) para {n} vaga(s). "
-        "HTTP primeiro; LinkedIn/inconclusivos no Chrome. Só ignora inativas claras."
-    )
+        cur = db.execute(
+            "UPDATE settings SET value=? WHERE key='worth_reverify_last_daily' AND value < ?",
+            (today, today),
+        )
+        return cur.rowcount == 1
 
 
-def worth_reverify_busy() -> bool:
-    try:
-        return queue.has_active_kind(KIND_WORTH_REVERIFY)
-    except Exception:
-        return False
+def _daily_worth_check_loop() -> None:
+    """Queue one browser-free liveness pass per Brasília calendar day, after 03:00."""
+    while True:
+        try:
+            today = datetime.now(BRASILIA).date().isoformat()
+            if datetime.now(BRASILIA).hour >= 3 and _claim_daily_worth_check(today):
+                try:
+                    with connect() as db:
+                        count = int(db.execute(
+                            "SELECT COUNT(*) AS n FROM jobs WHERE status='worth'"
+                        ).fetchone()["n"] or 0)
+                except Exception:
+                    with connect() as db:
+                        db.execute(
+                            "UPDATE settings SET value='' "
+                            "WHERE key='worth_reverify_last_daily' AND value=?",
+                            (today,),
+                        )
+                    raise
+                if count:
+                    try:
+                        qid = queue.enqueue(
+                            KIND_WORTH_REVERIFY,
+                            {"scheduled_date": today},
+                            dedupe_key=f"daily:{today}",
+                        )
+                    except Exception:
+                        with connect() as db:
+                            db.execute(
+                                "UPDATE settings SET value='' "
+                                "WHERE key='worth_reverify_last_daily' AND value=?",
+                                (today,),
+                            )
+                        raise
+                    log_event(
+                        "info", "worth-check",
+                        f"Verificação diária enfileirada (fila #{qid}, {count} vaga(s)).",
+                    )
+                else:
+                    log_event("info", "worth-check", "Verificação diária: nenhuma vaga para checar.")
+        except Exception as exc:
+            LOG.exception("Falha ao agendar verificação diária de vagas: %s", exc)
+        time.sleep(60)
+
+
+def _boot_worth_check_scheduler() -> None:
+    threading.Thread(
+        target=_daily_worth_check_loop,
+        daemon=True,
+        name="daily-worth-check-scheduler",
+    ).start()
 
 
 queue = JobQueue(
@@ -2341,7 +2370,7 @@ def queue_html(limit: int = 100) -> str:
     kind_label = {
         KIND_RESUME: "Análise de currículo",
         KIND_APPLY: "Candidatura",
-        KIND_WORTH_REVERIFY: "Reverificar Vale olhar",
+        KIND_WORTH_REVERIFY: "Verificação diária de vagas",
         "linkedin_apply": "Candidatura por navegador (retirada)",
     }
     status_label = {
@@ -2601,7 +2630,6 @@ def worth_html(
     sort: str = WORTH_SORT_NONE,
     date_from: str = "",
     date_to: str = "",
-    reverify_busy: bool | None = None,
 ) -> str:
     page = max(1, int(page or 1))
     page_size = max(5, min(50, int(page_size or WORTH_PAGE_SIZE)))
@@ -2611,8 +2639,6 @@ def worth_html(
     date_to = (date_to or "").strip()
     if date_from and date_to and date_from > date_to:
         date_from, date_to = date_to, date_from
-    if reverify_busy is None:
-        reverify_busy = worth_reverify_busy()
     offset = (page - 1) * page_size
     match_expr = _worth_match_expr()
     where = "jobs.status = 'worth'"
@@ -2691,12 +2717,8 @@ def worth_html(
         filter_bits.append(
             f'<button type="button" class="subtle worth-match-preset" data-worth-min-match="{n}">{label}</button>'
         )
-    reverify_disabled = " disabled" if reverify_busy else ""
-    reverify_label = "Reverificando…" if reverify_busy else "Reverificar ativas"
     filter_bits.append(
         '<span class="worth-ignore-all-wrap">'
-        f'<button type="button" class="subtle" id="worth-reverify"{reverify_disabled}>'
-        f"{esc(reverify_label)}</button>"
         '<button type="button" class="subtle" id="worth-ignore-all">Ignorar todas</button>'
         "</span>"
     )
@@ -3515,7 +3537,7 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
 
 <div id="tab-ia" class="tab-panel"><section class="panel"><h2>IA &amp; integrações</h2><form method="post" action="/ai-settings"><div class="form-grid"><label>Provedor de IA<select name="ai_provider"><option value="gemini" {'selected' if cfg.get('ai_provider') == 'gemini' else ''}>Gemini</option><option value="openai" {'selected' if cfg.get('ai_provider') == 'openai' else ''}>OpenAI</option></select></label><label>Modelo<input name="ai_model" value="{esc(cfg.get('ai_model','gemini-2.5-flash'))}"></label><label>Motor de navegador<select name="browser_engine"><option value="pydoll" {'selected' if cfg.get('browser_engine','pydoll') == 'pydoll' else ''}>Pydoll (CDP, stealth — padrão)</option><option value="playwright" {'selected' if cfg.get('browser_engine','pydoll') == 'playwright' else ''}>Playwright (fallback)</option></select></label><label>Chave de IA (vazio mantém a salva)<input type="password" name="api_key" autocomplete="new-password"></label><label>Adzuna App ID<input name="adzuna_app_id" value=""></label><label>Adzuna API key<input type="password" name="adzuna_app_key" value=""></label><label>Token Apify<input type="password" name="apify_token" value="" autocomplete="new-password"></label></div><label style="margin-top:14px">Fatos profissionais em português<textarea name="candidate_facts_pt" rows="3">{esc(cfg.get('candidate_facts_pt',''))}</textarea></label><label style="margin-top:12px">Professional facts in English<textarea name="candidate_facts_en" rows="3">{esc(cfg.get('candidate_facts_en',''))}</textarea></label><p class="hint">Chaves vão para o cofre do sistema. Os fatos alimentam a IA nas perguntas abertas e de opções.</p><button style="margin-top:14px">Salvar IA e integrações</button></form></section><section class="panel"><h2>Regras de formulário (navegador)</h2><form method="post" action="/profile-settings">{rules_panel}<p class="hint">Modo <code>salary</code> escolhe automaticamente BRL×USD pela moeda do campo e aplica o multiplicador PJ ao valor BRL quando a contratação preferida é PJ; "Valor fixo" só é usado como desempate. No modo <code>select</code>, coloque em "Valor fixo" o texto da opção preferida. Perguntas abertas sem regra usam a IA.</p><button>Salvar regras</button></form></section></div>
 
-<div id="tab-automacao" class="tab-panel"><section class="panel"><h2>Automação</h2><form method="post" action="/automation-settings"><label style="margin:0 0 12px;display:flex;gap:8px;align-items:flex-start"><input type="checkbox" name="auto_apply" value="1" {'checked' if cfg.get('auto_apply') == '1' else ''} style="width:auto;margin-top:3px"> <span>Após a coleta, enfileirar e triar vagas novas automaticamente. O envio automático fica limitado a e-mail SMTP; formulários são preenchidos por você no Chrome com a extensão.</span></label><div class="form-grid"><label>Score mínimo (%)<input name="minimum_match_score" type="number" min="0" max="100" value="{esc(cfg.get('minimum_match_score','80'))}"></label><label>Workers da fila (vagas em paralelo)<input name="queue_max_workers" type="number" min="1" max="8" value="{esc(cfg.get('queue_max_workers','3'))}"></label><label>Máx. tentativas por job<input name="queue_max_attempts" type="number" min="1" max="200" value="{esc(cfg.get('queue_max_attempts','40'))}"></label><label>TTL da fila (horas)<input name="queue_ttl_hours" type="number" min="1" max="168" value="{esc(cfg.get('queue_ttl_hours','24'))}"></label><label>Perfil Chrome para reverificar vagas LinkedIn<input name="linkedin_chrome_profile" value="{esc(cfg.get('linkedin_chrome_profile') or '')}" placeholder="{esc(os.path.join(ROOT, 'linkedin_browser_profile'))}"></label><label>Volume do som do copiloto (0–100)<input name="copilot_ask_sound_volume" type="number" min="0" max="100" value="{esc(str(int(round(_copilot_ask_volume(cfg) * 100))))}"></label></div><label style="margin:12px 0 18px;display:flex;gap:8px;align-items:flex-start"><input type="checkbox" name="copilot_ask_sound" value="1" {'checked' if cfg.get('copilot_ask_sound', '1') == '1' else ''} style="width:auto;margin-top:3px"> <span>Tocar som de notificação no painel quando o copiloto pedir um dado</span></label><p class="hint">Vagas de formulário ficam em <em>Vale a pena olhar</em>. Abra a vaga no Chrome e use Job Autofill; revise e envie manualmente.</p><button style="margin-top:14px">Salvar automação</button></form></section></div>
+<div id="tab-automacao" class="tab-panel"><section class="panel"><h2>Automação</h2><form method="post" action="/automation-settings"><label style="margin:0 0 12px;display:flex;gap:8px;align-items:flex-start"><input type="checkbox" name="auto_apply" value="1" {'checked' if cfg.get('auto_apply') == '1' else ''} style="width:auto;margin-top:3px"> <span>Após a coleta, enfileirar e triar vagas novas automaticamente. O envio automático fica limitado a e-mail SMTP; formulários são preenchidos por você no Chrome com a extensão.</span></label><div class="form-grid"><label>Score mínimo (%)<input name="minimum_match_score" type="number" min="0" max="100" value="{esc(cfg.get('minimum_match_score','80'))}"></label><label>Workers da fila (vagas em paralelo)<input name="queue_max_workers" type="number" min="1" max="8" value="{esc(cfg.get('queue_max_workers','3'))}"></label><label>Máx. tentativas por job<input name="queue_max_attempts" type="number" min="1" max="200" value="{esc(cfg.get('queue_max_attempts','40'))}"></label><label>TTL da fila (horas)<input name="queue_ttl_hours" type="number" min="1" max="168" value="{esc(cfg.get('queue_ttl_hours','24'))}"></label><label>Volume do som do copiloto (0–100)<input name="copilot_ask_sound_volume" type="number" min="0" max="100" value="{esc(str(int(round(_copilot_ask_volume(cfg) * 100))))}"></label></div><label style="margin:12px 0 18px;display:flex;gap:8px;align-items:flex-start"><input type="checkbox" name="copilot_ask_sound" value="1" {'checked' if cfg.get('copilot_ask_sound', '1') == '1' else ''} style="width:auto;margin-top:3px"> <span>Tocar som de notificação no painel quando o copiloto pedir um dado</span></label><p class="hint">A disponibilidade das vagas em “Vale a pena olhar” é verificada automaticamente uma vez por dia por HTTP e endpoints públicos. Verificações inconclusivas mantêm a vaga na lista.</p><p class="hint">Vagas de formulário ficam em <em>Vale a pena olhar</em>. Abra a vaga no Chrome e use Job Autofill; revise e envie manualmente.</p><button style="margin-top:14px">Salvar automação</button></form></section></div>
 
 <div id="tab-smtp" class="tab-panel"><section class="panel"><h2>SMTP</h2><form method="post" action="/smtp-settings"><div class="form-grid"><label>Host<input name="smtp_host" value="{esc(cfg.get('smtp_host',''))}"></label><label>Porta<input name="smtp_port" type="number" value="{esc(cfg.get('smtp_port','587'))}"></label><label>Usuário<input name="smtp_user" value="{esc(cfg.get('smtp_user',''))}"></label><label>Remetente (From)<input name="smtp_from" value="{esc(cfg.get('smtp_from',''))}"></label><label>Senha (vazio mantém)<input type="password" name="smtp_password" autocomplete="new-password"></label><label>TLS<select name="smtp_use_tls"><option value="1" {'selected' if cfg.get('smtp_use_tls','1')=='1' else ''}>Sim (STARTTLS)</option><option value="0" {'selected' if cfg.get('smtp_use_tls')=='0' else ''}>Não</option></select></label></div><div class="actions"><button>Salvar SMTP</button></div></form><form method="post" action="/smtp-test" style="margin-top:8px"><button class="subtle" type="submit">Enviar e-mail de teste</button></form></section></div>
 
@@ -3913,26 +3935,6 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
         setWorthIgnoreConfirm(false);
       }});
   }}
-  function enqueueWorthReverify() {{
-    var btn = document.getElementById("worth-reverify");
-    if (btn) btn.disabled = true;
-    fetch("/worth-reverify", {{
-      method: "POST",
-      body: new FormData(),
-      headers: {{ Accept: "application/json", "X-Requested-With": "fetch" }},
-      credentials: "same-origin"
-    }})
-      .then(function (r) {{ return r.json().then(function (data) {{ return {{ okHttp: r.ok, data: data }}; }}); }})
-      .then(function (res) {{
-        var data = res.data || {{}};
-        showNotice(data.notice || (data.ok ? "OK" : "Falha"), data.kind || (data.ok ? "success" : "error"));
-        requestWorthRefresh();
-      }})
-      .catch(function () {{
-        showNotice("Falha de comunicação com o painel.", "error");
-        if (btn) btn.disabled = false;
-      }});
-  }}
   var worthBody = document.getElementById("worth-body");
   if (worthBody) {{
     worthBody.addEventListener("click", function (ev) {{
@@ -3962,11 +3964,6 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
       }}
       if (ev.target && ev.target.id === "worth-ignore-all") {{
         setWorthIgnoreConfirm(true);
-        return;
-      }}
-      if (ev.target && ev.target.id === "worth-reverify") {{
-        if (ev.target.disabled) return;
-        enqueueWorthReverify();
         return;
       }}
       var btn = ev.target.closest("[data-worth-page]");
@@ -4293,7 +4290,6 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
     "/queue-clear": 1,
     "/clear-logs": 1,
     "/usage-refresh": 1,
-    "/worth-reverify": 1,
     "/job-status": 1,
     "/worth-ignore-all": 1,
     "/copilot-ask-answer": 1,
@@ -4355,7 +4351,7 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
           var fileInput = form.querySelector('input[type="file"]');
           if (fileInput) fileInput.value = "";
         }}
-        if (path === "/job-status" || path === "/worth-ignore-all" || path === "/worth-reverify") {{
+        if (path === "/job-status" || path === "/worth-ignore-all") {{
           requestWorthRefresh();
         }} else {{
           refresh();
@@ -4991,9 +4987,6 @@ class Handler(BaseHTTPRequestHandler):
                 self.respond_notice("1 vaga ignorada.")
             else:
                 self.respond_notice(f"{n} vagas ignoradas.")
-        elif path == "/worth-reverify":
-            note = enqueue_worth_reverify()
-            self.respond_notice(note, notice_kind="info")
         elif path == "/copilot-ask-cancel":
             ask_id = int(form["id"]) if form.get("id", "").isdigit() else 0
             if not ask_id:
@@ -5048,5 +5041,6 @@ if __name__ == "__main__":
     initialize()
     _boot_logging()
     _boot_queue()
+    _boot_worth_check_scheduler()
     print(f"Radar de Vagas disponível em http://{HOST}:{PORT}")
     ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
