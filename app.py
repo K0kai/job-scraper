@@ -3915,6 +3915,9 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
     }}
   }}
   function ignoreAllWorth() {{
+    var worthEl = document.getElementById("worth-body");
+    if (worthEl) worthEl.innerHTML = '<p class="hint" style="padding:16px">Ignorando vagas…</p>';
+    setWorthIgnoreConfirm(false);
     fetch("/worth-ignore-all", {{
       method: "POST",
       body: new FormData(),
@@ -3932,7 +3935,8 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
       }})
       .catch(function () {{
         showNotice("Falha de comunicação com o painel.", "error");
-        setWorthIgnoreConfirm(false);
+        worthPage = 1;
+        requestWorthRefresh();
       }});
   }}
   var worthBody = document.getElementById("worth-body");
@@ -4329,10 +4333,9 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
     if (submitter && submitter.name) {{
       body.set(submitter.name, submitter.value);
     }}
-    // O status da vaga só depende de uma gravação pequena. Esconda a linha
-    // imediatamente para a interface não esperar a latência do Render.
+    // A vaga sai visualmente da lista enquanto o Render confirma a gravação.
     var optimisticRow = null;
-    if (path === "/job-status" && body.get("status") === "applied") {{
+    if (path === "/job-status" && ["applied", "ignored"].indexOf(body.get("status")) !== -1) {{
       optimisticRow = form.closest("tr");
       if (optimisticRow) optimisticRow.hidden = true;
     }}
