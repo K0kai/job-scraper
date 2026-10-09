@@ -8,7 +8,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 
-LOG = logging.getLogger("job-scraper")
+LOG = logging.getLogger("odradek-scraper")
 ConnectFn = Callable[[], Any]
 AbortFn = Callable[[], bool]
 

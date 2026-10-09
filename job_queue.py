@@ -15,7 +15,7 @@ from typing import Any, Callable
 from panel_log import log_event
 from dbutil import using_postgres
 
-LOG = logging.getLogger("job-scraper")
+LOG = logging.getLogger("odradek-scraper")
 
 KIND_RESUME = "resume_analysis"
 KIND_APPLY = "job_apply"

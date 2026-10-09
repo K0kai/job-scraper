@@ -1,4 +1,4 @@
-# Radar de Vagas: interface local, armazenamento, busca e preparação de candidaturas.
+# Odradek Scraper: interface local, armazenamento, busca e preparação de candidaturas.
 # O host e a porta podem ser sobrescritos pelo ambiente de deploy (ex.: Render).
 from __future__ import annotations
 
@@ -51,7 +51,7 @@ FAVICON_PATH = os.path.join(ROOT, "assets", "public", "favicon.ico")
 HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "8765"))
 POLL_SECONDS = 15 * 60
-LOG = logging.getLogger("job-scraper")
+LOG = logging.getLogger("odradek-scraper")
 
 # Estrutura persistente. As vagas são deduplicadas pela impressão digital; cartas e execuções
 # ficam separadas para poder registrar versões e resultados sem alterar os dados da vaga.
@@ -133,6 +133,8 @@ DEFAULT_SETTINGS = {
     "auto_apply": "0",
     "browser_engine": "pydoll",
     "minimum_match_score": "65",
+    "job_selection_optimism": "75",
+    "job_selection_prompt": "",
     "maximum_applications_per_run": "5",
     "adzuna_countries": "br,us,gb,ca",
     "apify_monthly_credit_limit_usd": "5",
@@ -140,6 +142,7 @@ DEFAULT_SETTINGS = {
     "apify_actors_json": "[{\"id\": \"curious_coder~linkedin-jobs-scraper\", \"label\": \"LinkedIn Jobs\", \"enabled\": true, \"input_mode\": \"linkedin_search\", \"count\": 25}]",
     "apify_linkedin_filter_json": "",
     "apify_linkedin_filter_hash": "",
+    "apify_linkedin_filters_json": "",
     # Vazio = DEFAULT_LINKEDIN_FILTER_PROMPT (editável em Busca & coleta)
     "linkedin_filter_prompt": "",
     "ai_usage_json": "",
@@ -626,6 +629,41 @@ def create_cover_letter(job_id: int, resume_language: str | None = None) -> int:
     return int(row["id"])
 
 
+DEFAULT_JOB_SELECTION_PROMPT = """You are a fair, practical job-fit evaluator. Assess whether this candidate has a credible path to succeed in this role.
+
+- Compare the role's core responsibilities and required skills with the candidate's actual resume evidence.
+- Give meaningful credit to transferable skills, adjacent experience, and demonstrated ability to learn.
+- Treat missing secondary or preferred tools as a modest gap, not an automatic rejection.
+- Do not invent employers, degrees, skills, or experience absent from the candidate information.
+- Reject only for a genuine hard blocker or a fundamentally unrelated career path.
+- Base the score and recommendation on the optimism calibration supplied below.
+"""
+
+
+def effective_job_selection_prompt(cfg: dict[str, str] | None = None) -> str:
+    cfg = cfg or {}
+    custom = str(cfg.get("job_selection_prompt") or "").strip()
+    return custom if custom else DEFAULT_JOB_SELECTION_PROMPT
+
+
+def job_selection_optimism_instruction(value: object) -> tuple[int, str]:
+    try:
+        optimism = max(0, min(100, int(float(str(value or "75")))))
+    except (TypeError, ValueError):
+        optimism = 75
+    if optimism <= 20:
+        guidance = "Be highly selective: recommend only clear, well-supported matches; score adjacent or stretch roles conservatively."
+    elif optimism <= 40:
+        guidance = "Be somewhat selective: prioritize strong matches, while allowing relevant transferable experience."
+    elif optimism <= 60:
+        guidance = "Use balanced judgment: count relevant overlap and transferable skills, but reflect meaningful gaps."
+    elif optimism <= 80:
+        guidance = "Lean optimistic: give strong credit to adjacent experience and transferable skills; keep plausible roles in consideration."
+    else:
+        guidance = "Be very inclusive: favor a credible path to success, avoid over-penalizing missing secondary skills, and keep stretch roles in consideration unless a hard blocker exists."
+    return optimism, guidance
+
+
 def ai_assess_job(job: dict, cfg: dict[str, str]) -> dict:
     """Classifica aderência usando a análise de currículo já salva (sem reenviar o PDF)."""
     language = job.get("language", "unknown")
@@ -644,33 +682,12 @@ def ai_assess_job(job: dict, cfg: dict[str, str]) -> dict:
     if language == "en" and not resume_summary_en and not resume_summary_pt and not snippet_en and not snippet_pt:
         raise ValueError("Faça upload e análise de pelo menos um currículo antes da triagem automática.")
 
-    prompt = f"""You are an ENTHUSIASTIC job-application coach. Your bias is to APPLY when there is any credible path.
+    optimism, optimism_guidance = job_selection_optimism_instruction(cfg.get("job_selection_optimism"))
+    prompt = f"""{effective_job_selection_prompt(cfg)}
 
-CRITICAL CALIBRATION (follow strictly):
-- Be GENEROUS with match_score. Most plausible tech/office/remote roles for this candidate should land 65–90, not 20–40.
-- If the job is in the SAME broad field as the resume (e.g. software/engineering/IT/data/web vs software resume), match_score MUST be >= 65 unless a hard blocker applies.
-- If the job title overlaps the candidate's roles/skills even partially, match_score MUST be >= 70.
-- If ANY single skill, tool, or stack from the resume matches the job well, treat that as a strong positive — do NOT require a long list of overlapping skills to select the role.
-- Missing tools from a long JD list is NORMAL — do NOT tank the score. Penalize at most 5–15 points total for missing secondary tools.
-- Prefer transferable and adjacent skills (React↔Vue, AWS↔GCP, SQL dialects, similar frameworks).
-- Do NOT invent employers, degrees, or tools absent from the resume context.
-- Default to should_apply=true whenever match_score >= 50 and no hard blocker.
+OPTIMISM CALIBRATION: {optimism}/100. {optimism_guidance}
+Keep the score consistent with this calibration. Set should_apply=true when the role meets the configured standard and has no hard blocker. Identify whether the job description asks for a cover letter.
 
-Scoring bands (use the HIGH end when unsure):
-- 85–100: core role fits; several overlapping skills.
-- 70–84: good enough to apply; partial stack overlap or transferable skills.
-- 55–69: stretch / adjacent role in the same field — still apply.
-- 40–54: weak but same industry; apply only if remote/flexible.
-- 0–39: ONLY for hard blockers or totally different careers (nurse, truck driver, accountant with no path, etc.).
-
-Hard blockers (should_apply=false, score usually <40):
-- Fundamentally different profession with no bridge from the resume.
-- Explicit non-negotiable visa/onsite conflict vs candidate facts/location notes.
-- Seniority jump of ~2+ levels with zero supporting evidence.
-
-Never treat as hard blockers: laundry-list tools, "nice to have", cover letter requested, imperfect keyword match, years stated as "X+" when candidate is close.
-
-Identify whether the job description asks for a cover letter.
 Return ONLY JSON with keys:
 match_score (integer 0-100),
 should_apply (boolean),
@@ -869,7 +886,7 @@ def process_auto_job(job_id: int) -> str:
             job_id,
             score=score,
             reason=decision["reason"],
-            detail="Vaga do LinkedIn — carta preparada. Abra no Chrome e use Job Autofill para preencher manualmente.",
+            detail="Vaga do LinkedIn — carta preparada. Abra no Chrome e use Odradek Autofill para preencher manualmente.",
         )
         return f"vaga {job_id}: vale a pena olhar (LinkedIn, score {score})"
 
@@ -891,7 +908,7 @@ def process_auto_job(job_id: int) -> str:
             job_id,
             score=score,
             reason=decision["reason"],
-            detail=f"Envio por e-mail indisponível ({detail}). Abra a vaga no Chrome e use Job Autofill.",
+            detail=f"Envio por e-mail indisponível ({detail}). Abra a vaga no Chrome e use Odradek Autofill.",
         )
         return f"vaga {job_id}: vale a pena olhar — {detail}"
     with connect() as db:
@@ -1350,6 +1367,7 @@ LINKEDIN_TPR_WEEK = "r604800"
 LINKEDIN_MAX_AGE_DAYS = 7
 #: Quantos keywords a IA pode gravar / usar nas URLs (antes era 4–5 e estreita demais).
 LINKEDIN_FILTER_MAX_KEYWORDS = 12
+LINKEDIN_FILTER_MAX_COUNT = 12
 LINKEDIN_URL_MAX_KEYWORDS = 8
 LINKEDIN_SEARCH_MAX_URLS = 8
 
@@ -1370,7 +1388,7 @@ GEO / WORKPLACE RULES (mandatory — override panel location preferences):
 - Never make "Brazil" the only or primary location.
 
 KEYWORD BREADTH (mandatory):
-- Produce 6–12 distinct job-search phrases that spread across DIFFERENT skills, stacks, domains, and role titles from the resume.
+- Produce 6–12 distinct job-search phrases spread across DIFFERENT skills, stacks, domains, and role titles from the resume. Organize them into 4–8 separate filters, each with only 1–3 related phrases. Each filter is sent as its own Apify run, so cover different role/skill combinations without duplicating them.
 - One solid skill match is enough to justify a keyword. Do NOT require the intersection of many skills; e.g. include separate phrases for Python, React, SQL, DevOps, etc. when present on the resume.
 - Prefer English for global remote reach; PT only if clearly Brazil-hybrid BH search.
 - Market demand may influence ORDER, but NEVER drop a real resume skill just because it is less trendy.
@@ -1382,12 +1400,13 @@ Other rules:
   * Only consider jobs from the last 7 days (LinkedIn f_TPR=r604800).
   * Strongly prioritize jobs posted today / last 24 hours (f_TPR=r86400) over older ones in the week.
 - OPEN JOBS ONLY (intent): design searches for roles that still accept applications. Prefer fresher postings; never aim for filled/closed/expired listings.
-- Return ONLY JSON with keys:
-  keywords (string array),
+- Return ONLY JSON with key filters, an array of 4–8 objects. Each object has:
+  name (short unique label in Portuguese),
+  keywords (1–3 related search phrases),
   locations (string array),
   experience_levels (integer array of f_E codes),
   workplace_types (integer array of f_WT codes),
-  reason (short string in Portuguese explaining breadth of skills covered + remote global + hybrid BH + prioridade a vagas do dia / máx. 7 dias + só vagas abertas).
+  reason (short string in Portuguese explaining the role/skills covered + remote global + hybrid BH + recency).
 
 Panel keyword preferences (roles/skills only — ignore geo bias here): {pref_keywords}
 Candidate facts PT: {facts_pt}
@@ -1439,6 +1458,9 @@ def _resume_filter_fingerprint(cfg: dict[str, str] | None = None) -> str:
         {
             "summaries": summaries,
             "prompt": prompt,
+            "preferred_keywords": cfg.get("keywords", ""),
+            "candidate_facts_pt": cfg.get("candidate_facts_pt", ""),
+            "candidate_facts_en": cfg.get("candidate_facts_en", ""),
             "meta": [
                 {
                     "language": r["language"],
@@ -1454,20 +1476,27 @@ def _resume_filter_fingerprint(cfg: dict[str, str] | None = None) -> str:
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:24]
 
 
+def _fallback_linkedin_filters(cfg: dict[str, str]) -> list[dict]:
+    keywords = terms(cfg.get("keywords", "")) or ["software engineer"]
+    groups = [keywords[i : i + 2] for i in range(0, min(len(keywords), 12), 2)] or [["software engineer"]]
+    return [
+        {
+            "id": f"fallback-{i + 1}",
+            "name": f"Busca {i + 1}: {', '.join(group[:2])}",
+            "enabled": True,
+            "keywords": group,
+            "locations": ["Remote", "Belo Horizonte"],
+            "experience_levels": [3, 4],
+            "workplace_types": [2, 3],
+            "reason": "Filtro alternativo baseado nas preferências, remoto global e híbrido em Belo Horizonte.",
+            "source": "fallback",
+        }
+        for i, group in enumerate(groups[:LINKEDIN_FILTER_MAX_COUNT])
+    ]
+
+
 def _fallback_linkedin_filter(cfg: dict[str, str]) -> dict:
-    keywords = terms(cfg.get("keywords", ""))[:4] or ["software engineer"]
-    # Remoto global; híbrido só em Belo Horizonte (não priorizar Brasil/país inteiro).
-    return {
-        "keywords": keywords,
-        "locations": ["Remote", "Belo Horizonte"],
-        "experience_levels": [3, 4],
-        "workplace_types": [2, 3],
-        "reason": (
-            "Fallback: keywords das preferências; locations Remote + Belo Horizonte; "
-            "f_WT remote+hybrid (híbrido pensado para BH)."
-        ),
-        "source": "fallback",
-    }
+    return _fallback_linkedin_filters(cfg)[0]
 
 
 def _normalize_linkedin_filter(raw: dict, cfg: dict[str, str]) -> dict:
@@ -1480,28 +1509,26 @@ def _normalize_linkedin_filter(raw: dict, cfg: dict[str, str]) -> dict:
     locations = [str(x).strip() for x in locations if str(x).strip()][:4]
     if not locations:
         locations = list(fallback["locations"])
+    experience_raw = raw.get("experience_levels")
     experience = []
-    for item in raw.get("experience_levels") or []:
+    for item in (experience_raw if isinstance(experience_raw, list) else fallback["experience_levels"]):
         try:
             code = int(item)
         except (TypeError, ValueError):
             continue
         if code in LINKEDIN_EXPERIENCE_CODES and code not in experience:
             experience.append(code)
-    if not experience:
-        experience = list(fallback["experience_levels"])
+    workplace_raw = raw.get("workplace_types")
     workplace = []
-    for item in raw.get("workplace_types") or []:
+    for item in (workplace_raw if isinstance(workplace_raw, list) else fallback["workplace_types"]):
         try:
             code = int(item)
         except (TypeError, ValueError):
             continue
         if code in LINKEDIN_WORKPLACE_CODES and code not in workplace:
             workplace.append(code)
-    if not workplace:
-        workplace = list(fallback["workplace_types"])
     reason = str(raw.get("reason") or "").strip()[:400]
-    return {
+    out = {
         "keywords": keywords,
         "locations": locations,
         "experience_levels": experience,
@@ -1509,10 +1536,70 @@ def _normalize_linkedin_filter(raw: dict, cfg: dict[str, str]) -> dict:
         "reason": reason or fallback["reason"],
         "source": str(raw.get("source") or "ai"),
     }
+    name = str(raw.get("name") or "").strip()[:80]
+    if name:
+        out["name"] = name
+    return out
 
 
-def ai_generate_linkedin_search_filter(cfg: dict[str, str]) -> dict:
-    """Pede à IA keywords + níveis LinkedIn (f_E/f_WT) com base no currículo analisado."""
+def _normalize_linkedin_filters(
+    raw: object,
+    cfg: dict[str, str],
+    *,
+    fallback_if_empty: bool = True,
+) -> list[dict]:
+    if isinstance(raw, dict):
+        candidates = raw.get("filters") if isinstance(raw.get("filters"), list) else [raw]
+    elif isinstance(raw, list):
+        candidates = raw
+    else:
+        candidates = []
+    filters: list[dict] = []
+    seen: set[str] = set()
+    for index, item in enumerate(candidates[:LINKEDIN_FILTER_MAX_COUNT]):
+        if not isinstance(item, dict):
+            continue
+        normalized = _normalize_linkedin_filter(item, cfg)
+        signature = json.dumps(
+            {key: normalized[key] for key in ("keywords", "locations", "experience_levels", "workplace_types")},
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        if signature in seen:
+            continue
+        seen.add(signature)
+        stable_id = hashlib.sha256(f"{index}:{signature}".encode("utf-8")).hexdigest()[:12]
+        name = normalized.get("name") or f"Busca {index + 1}"
+        filters.append({
+            **normalized,
+            "id": str(item.get("id") or f"li-{stable_id}")[:64],
+            "name": name,
+            "enabled": bool(item.get("enabled", True)),
+        })
+    return filters or (_fallback_linkedin_filters(cfg) if fallback_if_empty else [])
+
+
+def _validate_linkedin_filter_form(raw: str, cfg: dict[str, str]) -> str:
+    try:
+        submitted = json.loads(raw or "[]")
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"JSON dos filtros LinkedIn inválido: {exc}") from exc
+    if not isinstance(submitted, list) or len(submitted) > LINKEDIN_FILTER_MAX_COUNT:
+        raise ValueError(f"Use uma lista com até {LINKEDIN_FILTER_MAX_COUNT} filtros LinkedIn.")
+    for index, item in enumerate(submitted, start=1):
+        if not isinstance(item, dict):
+            raise ValueError(f"Filtro #{index} inválido.")
+        if not str(item.get("name") or "").strip():
+            raise ValueError(f"Dê um nome ao filtro #{index}.")
+        keywords = item.get("keywords")
+        if not isinstance(keywords, list) or not any(str(x).strip() for x in keywords):
+            raise ValueError(f"Adicione ao menos uma keyword ao filtro #{index}.")
+    filters = _normalize_linkedin_filters(submitted, cfg, fallback_if_empty=False)
+    return json.dumps(filters, ensure_ascii=False)
+
+
+def ai_generate_linkedin_search_filters(cfg: dict[str, str]) -> list[dict]:
+    """Pede à IA um conjunto de filtros LinkedIn independentes com base no currículo."""
     with connect() as db:
         summaries = resume_summaries(db)
     resume_pt = (summaries.get("pt") or "").strip()
@@ -1537,6 +1624,12 @@ def ai_generate_linkedin_search_filter(cfg: dict[str, str]) -> dict:
         resume_pt=resume_pt[:6000],
         resume_en=resume_en[:6000],
     )
+    prompt += (
+        "\n\nMANDATORY OUTPUT OVERRIDE: Return JSON exactly as "
+        '{"filters":[{"name":"...","keywords":["..."],"locations":["..."],'
+        '"experience_levels":[3,4],"workplace_types":[2,3],"reason":"..."}]}. '
+        "Create multiple independent filters (ideally 4–8), with only 1–3 related keywords per filter."
+    )
     try:
         if provider == "openai":
             endpoint = "https://api.openai.com/v1/responses"
@@ -1546,7 +1639,7 @@ def ai_generate_linkedin_search_filter(cfg: dict[str, str]) -> dict:
                     "input": prompt,
                     "text": {"format": {"type": "json_object"}},
                     "store": False,
-                    "max_output_tokens": 700,
+                    "max_output_tokens": 1800,
                 }
             ).encode("utf-8")
             headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
@@ -1558,7 +1651,7 @@ def ai_generate_linkedin_search_filter(cfg: dict[str, str]) -> dict:
             payload = json.dumps(
                 {
                     "contents": [{"parts": [{"text": prompt}]}],
-                    "generationConfig": {"maxOutputTokens": 700, "responseMimeType": "application/json"},
+                    "generationConfig": {"maxOutputTokens": 1800, "responseMimeType": "application/json"},
                 }
             ).encode("utf-8")
             headers = {"Content-Type": "application/json"}
@@ -1595,119 +1688,160 @@ def ai_generate_linkedin_search_filter(cfg: dict[str, str]) -> dict:
     decision = json.loads(raw_text.strip())
     if not isinstance(decision, dict):
         raise ValueError("Resposta da IA para filtro LinkedIn inválida.")
-    normalized = _normalize_linkedin_filter(decision, cfg)
-    normalized["source"] = "ai"
-    return normalized
+    raw_filters = decision.get("filters") if isinstance(decision.get("filters"), list) else [decision]
+    expanded_filters: list[dict] = []
+    for index, item in enumerate(raw_filters):
+        if not isinstance(item, dict):
+            continue
+        item_keywords = item.get("keywords") if isinstance(item.get("keywords"), list) else []
+        groups = [item_keywords[i : i + 3] for i in range(0, len(item_keywords), 3)]
+        if len(groups) > 1:
+            for part, group in enumerate(groups, start=1):
+                expanded_filters.append({
+                    **item,
+                    "name": f"{item.get('name') or f'Busca {index + 1}'} {part}",
+                    "keywords": group,
+                })
+        else:
+            expanded_filters.append(item)
+    if not expanded_filters:
+        raise ValueError("A IA não retornou nenhum filtro LinkedIn válido.")
+    filters = _normalize_linkedin_filters(expanded_filters, cfg)
+    for index, item in enumerate(filters, start=1):
+        item["source"] = "ai"
+        item["id"] = str(item.get("id") or f"ai-{index}")
+    return filters
 
 
-def get_linkedin_search_filter(cfg: dict[str, str], *, force_refresh: bool = False) -> dict:
-    """Retorna filtro LinkedIn em cache ou gera com IA quando o currículo/prompt mudou."""
+def get_linkedin_search_filters(cfg: dict[str, str], *, force_refresh: bool = False) -> list[dict]:
+    """Retorna filtros em cache ou gera uma coleção quando currículo/prompt mudarem."""
     fingerprint = _resume_filter_fingerprint(cfg)
     cached_hash = (cfg.get("apify_linkedin_filter_hash") or "").strip()
-    cached_raw = (cfg.get("apify_linkedin_filter_json") or "").strip()
+    cached_raw = (cfg.get("apify_linkedin_filters_json") or "").strip()
     if not force_refresh and cached_hash == fingerprint and cached_raw:
         try:
-            data = json.loads(cached_raw)
-            if isinstance(data, dict):
-                out = _normalize_linkedin_filter(data, cfg)
-                out["source"] = str(data.get("source") or "cache")
-                return out
+            filters = _normalize_linkedin_filters(
+                json.loads(cached_raw), cfg, fallback_if_empty=False
+            )
+            return filters
         except json.JSONDecodeError:
             pass
 
+    legacy_filter: dict | None = None
+    if not cached_raw:
+        try:
+            old = json.loads((cfg.get("apify_linkedin_filter_json") or "").strip() or "null")
+            if isinstance(old, dict):
+                legacy_filter = old
+        except json.JSONDecodeError:
+            pass
     try:
-        generated = ai_generate_linkedin_search_filter(cfg)
+        generated = ai_generate_linkedin_search_filters(cfg)
     except (AiUnavailableError, ValueError, json.JSONDecodeError) as exc:
-        log_event("warning", "apify", f"Filtro LinkedIn via IA indisponível ({exc}); usando fallback.")
-        generated = _fallback_linkedin_filter(cfg)
+        log_event("warning", "apify", f"Filtros LinkedIn via IA indisponíveis ({exc}); usando fallback.")
+        if legacy_filter:
+            generated = _normalize_linkedin_filters([legacy_filter], cfg)
+            generated[0]["source"] = "legacy"
+        else:
+            generated = _fallback_linkedin_filters(cfg)
 
-    payload = dict(generated)
-    set_setting("apify_linkedin_filter_json", json.dumps(payload, ensure_ascii=False))
+    old_enabled: dict[str, bool] = {}
+    if cached_raw:
+        try:
+            old_enabled = {
+                str(item.get("name") or "").strip().casefold(): bool(item.get("enabled", True))
+                for item in _normalize_linkedin_filters(json.loads(cached_raw), cfg)
+            }
+        except json.JSONDecodeError:
+            pass
+    if old_enabled:
+        for item in generated:
+            if item["name"].casefold() in old_enabled:
+                item["enabled"] = old_enabled[item["name"].casefold()]
+    payload = _normalize_linkedin_filters(generated, cfg)
+    set_setting("apify_linkedin_filters_json", json.dumps(payload, ensure_ascii=False))
     set_setting("apify_linkedin_filter_hash", fingerprint)
     log_event(
         "info",
         "apify",
-        "Filtro LinkedIn "
-        f"({payload.get('source')}): keywords={payload['keywords']}, "
-        f"locations={payload['locations']}, f_E={payload['experience_levels']}, "
-        f"f_WT={payload['workplace_types']}. {payload.get('reason', '')}",
+        f"{len(payload)} filtros LinkedIn disponíveis; "
+        f"{sum(1 for item in payload if item['enabled'])} ativos.",
     )
     return payload
 
 
+def get_linkedin_search_filter(cfg: dict[str, str], *, force_refresh: bool = False) -> dict:
+    """Compatibilidade dos placeholders customizados: usa o primeiro filtro ativo."""
+    filters = get_linkedin_search_filters(cfg, force_refresh=force_refresh)
+    return next((item for item in filters if item.get("enabled")), filters[0] if filters else _fallback_linkedin_filter(cfg))
+
+
 def linkedin_filter_panel_html(cfg: dict[str, str] | None = None) -> str:
-    """Bloco somente leitura do filtro LinkedIn em cache (gerado pela IA)."""
+    """Editor dos filtros independentes usados nos runs de busca LinkedIn."""
     cfg = cfg or settings()
-    raw = (cfg.get("apify_linkedin_filter_json") or "").strip()
-    if not raw:
-        body = (
-            '<p class="hint" style="margin:0">Ainda não há filtro gerado. Ele aparece após a primeira '
-            "coleta Apify em modo <code>linkedin_search</code> (com currículo já analisado).</p>"
-        )
-        return (
-            '<div id="linkedin-filter-panel" class="resume-card" style="margin-top:12px">'
-            "<h3 style=\"margin:0 0 8px;font-size:14px\">Filtro LinkedIn (IA)</h3>"
-            f"{body}</div>"
-        )
     try:
-        data = json.loads(raw)
+        raw_filters = json.loads((cfg.get("apify_linkedin_filters_json") or "").strip() or "null")
     except json.JSONDecodeError:
-        data = {}
-    if not isinstance(data, dict):
-        data = {}
-    exp_labels = {
-        1: "Internship",
-        2: "Entry",
-        3: "Associate",
-        4: "Mid-Senior",
-        5: "Director",
-        6: "Executive",
-    }
-    wt_labels = {1: "On-site", 2: "Remote", 3: "Hybrid"}
-    keywords = data.get("keywords") if isinstance(data.get("keywords"), list) else []
-    locations = data.get("locations") if isinstance(data.get("locations"), list) else []
-    experience = data.get("experience_levels") if isinstance(data.get("experience_levels"), list) else []
-    workplace = data.get("workplace_types") if isinstance(data.get("workplace_types"), list) else []
-    source = esc(str(data.get("source") or "cache"))
-    reason = esc(str(data.get("reason") or "").strip())
-    exp_bits = []
-    for x in experience:
+        raw_filters = None
+    if raw_filters is None:
         try:
-            code = int(x)
-        except (TypeError, ValueError):
-            continue
-        exp_bits.append(f"{exp_labels.get(code, code)} ({code})")
-    wt_bits = []
-    for x in workplace:
-        try:
-            code = int(x)
-        except (TypeError, ValueError):
-            continue
-        wt_bits.append(f"{wt_labels.get(code, code)} ({code})")
-    exp_txt = ", ".join(exp_bits) or "—"
-    wt_txt = ", ".join(wt_bits) or "—"
-    pretty = esc(json.dumps(data, ensure_ascii=False, indent=2))
+            legacy = json.loads((cfg.get("apify_linkedin_filter_json") or "").strip() or "null")
+            raw_filters = [legacy] if isinstance(legacy, dict) else None
+        except json.JSONDecodeError:
+            raw_filters = None
+    filters = _normalize_linkedin_filters(raw_filters, cfg, fallback_if_empty=False)
+    exp_labels = {1: "Estágio", 2: "Júnior", 3: "Associado", 4: "Pleno / sênior", 5: "Diretor", 6: "Executivo"}
+    workplace_labels = {1: "Presencial", 2: "Remoto", 3: "Híbrido"}
+    cards = []
+    for item in filters:
+        checked = " checked" if item.get("enabled", True) else ""
+        selected_exp = {int(x) for x in item.get("experience_levels", []) if str(x).isdigit()}
+        selected_workplace = {int(x) for x in item.get("workplace_types", []) if str(x).isdigit()}
+        experience_options = "".join(
+            f'<label class="linkedin-filter-option"><input type="checkbox" data-filter-experience value="{code}"'
+            f'{" checked" if code in selected_exp else ""}>{label}</label>'
+            for code, label in exp_labels.items()
+        )
+        workplace_options = "".join(
+            f'<label class="linkedin-filter-option"><input type="checkbox" data-filter-workplace value="{code}"'
+            f'{" checked" if code in selected_workplace else ""}>{label}</label>'
+            for code, label in workplace_labels.items()
+        )
+        cards.append(
+            f'<article class="linkedin-filter-card" data-filter-id="{esc(item["id"])}" '
+            f'data-filter-source="{esc(item.get("source", "manual"))}" '
+            f'data-filter-reason="{esc(item.get("reason", ""))}">'
+            '<div class="linkedin-filter-head"><label class="linkedin-filter-enable">'
+            f'<input type="checkbox" data-filter-enabled{checked}> Usar nesta busca</label>'
+            '<button type="button" class="subtle linkedin-filter-delete">Excluir</button></div>'
+            '<label>Nome do filtro<input data-filter-name maxlength="80" value="'
+            f'{esc(item.get("name", ""))}"></label>'
+            '<label>Keywords (separadas por vírgula)<input data-filter-keywords value="'
+            f'{esc(", ".join(item.get("keywords", [])))}"></label>'
+            '<label>Locais (separados por vírgula)<input data-filter-locations value="'
+            f'{esc(", ".join(item.get("locations", [])))}"></label>'
+            '<div class="linkedin-filter-options"><strong>Experiência</strong>'
+            f'{experience_options}</div>'
+            '<div class="linkedin-filter-options"><strong>Modelo de trabalho</strong>'
+            f'{workplace_options}</div><small class="hint">'
+            f'{esc(item.get("reason", ""))}</small></article>'
+        )
+    filters_json = esc(json.dumps(filters, ensure_ascii=False))
     return (
         '<div id="linkedin-filter-panel" class="resume-card" style="margin-top:12px">'
-        '<h3 style="margin:0 0 8px;font-size:14px">Filtro LinkedIn (IA)</h3>'
-        f'<p class="hint" style="margin:0 0 8px"><strong>Origem:</strong> {source}<br>'
-        f"<strong>Keywords:</strong> {esc(', '.join(str(k) for k in keywords) or '—')}<br>"
-        f"<strong>Locations:</strong> {esc(', '.join(str(x) for x in locations) or '—')}<br>"
-        f"<strong>Nível (f_E):</strong> {esc(exp_txt)}<br>"
-        f"<strong>Local de trabalho (f_WT):</strong> {esc(wt_txt)}<br>"
-        f"<strong>Recência (f_TPR):</strong> máx. {LINKEDIN_MAX_AGE_DAYS} dias "
-        f"(prioridade: mesmo dia / 24h)</p>"
-        + (f'<p class="hint" style="margin:0 0 8px"><strong>Motivo:</strong> {reason}</p>' if reason else "")
-        + '<details><summary>JSON completo</summary>'
-        f'<pre style="margin:8px 0 0;white-space:pre-wrap;font:12px/1.4 ui-monospace,Menlo,Consolas,monospace;'
-        f'max-height:240px;overflow:auto;background:#f4f7f7;padding:10px;border-radius:8px">{pretty}</pre>'
-        "</details>"
-        '<p class="hint" style="margin:8px 0 0">Somente leitura. As URLs de busca sempre usam '
-        f"<code>f_TPR={LINKEDIN_TPR_DAY}</code> (mesmo dia, prioridade) e "
-        f"<code>f_TPR={LINKEDIN_TPR_WEEK}</code> (≤{LINKEDIN_MAX_AGE_DAYS} dias). "
-        "Regenera quando o currículo analisado ou o <em>prompt do filtro</em> (aba Busca) mudam — "
-        "ou na hora ao salvar o prompt.</p>"
-        "</div>"
+        '<h3 style="margin:0 0 8px;font-size:14px">Filtros LinkedIn</h3>'
+        '<p class="hint">Cada filtro ativo executa uma busca Apify independente e consome um run do actor. '
+        'Desative filtros para '
+        'pausá-los sem perder a configuração; use Excluir para removê-los.</p>'
+        f'<input type="hidden" id="linkedin-filters-json" name="apify_linkedin_filters_json" value="{filters_json}">'
+        f'<div id="linkedin-filter-list">{"".join(cards) if cards else "<p class=\"hint\">Nenhum filtro criado ainda. Adicione um manualmente ou peça à IA para gerar vários.</p>"}</div>'
+        '<div class="linkedin-filter-add"><input id="new-linkedin-filter-name" placeholder="Nome do novo filtro">'
+        '<input id="new-linkedin-filter-keywords" placeholder="Keywords separadas por vírgula">'
+        '<button type="button" class="subtle" id="linkedin-filter-add">Adicionar filtro</button>'
+        '<button type="submit" class="subtle" formaction="/linkedin-filters-generate">Gerar filtros com IA</button></div>'
+        f'<p class="hint">As URLs são limitadas a {LINKEDIN_MAX_AGE_DAYS} dias; priorizam as últimas 24h. '
+        'A IA separa títulos e competências em filtros menores. Edite os filtros, marque quais usar e salve as preferências.</p>'
+        '</div>'
     )
 
 
@@ -1751,8 +1885,9 @@ def build_linkedin_search_urls(filter_data: dict, *, max_urls: int = 4) -> list[
             pairs.append((loc, "3"))
     if 1 in workplace and not pairs:
         pairs.append((locations[0], "1"))
-    if not pairs:
-        # Sem f_WT explícito: remote global + BH.
+    if not workplace:
+        pairs = [(loc, "") for loc in locations]
+    elif not pairs:
         pairs = [("Remote", "2"), ("Belo Horizonte", "3")]
 
     def _url(keyword: str, location: str, f_wt: str, tpr: str) -> str:
@@ -1795,13 +1930,18 @@ def build_linkedin_search_urls(filter_data: dict, *, max_urls: int = 4) -> list[
     return urls
 
 
-def build_apify_run_input(actor: dict, cfg: dict[str, str]) -> dict:
+def build_apify_run_input(
+    actor: dict,
+    cfg: dict[str, str],
+    *,
+    linkedin_filter: dict | None = None,
+) -> dict:
     keywords = terms(cfg.get("keywords", ""))[:3] or ["software engineer"]
     locations = terms(cfg.get("locations", ""))[:3] or ["remote"]
     count = int(actor.get("count") or 25)
     mode = str(actor.get("input_mode") or "linkedin_search")
     if mode == "linkedin_search":
-        filter_data = get_linkedin_search_filter(cfg)
+        filter_data = linkedin_filter or get_linkedin_search_filter(cfg)
         urls = build_linkedin_search_urls(filter_data, max_urls=LINKEDIN_SEARCH_MAX_URLS)
         return {"urls": urls, "count": count, "scrapeCompany": False}
 
@@ -2026,10 +2166,16 @@ def normalize_apify_items(items: list, *, label: str) -> list[dict]:
     return results
 
 
-def run_apify_actor(token: str, actor: dict, cfg: dict[str, str]) -> list[dict]:
+def run_apify_actor(
+    token: str,
+    actor: dict,
+    cfg: dict[str, str],
+    *,
+    linkedin_filter: dict | None = None,
+) -> list[dict]:
     actor_id = normalize_apify_actor_id(str(actor["id"]))
     label = str(actor.get("label") or actor_id)
-    run_input = build_apify_run_input(actor, cfg)
+    run_input = build_apify_run_input(actor, cfg, linkedin_filter=linkedin_filter)
     log_event("info", "apify", f"Iniciando actor {label} ({actor_id}).")
     started = fetch_json(
         f"{APIFY_API}/actors/{quote_plus(actor_id)}/runs",
@@ -2065,7 +2211,7 @@ def run_apify_actor(token: str, actor: dict, cfg: dict[str, str]) -> list[dict]:
 
 
 def fetch_apify() -> list[dict]:
-    """Roda todos os actors Apify habilitados e mescla os resultados."""
+    """Run enabled actors; LinkedIn actors run once for each enabled filter."""
     token = secret_get("apify_token")
     if not token:
         raise ValueError("Configure o token da Apify no painel.")
@@ -2085,26 +2231,51 @@ def fetch_apify() -> list[dict]:
     actors = [actor for actor in load_apify_actors(cfg) if actor.get("enabled", True)]
     if not actors:
         raise ValueError("Nenhum actor Apify habilitado em apify_actors_json.")
+    linkedin_filters: list[dict] = []
+    if any(actor.get("input_mode") == "linkedin_search" for actor in actors):
+        linkedin_filters = [
+            item for item in get_linkedin_search_filters(cfg) if item.get("enabled", True)
+        ]
+        if not linkedin_filters:
+            log_event("info", "apify", "Todos os filtros LinkedIn estão desativados; nenhum run LinkedIn será iniciado.")
 
     results: list[dict] = []
     errors: list[str] = []
+    budget_exhausted = False
     for actor in actors:
         if collector.stop_event.is_set():
             break
-        # Re-check credit budget between actors.
-        try:
-            used_now, _ = apify_monthly_usage_usd(token)
-            if used_now >= limit:
-                errors.append(f"{actor.get('label')}: limite de créditos atingido antes da execução")
+        actor_runs = (
+            [(actor, item) for item in linkedin_filters]
+            if actor.get("input_mode") == "linkedin_search"
+            else [(actor, None)]
+        )
+        for run_actor, linkedin_filter in actor_runs:
+            if collector.stop_event.is_set():
                 break
-        except Exception:
-            pass
-        try:
-            results.extend(run_apify_actor(token, actor, cfg))
-        except Exception as exc:
-            LOG.exception("Falha no actor Apify %s", actor.get("id"))
-            errors.append(f"{actor.get('label')}: {exc}")
-            log_event("error", "apify", f"Falha no actor {actor.get('label')}: {exc}")
+            run_label = str(actor.get("label") or actor["id"])
+            if linkedin_filter:
+                run_actor = {**actor, "label": f"{run_label} — {linkedin_filter['name']}"}
+                run_label = run_actor["label"]
+            # Re-check the configured monthly credit ceiling before every run.
+            try:
+                used_now, _ = apify_monthly_usage_usd(token)
+                if used_now >= limit:
+                    errors.append(f"{run_label}: limite de créditos atingido antes da execução")
+                    budget_exhausted = True
+                    break
+            except Exception:
+                pass
+            try:
+                results.extend(
+                    run_apify_actor(token, run_actor, cfg, linkedin_filter=linkedin_filter)
+                )
+            except Exception as exc:
+                LOG.exception("Falha no actor Apify %s", run_label)
+                errors.append(f"{run_label}: {exc}")
+                log_event("error", "apify", f"Falha no actor {run_label}: {exc}")
+        if budget_exhausted:
+            break
     try:
         used_after, cycle_after = apify_monthly_usage_usd(token)
         set_setting("apify_last_usage_usd", f"{used_after:.4f}")
@@ -3244,31 +3415,7 @@ html,body{height:100%}
   background: var(--bg);
   border-radius: 8px;
 }
-/* Setas pretas nos extremos das barras de rolagem */
-*::-webkit-scrollbar-button:single-button {
-  background: #000 !important;      /* seta preta */
-  border: none;
-  width: 9px;
-  height: 9px;
-  display: block;
-}
-/* Mantém as setas pretas no hover e ativo */
-*::-webkit-scrollbar-button:single-button:hover,
-*::-webkit-scrollbar-button:single-button:active {
-  background: #000 !important;
-}
-/* Garante que o símbolo das setas (pseudo-elemento) seja preto */
-*::-webkit-scrollbar-button:single-button:vertical:decrement,
-*::-webkit-scrollbar-button:single-button:vertical:increment,
-*::-webkit-scrollbar-button:single-button:horizontal:decrement,
-*::-webkit-scrollbar-button:single-button:horizontal:increment {
-  background-color: #000 !important;
-  border: none;
-}
-/* Remove os ícones padrão para forçar aparência preta, opcional */
-*::-webkit-scrollbar-button:single-button:before {
-  display: none;
-}
+*::-webkit-scrollbar-button{display:none}
 
 body{margin:0;background:var(--bg);color:var(--ink);
 font:14.5px/1.55 ui-sans-serif,Inter,Segoe UI,Arial,sans-serif;-webkit-font-smoothing:antialiased}
@@ -3307,6 +3454,15 @@ input,textarea,select{font:inherit;color:var(--ink);width:100%;margin-top:6px;pa
 border:1px solid var(--line2);border-radius:9px;background:#0e0e10;transition:border-color .12s,background .12s}
 input:focus,textarea:focus,select:focus{outline:none;border-color:var(--accent);background:#101012}
 input[type=checkbox]{width:auto;margin:0;accent-color:var(--accent)}
+.linkedin-filter-card{border:1px solid var(--line2);border-radius:10px;padding:12px;margin:10px 0;background:#101012}
+.linkedin-filter-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
+.linkedin-filter-enable,.linkedin-filter-option{display:flex;align-items:center;gap:7px}
+.linkedin-filter-options{display:flex;flex-wrap:wrap;gap:8px 14px;align-items:center;margin-top:10px}
+.linkedin-filter-options strong{width:100%;font-size:11px;color:var(--muted2)}
+.linkedin-filter-option{font-size:11.5px;font-weight:500}
+.linkedin-filter-add{display:grid;grid-template-columns:minmax(160px,1fr) minmax(220px,2fr) auto auto;gap:8px;margin-top:12px;align-items:end}
+.linkedin-filter-add input{margin:0}
+@media(max-width:760px){.linkedin-filter-add{grid-template-columns:1fr 1fr}.linkedin-filter-add button{width:100%}}
 option{background:#0e0e10;color:var(--ink)}
 .hint{color:var(--muted2);font-size:11.5px;margin:12px 0 0;line-height:1.5}
 .hint code{background:#000;border:1px solid var(--line);border-radius:5px;padding:1px 5px;color:var(--muted);font-size:11px}
@@ -3458,7 +3614,60 @@ color:#c9c9d1;border:1px solid var(--line);border-radius:10px;padding:12px;max-h
 @media(max-width:900px){.log-line{grid-template-columns:1fr;gap:2px}}
 @media(max-width:820px){.shell{grid-template-columns:1fr}.sidebar{position:static;height:auto}
 .top{grid-template-columns:1fr}.stats{grid-template-columns:repeat(2,1fr)}
-.form-grid{grid-template-columns:1fr}}"""
+.form-grid{grid-template-columns:1fr}}
+
+/* Product visual system: warm graphite, quiet chrome, red reserved for action. */
+:root{--bg:#101112;--panel:#151718;--panel2:#1b1e1f;--line:#292d2e;--line2:#3a3f40;
+--ink:#ece9e5;--muted:#a5a19c;--muted2:#77746f;--accent:#d84b45;--accent2:#eb5b54}
+body{font-size:14px;line-height:1.55;letter-spacing:.008em;background:var(--bg)}
+.shell{grid-template-columns:232px minmax(0,1fr)}
+.sidebar{background:#131516;border-right-color:#242829;padding:24px 13px 16px;gap:22px}
+.brand{padding:0 9px 17px;border-bottom-color:#292d2e}
+.brand strong{font-size:14px;letter-spacing:-.01em;text-transform:none}
+.brand small{font-size:10.5px;letter-spacing:.045em;color:#85817b}
+.nav-label{font-size:9.5px;letter-spacing:.17em;margin:7px 10px 7px}
+.tabs{gap:3px}
+.tab{padding:8px 10px;border-radius:6px;font-size:13px;font-weight:600;border:0;gap:10px}
+.tab::before{content:"";width:4px;height:4px;border-radius:50%;background:transparent;flex:none}
+.tab.active{background:#202324;color:#f4f1ec}
+.tab.active::before{background:var(--accent)}
+.tab:hover{background:#1b1e1f}
+.content{padding:30px clamp(20px,3.2vw,48px) 48px}
+h1{font-size:21px;letter-spacing:-.025em}h2{font-size:16px;letter-spacing:-.015em;margin-bottom:18px}
+.panel{background:var(--panel);border-color:#292d2e;border-radius:9px;padding:22px;margin-bottom:16px;box-shadow:none}
+.panel > h2{display:flex;align-items:center;gap:11px;padding-bottom:14px;border-bottom:1px solid #292d2e}
+.panel > h2::before{content:"";display:block;width:14px;height:2px;background:var(--accent);flex:none}
+.stat,.usage-card,.worth-card{background:var(--panel);border-color:#292d2e;border-radius:8px}
+.form-grid{gap:18px}
+label{color:#c1bfba;font-size:12px;font-weight:650}
+input,textarea,select{background:#111314;border-color:#34393a;border-radius:6px;padding:10px 11px}
+input:focus,textarea:focus,select:focus{border-color:#a9443f;box-shadow:0 0 0 2px rgba(216,75,69,.13)}
+button{border-radius:6px;font-weight:650;background:var(--accent);color:#fff}
+button:hover{filter:brightness(1.08)}
+button.subtle{border-radius:6px;background:transparent;color:#b4b0aa;border-color:#383d3e}
+button.subtle:hover{background:#222627;color:#f0ede8;border-color:#555b5c;filter:none}
+.hint{font-size:12px;color:#898680;line-height:1.6}
+.help-disclosure{margin:10px 0 14px}
+.help-disclosure summary{list-style:none;display:inline-flex;align-items:center;gap:7px;color:#8c8987;font-size:11.5px;user-select:none}
+.help-disclosure summary::-webkit-details-marker{display:none}
+.help-disclosure summary::before{content:"?";display:inline-grid;place-items:center;width:17px;height:17px;border:1px solid #4a4847;border-radius:50%;color:#c2bfbd;font-size:10px;font-weight:700;transition:all .15s}
+.help-disclosure[open] summary{color:#d3cfcc}
+.help-disclosure[open] summary::before{border-color:var(--accent);background:var(--accent);color:#fff}
+.help-disclosure .hint{max-width:850px;margin:8px 0 0;padding:10px 12px;border-left:2px solid #493032;background:rgba(255,255,255,.025);border-radius:0 6px 6px 0}
+.help-disclosure:focus-within summary{outline:2px solid rgba(217,67,72,.6);outline-offset:3px;border-radius:3px}
+.optimism-control{display:grid;grid-template-columns:1fr auto;gap:6px 12px;align-items:center;max-width:560px;margin:14px 0}
+.optimism-control input[type=range]{grid-column:1/-1;width:100%;margin:2px 0;accent-color:var(--accent);padding:0;border:0;background:transparent}
+.optimism-control small{grid-column:1/-1;color:var(--muted2);font-size:11.5px;font-weight:500}
+.optimism-value{font-variant-numeric:tabular-nums;color:var(--ink);font-size:12px}
+.job-selection-prompt{margin:15px 0 4px}
+.job-selection-prompt summary{font-size:12px}
+.job-selection-prompt label{margin-top:12px}
+.job-selection-prompt textarea{font:12px/1.55 ui-monospace,SFMono-Regular,Consolas,monospace}
+.table-wrap{border-radius:8px;border-color:#292d2e}th{background:#191c1d;color:#898680}
+.source{border-radius:4px;background:#1d2021}
+.sidebar-foot{border-top-color:#29292b}
+@media(max-width:820px){.shell{grid-template-columns:1fr}.sidebar{padding:14px;gap:12px}.brand{padding-bottom:12px}.tabs{display:grid;grid-template-columns:repeat(2,minmax(0,1fr))}.nav-label{grid-column:1/-1}}
+"""
 
 def render_page(notice: str = "", notice_kind: str = "success") -> str:
     """Monta o painel local: preferências, controles, histórico e vagas capturadas."""
@@ -3496,12 +3705,20 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
         f'{" hidden" if not notice else ""}>'
         f"{esc(notice) if notice else ''}</div>"
     )
-    return f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Radar de Vagas</title>
+    optimism_value, _ = job_selection_optimism_instruction(cfg.get("job_selection_optimism"))
+    selection_controls_html = f'''<h3 style="margin:22px 0 10px;color:var(--muted)">Seleção de vagas</h3>
+<label class="optimism-control">Otimismo da triagem <span class="optimism-value" id="job-selection-optimism-value">{optimism_value}/100</span>
+<input type="range" name="job_selection_optimism" id="job-selection-optimism" min="0" max="100" step="1" value="{optimism_value}">
+<small>Mais baixo = seleção criteriosa. Mais alto = considera mais vagas com potencial.</small></label>
+<details class="job-selection-prompt"><summary>Editar instruções da seleção</summary>
+<label>Prompt de seleção<textarea name="job_selection_prompt" rows="9">{esc(effective_job_selection_prompt(cfg))}</textarea></label>
+<p class="hint">O sistema acrescenta o nível de otimismo, currículo e dados da vaga automaticamente. Não remova as instruções de formato JSON.</p></details>'''
+    page_html = f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Odradek Scraper</title>
 <link rel="icon" href="/favicon.ico" type="image/x-icon">
 <style>{PAGE_CSS}</style></head><body>
 <div class="shell">
 <aside class="sidebar">
-<div class="brand"><strong>Radar de Vagas</strong><small>coleta &middot; triagem &middot; candidaturas</small></div>
+<div class="brand"><strong>Odradek Scraper</strong><small>coleta &middot; triagem &middot; candidaturas</small></div>
 <nav class="tabs" aria-label="Seções do painel">
 <span class="nav-label">Operação</span>
 <button type="button" class="tab active" data-tab="painel">Visão geral</button>
@@ -3529,7 +3746,7 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
 <section class="panel" style="margin-top:18px"><h2>Execuções recentes</h2><ul class="history" id="run-history">{history}</ul></section>
 </div>
 
-<div id="tab-busca" class="tab-panel"><section class="panel"><h2>Busca &amp; coleta</h2><form method="post" action="/settings"><div class="form-grid"><label>Cargos e termos, separados por vírgula<textarea name="keywords" rows="3">{esc(cfg.get('keywords',''))}</textarea></label><label>Países/regiões aceitos<textarea name="locations" rows="3">{esc(cfg.get('locations',''))}</textarea></label><label>Fontes: remotive, remoteok, adzuna, apify<input name="sources" value="{esc(cfg.get('sources',''))}"></label><label>Intervalo de busca (minutos)<input name="interval_minutes" type="number" min="5" value="{esc(cfg.get('interval_minutes','15'))}"></label><label>Países Adzuna (ex.: br,us,gb,ca)<input name="adzuna_countries" value="{esc(cfg.get('adzuna_countries','br,us,gb,ca'))}"></label><label>Limite mensal Apify (USD)<input name="apify_monthly_credit_limit_usd" type="number" min="0" step="0.01" value="{esc(cfg.get('apify_monthly_credit_limit_usd','5'))}"></label><label>Máximo de vagas por ciclo Apify<input name="apify_job_count" type="number" min="1" max="100" value="{esc(cfg.get('apify_job_count','25'))}"></label><label style="grid-column:1/-1">Actors Apify (JSON — um ou mais scrapers)<textarea name="apify_actors_json" rows="8" style="font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px">{esc(cfg.get('apify_actors_json',''))}</textarea></label></div><p class="hint">Cada actor: <code>id</code>, <code>label</code>, <code>enabled</code>, <code>input_mode</code> (<code>linkedin_search</code> ou <code>custom</code>), <code>count</code> opcional. Em <code>linkedin_search</code>, a IA monta sozinha keywords + f_E (nível) + f_WT (remote/híbrido) a partir do currículo (cache até o prompt ou o currículo mudarem). Em <code>custom</code>, use <code>input_template</code> com placeholders <code>{{keyword}}</code>, <code>{{location}}</code>, <code>{{count}}</code>, <code>{{keywords}}</code>.</p><label style="margin:16px 0 8px;display:block;grid-column:1/-1">Prompt do filtro LinkedIn (IA)<textarea name="linkedin_filter_prompt" rows="14" style="font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px">{esc(effective_linkedin_filter_prompt(cfg))}</textarea></label><p class="hint">Edite as instruções da IA para o filtro. Placeholders: <code>{{pref_keywords}}</code>, <code>{{facts_pt}}</code>, <code>{{facts_en}}</code>, <code>{{resume_pt}}</code>, <code>{{resume_en}}</code>. Ao salvar com mudanças neste texto, o filtro é <strong>regerado</strong> na hora (precisa de chave de IA e currículo analisado).</p><div id="linkedin-filter-slot">{linkedin_filter_view}</div><button>Salvar preferências</button></form></section></div>
+<div id="tab-busca" class="tab-panel"><section class="panel"><h2>Busca &amp; coleta</h2><form method="post" action="/settings"><div class="form-grid"><label>Cargos e termos, separados por vírgula<textarea name="keywords" rows="3">{esc(cfg.get('keywords',''))}</textarea></label><label>Países/regiões aceitos<textarea name="locations" rows="3">{esc(cfg.get('locations',''))}</textarea></label><label>Fontes: remotive, remoteok, adzuna, apify<input name="sources" value="{esc(cfg.get('sources',''))}"></label><label>Intervalo de busca (minutos)<input name="interval_minutes" type="number" min="5" value="{esc(cfg.get('interval_minutes','15'))}"></label><label>Países Adzuna (ex.: br,us,gb,ca)<input name="adzuna_countries" value="{esc(cfg.get('adzuna_countries','br,us,gb,ca'))}"></label><label>Limite mensal Apify (USD)<input name="apify_monthly_credit_limit_usd" type="number" min="0" step="0.01" value="{esc(cfg.get('apify_monthly_credit_limit_usd','5'))}"></label><label>Máximo de vagas por ciclo Apify<input name="apify_job_count" type="number" min="1" max="100" value="{esc(cfg.get('apify_job_count','25'))}"></label><label style="grid-column:1/-1">Actors Apify (JSON — um ou mais scrapers)<textarea name="apify_actors_json" rows="8" style="font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px">{esc(cfg.get('apify_actors_json',''))}</textarea></label></div><p class="hint">Cada actor: <code>id</code>, <code>label</code>, <code>enabled</code>, <code>input_mode</code> (<code>linkedin_search</code> ou <code>custom</code>), <code>count</code> opcional. Em <code>linkedin_search</code>, cada filtro LinkedIn ativo gera um run Apify independente; a IA cria vários filtros a partir do currículo. Em <code>custom</code>, use <code>input_template</code> com placeholders <code>{{keyword}}</code>, <code>{{location}}</code>, <code>{{count}}</code>, <code>{{keywords}}</code>.</p><label style="margin:16px 0 8px;display:block;grid-column:1/-1">Prompt do filtro LinkedIn (IA)<textarea name="linkedin_filter_prompt" rows="14" style="font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px">{esc(effective_linkedin_filter_prompt(cfg))}</textarea></label><p class="hint">Edite as instruções da IA para o filtro. Placeholders: <code>{{pref_keywords}}</code>, <code>{{facts_pt}}</code>, <code>{{facts_en}}</code>, <code>{{resume_pt}}</code>, <code>{{resume_en}}</code>. Ao salvar com mudanças neste texto, os filtros são <strong>regenerados</strong> na hora (precisa de chave de IA e currículo analisado).</p><div id="linkedin-filter-slot">{linkedin_filter_view}</div><button>Salvar preferências</button></form></section></div>
 
 <div id="tab-curriculos" class="tab-panel"><section class="panel"><h2>Currículos (PDF)</h2>{resume_panel}<p class="hint">O seletor de arquivos do sistema abre ao escolher o PDF. A análise agora gera um dossiê completo (skills, experiências, projetos). Use <em>Reanalisar</em> para regenerar com o prompt enriquecido.</p></section></div>
 
@@ -3537,11 +3754,11 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
 
 <div id="tab-ia" class="tab-panel"><section class="panel"><h2>IA &amp; integrações</h2><form method="post" action="/ai-settings"><div class="form-grid"><label>Provedor de IA<select name="ai_provider"><option value="gemini" {'selected' if cfg.get('ai_provider') == 'gemini' else ''}>Gemini</option><option value="openai" {'selected' if cfg.get('ai_provider') == 'openai' else ''}>OpenAI</option></select></label><label>Modelo<input name="ai_model" value="{esc(cfg.get('ai_model','gemini-2.5-flash'))}"></label><label>Motor de navegador<select name="browser_engine"><option value="pydoll" {'selected' if cfg.get('browser_engine','pydoll') == 'pydoll' else ''}>Pydoll (CDP, stealth — padrão)</option><option value="playwright" {'selected' if cfg.get('browser_engine','pydoll') == 'playwright' else ''}>Playwright (fallback)</option></select></label><label>Chave de IA (vazio mantém a salva)<input type="password" name="api_key" autocomplete="new-password"></label><label>Adzuna App ID<input name="adzuna_app_id" value=""></label><label>Adzuna API key<input type="password" name="adzuna_app_key" value=""></label><label>Token Apify<input type="password" name="apify_token" value="" autocomplete="new-password"></label></div><label style="margin-top:14px">Fatos profissionais em português<textarea name="candidate_facts_pt" rows="3">{esc(cfg.get('candidate_facts_pt',''))}</textarea></label><label style="margin-top:12px">Professional facts in English<textarea name="candidate_facts_en" rows="3">{esc(cfg.get('candidate_facts_en',''))}</textarea></label><p class="hint">Chaves vão para o cofre do sistema. Os fatos alimentam a IA nas perguntas abertas e de opções.</p><button style="margin-top:14px">Salvar IA e integrações</button></form></section><section class="panel"><h2>Regras de formulário (navegador)</h2><form method="post" action="/profile-settings">{rules_panel}<p class="hint">Modo <code>salary</code> escolhe automaticamente BRL×USD pela moeda do campo e aplica o multiplicador PJ ao valor BRL quando a contratação preferida é PJ; "Valor fixo" só é usado como desempate. No modo <code>select</code>, coloque em "Valor fixo" o texto da opção preferida. Perguntas abertas sem regra usam a IA.</p><button>Salvar regras</button></form></section></div>
 
-<div id="tab-automacao" class="tab-panel"><section class="panel"><h2>Automação</h2><form method="post" action="/automation-settings"><label style="margin:0 0 12px;display:flex;gap:8px;align-items:flex-start"><input type="checkbox" name="auto_apply" value="1" {'checked' if cfg.get('auto_apply') == '1' else ''} style="width:auto;margin-top:3px"> <span>Após a coleta, enfileirar e triar vagas novas automaticamente. O envio automático fica limitado a e-mail SMTP; formulários são preenchidos por você no Chrome com a extensão.</span></label><div class="form-grid"><label>Score mínimo (%)<input name="minimum_match_score" type="number" min="0" max="100" value="{esc(cfg.get('minimum_match_score','80'))}"></label><label>Workers da fila (vagas em paralelo)<input name="queue_max_workers" type="number" min="1" max="8" value="{esc(cfg.get('queue_max_workers','3'))}"></label><label>Máx. tentativas por job<input name="queue_max_attempts" type="number" min="1" max="200" value="{esc(cfg.get('queue_max_attempts','40'))}"></label><label>TTL da fila (horas)<input name="queue_ttl_hours" type="number" min="1" max="168" value="{esc(cfg.get('queue_ttl_hours','24'))}"></label><label>Volume do som do copiloto (0–100)<input name="copilot_ask_sound_volume" type="number" min="0" max="100" value="{esc(str(int(round(_copilot_ask_volume(cfg) * 100))))}"></label></div><label style="margin:12px 0 18px;display:flex;gap:8px;align-items:flex-start"><input type="checkbox" name="copilot_ask_sound" value="1" {'checked' if cfg.get('copilot_ask_sound', '1') == '1' else ''} style="width:auto;margin-top:3px"> <span>Tocar som de notificação no painel quando o copiloto pedir um dado</span></label><p class="hint">A disponibilidade das vagas em “Vale a pena olhar” é verificada automaticamente uma vez por dia por HTTP e endpoints públicos. Verificações inconclusivas mantêm a vaga na lista.</p><p class="hint">Vagas de formulário ficam em <em>Vale a pena olhar</em>. Abra a vaga no Chrome e use Job Autofill; revise e envie manualmente.</p><button style="margin-top:14px">Salvar automação</button></form></section></div>
+<div id="tab-automacao" class="tab-panel"><section class="panel"><h2>Automação</h2><form method="post" action="/automation-settings"><label style="margin:0 0 12px;display:flex;gap:8px;align-items:flex-start"><input type="checkbox" name="auto_apply" value="1" {'checked' if cfg.get('auto_apply') == '1' else ''} style="width:auto;margin-top:3px"> <span>Após a coleta, enfileirar e triar vagas novas automaticamente. O envio automático fica limitado a e-mail SMTP; formulários são preenchidos por você no Chrome com a extensão.</span></label><div class="form-grid"><label>Score mínimo (%)<input name="minimum_match_score" type="number" min="0" max="100" value="{esc(cfg.get('minimum_match_score','80'))}"></label><label>Workers da fila (vagas em paralelo)<input name="queue_max_workers" type="number" min="1" max="8" value="{esc(cfg.get('queue_max_workers','3'))}"></label><label>Máx. tentativas por job<input name="queue_max_attempts" type="number" min="1" max="200" value="{esc(cfg.get('queue_max_attempts','40'))}"></label><label>TTL da fila (horas)<input name="queue_ttl_hours" type="number" min="1" max="168" value="{esc(cfg.get('queue_ttl_hours','24'))}"></label><label>Volume do som do copiloto (0–100)<input name="copilot_ask_sound_volume" type="number" min="0" max="100" value="{esc(str(int(round(_copilot_ask_volume(cfg) * 100))))}"></label></div><label style="margin:12px 0 18px;display:flex;gap:8px;align-items:flex-start"><input type="checkbox" name="copilot_ask_sound" value="1" {'checked' if cfg.get('copilot_ask_sound', '1') == '1' else ''} style="width:auto;margin-top:3px"> <span>Tocar som de notificação no painel quando o copiloto pedir um dado</span></label><p class="hint">A disponibilidade das vagas em “Vale a pena olhar” é verificada automaticamente uma vez por dia por HTTP e endpoints públicos. Verificações inconclusivas mantêm a vaga na lista.</p><p class="hint">Vagas de formulário ficam em <em>Vale a pena olhar</em>. Abra a vaga no Chrome e use Odradek Autofill; revise e envie manualmente.</p><button style="margin-top:14px">Salvar automação</button></form></section></div>
 
 <div id="tab-smtp" class="tab-panel"><section class="panel"><h2>SMTP</h2><form method="post" action="/smtp-settings"><div class="form-grid"><label>Host<input name="smtp_host" value="{esc(cfg.get('smtp_host',''))}"></label><label>Porta<input name="smtp_port" type="number" value="{esc(cfg.get('smtp_port','587'))}"></label><label>Usuário<input name="smtp_user" value="{esc(cfg.get('smtp_user',''))}"></label><label>Remetente (From)<input name="smtp_from" value="{esc(cfg.get('smtp_from',''))}"></label><label>Senha (vazio mantém)<input type="password" name="smtp_password" autocomplete="new-password"></label><label>TLS<select name="smtp_use_tls"><option value="1" {'selected' if cfg.get('smtp_use_tls','1')=='1' else ''}>Sim (STARTTLS)</option><option value="0" {'selected' if cfg.get('smtp_use_tls')=='0' else ''}>Não</option></select></label></div><div class="actions"><button>Salvar SMTP</button></div></form><form method="post" action="/smtp-test" style="margin-top:8px"><button class="subtle" type="submit">Enviar e-mail de teste</button></form></section></div>
 
-<div id="tab-vale" class="tab-panel"><section class="panel"><h2>Vale a pena olhar</h2><p class="hint">Vagas que merecem revisão manual ou cujo envio por e-mail não foi possível. Abra a vaga no Chrome e use a extensão Job Autofill para preencher o formulário.</p><div id="worth-body">{worth_view}</div></section></div>
+<div id="tab-vale" class="tab-panel"><section class="panel"><h2>Vale a pena olhar</h2><p class="hint">Vagas que merecem revisão manual ou cujo envio por e-mail não foi possível. Abra a vaga no Chrome e use a extensão Odradek Autofill para preencher o formulário.</p><div id="worth-body">{worth_view}</div></section></div>
 
 <div id="worth-ignore-modal" class="modal" hidden>
   <div class="modal-backdrop" data-worth-ignore-dismiss></div>
@@ -3593,6 +3810,35 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
   var liveController = null;
   var inFlightView = "";
   var panelReady = false;
+  function condenseHelpText(root) {{
+    (root || document).querySelectorAll('.tab-panel > section.panel p.hint, .tab-panel > section.panel form > p.hint').forEach(function (hint) {{
+      if (hint.closest('.modal, .assistant-chat, .help-disclosure') || hint.dataset.helpHandled) return;
+      if ((hint.textContent || '').trim().length < 150) return;
+      hint.dataset.helpHandled = '1';
+      var disclosure = document.createElement('details');
+      disclosure.className = 'help-disclosure';
+      var summary = document.createElement('summary');
+      summary.textContent = 'Ajuda';
+      hint.parentNode.insertBefore(disclosure, hint);
+      disclosure.appendChild(summary);
+      disclosure.appendChild(hint);
+    }});
+  }}
+  condenseHelpText(document);
+  var optimismInput = document.getElementById('job-selection-optimism');
+  var optimismValue = document.getElementById('job-selection-optimism-value');
+  if (optimismInput && optimismValue) optimismInput.addEventListener('input', function () {{
+    optimismValue.textContent = optimismInput.value + '/100';
+  }});
+  ['worth-body','queue-body','usage-body','linkedin-filter-slot'].forEach(function (id) {{
+    var host = document.getElementById(id);
+    if (!host || typeof MutationObserver === 'undefined') return;
+    new MutationObserver(function (records) {{
+      records.forEach(function (record) {{ record.addedNodes.forEach(function (node) {{
+        if (node.nodeType === 1) condenseHelpText(node);
+      }}); }});
+    }}).observe(host, {{childList:true,subtree:true}});
+  }});
   function formatCountdownClient(sec) {{
     sec = Math.max(0, Math.floor(sec));
     var h = Math.floor(sec / 3600);
@@ -4368,6 +4614,136 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
         if (submitter) submitter.disabled = false;
       }});
   }});
+  function initLinkedinFilterPanel() {{
+    var linkedinFilterPanel = document.getElementById("linkedin-filter-panel");
+    if (!linkedinFilterPanel || linkedinFilterPanel.dataset.initialized === "1") return;
+    linkedinFilterPanel.dataset.initialized = "1";
+    var linkedinFilterList = document.getElementById("linkedin-filter-list");
+    var linkedinFiltersInput = document.getElementById("linkedin-filters-json");
+    var experienceOptions = [[1, "Estágio"], [2, "Júnior"], [3, "Associado"], [4, "Pleno / sênior"], [5, "Diretor"], [6, "Executivo"]];
+    var workplaceOptions = [[1, "Presencial"], [2, "Remoto"], [3, "Híbrido"]];
+    function commaValues(value) {{
+      return String(value || "").split(",").map(function (x) {{ return x.trim(); }}).filter(Boolean);
+    }}
+    function addFilterOptions(parent, title, attr, options, selected) {{
+      var group = document.createElement("div");
+      group.className = "linkedin-filter-options";
+      var heading = document.createElement("strong");
+      heading.textContent = title;
+      group.appendChild(heading);
+      options.forEach(function (option) {{
+        var label = document.createElement("label");
+        label.className = "linkedin-filter-option";
+        var input = document.createElement("input");
+        input.type = "checkbox";
+        input.setAttribute(attr, "");
+        input.value = String(option[0]);
+        input.checked = selected.indexOf(option[0]) !== -1;
+        label.appendChild(input);
+        label.appendChild(document.createTextNode(option[1]));
+        group.appendChild(label);
+      }});
+      parent.appendChild(group);
+    }}
+    function addFilterTextField(parent, labelText, attr, value) {{
+      var label = document.createElement("label");
+      label.textContent = labelText;
+      var input = document.createElement("input");
+      input.setAttribute(attr, "");
+      input.value = value || "";
+      label.appendChild(input);
+      parent.appendChild(label);
+    }}
+    function createLinkedinFilterCard(filter) {{
+      var card = document.createElement("article");
+      card.className = "linkedin-filter-card";
+      card.setAttribute("data-filter-id", filter.id || ("manual-" + Date.now()));
+      card.setAttribute("data-filter-source", filter.source || "manual");
+      card.setAttribute("data-filter-reason", filter.reason || "Criado manualmente.");
+      var head = document.createElement("div");
+      head.className = "linkedin-filter-head";
+      var enableLabel = document.createElement("label");
+      enableLabel.className = "linkedin-filter-enable";
+      var enabled = document.createElement("input");
+      enabled.type = "checkbox";
+      enabled.setAttribute("data-filter-enabled", "");
+      enabled.checked = filter.enabled !== false;
+      enableLabel.appendChild(enabled);
+      enableLabel.appendChild(document.createTextNode(" Usar nesta busca"));
+      var remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "subtle linkedin-filter-delete";
+      remove.textContent = "Excluir";
+      head.appendChild(enableLabel);
+      head.appendChild(remove);
+      card.appendChild(head);
+      addFilterTextField(card, "Nome do filtro", "data-filter-name", filter.name || "");
+      addFilterTextField(card, "Keywords (separadas por vírgula)", "data-filter-keywords", (filter.keywords || []).join(", "));
+      addFilterTextField(card, "Locais (separados por vírgula)", "data-filter-locations", (filter.locations || ["Remote", "Belo Horizonte"]).join(", "));
+      addFilterOptions(card, "Experiência", "data-filter-experience", experienceOptions, filter.experience_levels || [3, 4]);
+      addFilterOptions(card, "Modelo de trabalho", "data-filter-workplace", workplaceOptions, filter.workplace_types || [2, 3]);
+      var reason = document.createElement("small");
+      reason.className = "hint";
+      reason.textContent = filter.reason || "Filtro criado manualmente.";
+      card.appendChild(reason);
+      return card;
+    }}
+    function syncLinkedinFilters() {{
+      if (!linkedinFiltersInput) return;
+      var filters = Array.from(linkedinFilterList.querySelectorAll(".linkedin-filter-card")).map(function (card) {{
+        return {{
+          id: card.getAttribute("data-filter-id") || ("manual-" + Date.now()),
+          name: (card.querySelector("[data-filter-name]") || {{value: ""}}).value.trim(),
+          enabled: !!(card.querySelector("[data-filter-enabled]") || {{checked: false}}).checked,
+          keywords: commaValues((card.querySelector("[data-filter-keywords]") || {{value: ""}}).value),
+          locations: commaValues((card.querySelector("[data-filter-locations]") || {{value: ""}}).value),
+          experience_levels: Array.from(card.querySelectorAll("[data-filter-experience]:checked")).map(function (x) {{ return Number(x.value); }}),
+          workplace_types: Array.from(card.querySelectorAll("[data-filter-workplace]:checked")).map(function (x) {{ return Number(x.value); }}),
+          reason: card.getAttribute("data-filter-reason") || "",
+          source: card.getAttribute("data-filter-source") || "manual"
+        }};
+      }}).filter(function (filter) {{ return filter.name && filter.keywords.length; }});
+      linkedinFiltersInput.value = JSON.stringify(filters);
+    }}
+    linkedinFilterList.addEventListener("input", syncLinkedinFilters);
+    linkedinFilterList.addEventListener("change", syncLinkedinFilters);
+    linkedinFilterList.addEventListener("click", function (ev) {{
+      var remove = ev.target.closest(".linkedin-filter-delete");
+      if (!remove) return;
+      var card = remove.closest(".linkedin-filter-card");
+      if (card) card.remove();
+      syncLinkedinFilters();
+    }});
+    var addFilterButton = document.getElementById("linkedin-filter-add");
+    if (addFilterButton) addFilterButton.addEventListener("click", function () {{
+      var nameInput = document.getElementById("new-linkedin-filter-name");
+      var keywordsInput = document.getElementById("new-linkedin-filter-keywords");
+      var name = nameInput ? nameInput.value.trim() : "";
+      var keywords = commaValues(keywordsInput ? keywordsInput.value : "");
+      if (!name || !keywords.length) {{
+        showNotice("Informe um nome e ao menos uma keyword para criar o filtro.", "warning");
+        return;
+      }}
+      var emptyHint = linkedinFilterList.querySelector(":scope > .hint");
+      if (emptyHint) emptyHint.remove();
+      linkedinFilterList.appendChild(createLinkedinFilterCard({{
+        id: "manual-" + Date.now(), name: name, keywords: keywords,
+        locations: ["Remote", "Belo Horizonte"], experience_levels: [3, 4],
+        workplace_types: [2, 3], enabled: true, source: "manual",
+        reason: "Filtro criado manualmente."
+      }}));
+      if (nameInput) nameInput.value = "";
+      if (keywordsInput) keywordsInput.value = "";
+      syncLinkedinFilters();
+    }});
+    var filterSettingsForm = linkedinFilterPanel.closest("form");
+    if (filterSettingsForm) filterSettingsForm.addEventListener("submit", syncLinkedinFilters);
+  }}
+  initLinkedinFilterPanel();
+  var linkedinFilterSlot = document.getElementById("linkedin-filter-slot");
+  if (linkedinFilterSlot && typeof MutationObserver !== "undefined") {{
+    new MutationObserver(initLinkedinFilterPanel).observe(linkedinFilterSlot, {{ childList: true, subtree: true }});
+  }}
   var healthHeartbeatInFlight = false;
   function keepServerAwake() {{
     if (healthHeartbeatInFlight) return;
@@ -4391,6 +4767,11 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
   }});
 }})();
 </script></body></html>'''
+    return page_html.replace(
+        '<p class="hint">Chaves vão para o cofre do sistema.',
+        selection_controls_html + '<p class="hint">Chaves vão para o cofre do sistema.',
+        1,
+    )
 
 
 def parse_form(handler: BaseHTTPRequestHandler) -> dict[str, str]:
@@ -4540,10 +4921,10 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 with connect() as db:
                     db.execute("SELECT 1")
-                self.send_extension_json({"ok": True, "service": "job-scraper", "database": "ok"})
+                self.send_extension_json({"ok": True, "service": "odradek-scraper", "database": "ok"})
             except Exception:
                 self.send_extension_json(
-                    {"ok": False, "service": "job-scraper", "database": "unavailable"},
+                    {"ok": False, "service": "odradek-scraper", "database": "unavailable"},
                     status=503,
                 )
             return
@@ -4760,6 +5141,41 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         form = parse_form(self)
+        if path == "/linkedin-filters-generate":
+            try:
+                if "apify_actors_json" in form and form.get("apify_actors_json", "").strip():
+                    load_apify_actors({**settings(), "apify_actors_json": form["apify_actors_json"]})
+                raw_prompt = (form.get("linkedin_filter_prompt") or "").strip()
+                form["linkedin_filter_prompt"] = (
+                    "" if raw_prompt == DEFAULT_LINKEDIN_FILTER_PROMPT.strip() else raw_prompt
+                )
+                current_cfg = {**settings(), **form}
+                if "apify_linkedin_filters_json" in form:
+                    form["apify_linkedin_filters_json"] = _validate_linkedin_filter_form(
+                        form["apify_linkedin_filters_json"], current_cfg
+                    )
+                save_settings(form)
+                cfg = settings()
+                generated = ai_generate_linkedin_search_filters(cfg)
+                previous = _normalize_linkedin_filters(
+                    json.loads(cfg.get("apify_linkedin_filters_json") or "[]"),
+                    cfg,
+                    fallback_if_empty=False,
+                )
+                previous_states = {item["name"].casefold(): item["enabled"] for item in previous}
+                for item in generated:
+                    if item["name"].casefold() in previous_states:
+                        item["enabled"] = previous_states[item["name"].casefold()]
+                payload = json.dumps(generated, ensure_ascii=False)
+                set_setting("apify_linkedin_filters_json", payload)
+                set_setting("apify_linkedin_filter_json", json.dumps(generated[0], ensure_ascii=False))
+                set_setting("apify_linkedin_filter_hash", _resume_filter_fingerprint(cfg))
+                log_event("info", "apify", f"IA gerou {len(generated)} filtros LinkedIn.")
+                self.redirect(f"A IA gerou {len(generated)} filtros LinkedIn. Revise e salve os que deseja usar.")
+            except Exception as exc:
+                log_event("warning", "apify", f"Falha ao gerar filtros LinkedIn: {exc}")
+                self.redirect(f"Não foi possível gerar filtros com IA: {exc}", notice_kind="error")
+            return
         if path == "/reanalyze-resume":
             language = (form.get("language") or "").strip().casefold()
             if language not in {"pt", "en"}:
@@ -4815,6 +5231,14 @@ class Handler(BaseHTTPRequestHandler):
                 except ValueError as exc:
                     self.redirect(f"Actors Apify inválidos: {exc}", notice_kind="error")
                     return
+            if "apify_linkedin_filters_json" in form:
+                try:
+                    form["apify_linkedin_filters_json"] = _validate_linkedin_filter_form(
+                        form["apify_linkedin_filters_json"], {**settings(), **form}
+                    )
+                except ValueError as exc:
+                    self.redirect(f"Filtros LinkedIn inválidos: {exc}", notice_kind="error")
+                    return
             old_prompt = effective_linkedin_filter_prompt(settings())
             raw_prompt = (form.get("linkedin_filter_prompt") or "").strip()
             # Mesmo texto do default embutido → guarda vazio (usa DEFAULT).
@@ -4829,9 +5253,9 @@ class Handler(BaseHTTPRequestHandler):
             notice_kind = "success"
             if new_prompt != old_prompt:
                 try:
-                    get_linkedin_search_filter(new_cfg, force_refresh=True)
-                    notice = "Filtros salvos e filtro LinkedIn regerado."
-                    log_event("info", "settings", "Prompt do filtro LinkedIn alterado; filtro regerado.")
+                    regenerated = get_linkedin_search_filters(new_cfg, force_refresh=True)
+                    notice = f"Preferências salvas e {len(regenerated)} filtros LinkedIn regenerados."
+                    log_event("info", "settings", f"Prompt LinkedIn alterado; {len(regenerated)} filtros regenerados.")
                 except Exception as exc:
                     notice = (
                         "Preferências salvas, mas falhou ao regenerar o filtro LinkedIn: "
@@ -4840,6 +5264,8 @@ class Handler(BaseHTTPRequestHandler):
                     notice_kind = "warning"
                     log_event("warning", "settings", f"Regeneração do filtro LinkedIn falhou: {exc}")
             else:
+                if "apify_linkedin_filters_json" in form:
+                    set_setting("apify_linkedin_filter_hash", _resume_filter_fingerprint(new_cfg))
                 log_event("info", "settings", "Preferências de busca salvas.")
             self.redirect(notice, notice_kind=notice_kind)
         elif path == "/candidate-settings":
@@ -4849,6 +5275,12 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/ai-settings":
             # Assisted-only: strip any legacy auto-submit flag if present in DB form posts.
             form.pop("linkedin_stop_before_submit", None)
+            optimism, _ = job_selection_optimism_instruction(form.get("job_selection_optimism"))
+            form["job_selection_optimism"] = str(optimism)
+            selection_prompt = str(form.get("job_selection_prompt") or "").strip()[:30000]
+            form["job_selection_prompt"] = (
+                "" if selection_prompt == DEFAULT_JOB_SELECTION_PROMPT.strip() else selection_prompt
+            )
             save_settings(form)
             provider = form.get("ai_provider", "gemini").casefold()
             try:
@@ -4904,8 +5336,8 @@ class Handler(BaseHTTPRequestHandler):
                     cfg=cfg,
                     password=secret_get("smtp_password"),
                     to_addrs=[to_addr],
-                    subject="Radar de Vagas — teste SMTP",
-                    body="Este é um e-mail de teste do Radar de Vagas.",
+                    subject="Odradek Scraper — teste SMTP",
+                    body="Este é um e-mail de teste do Odradek Scraper.",
                     attachment_path=None,
                 )
                 log_event("success", "smtp", f"E-mail de teste enviado para {to_addr}.")
@@ -5045,5 +5477,5 @@ if __name__ == "__main__":
     _boot_logging()
     _boot_queue()
     _boot_worth_check_scheduler()
-    print(f"Radar de Vagas disponível em http://{HOST}:{PORT}")
+    print(f"Odradek Scraper disponível em http://{HOST}:{PORT}")
     ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()

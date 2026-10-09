@@ -8,7 +8,7 @@ from typing import Any
 
 from resume_pipeline import AiUnavailableError
 
-LOG = logging.getLogger("job-scraper")
+LOG = logging.getLogger("odradek-scraper")
 
 _SALARY_POLICY_RULES = """
 Salary review policy (offshore / remote-from-Brazil candidate):

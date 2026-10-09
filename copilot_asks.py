@@ -9,7 +9,7 @@ from typing import Callable
 
 from dbutil import using_postgres
 
-LOG = logging.getLogger("job-scraper")
+LOG = logging.getLogger("odradek-scraper")
 
 STATUS_PENDING = "pending"
 STATUS_AWAITING_AI = "awaiting_ai"

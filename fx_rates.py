@@ -11,7 +11,7 @@ import urllib.request
 from datetime import datetime, timezone
 from typing import Callable
 
-LOG = logging.getLogger("job-scraper")
+LOG = logging.getLogger("odradek-scraper")
 
 FX_JSON_KEY = "fx_rates_json"
 FX_AT_KEY = "fx_rates_fetched_at"
@@ -60,7 +60,7 @@ def _rates_from_cfg(cfg: dict | None) -> tuple[dict[str, float], float] | None:
 
 
 def _fetch_usd_rates(url: str = API_URL, *, timeout: float = 12) -> dict[str, float]:
-    req = urllib.request.Request(url, headers={"User-Agent": "job-scraper-fx/1.0"}, method="GET")
+    req = urllib.request.Request(url, headers={"User-Agent": "odradek-scraper-fx/1.0"}, method="GET")
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         payload = json.loads(resp.read().decode("utf-8"))
     rates_raw = payload.get("rates") if isinstance(payload, dict) else None

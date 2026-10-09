@@ -1,4 +1,4 @@
-# job-scraper (estudo / fins educacionais)
+# Odradek Scraper (estudo / fins educacionais)
 
 Projeto **pessoal e educacional** para estudar, em ambiente local:
 

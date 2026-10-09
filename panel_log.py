@@ -99,7 +99,7 @@ class PanelLogHandler(logging.Handler):
             self.handleError(record)
 
 
-def attach_to_logger(logger_name: str = "job-scraper") -> None:
+def attach_to_logger(logger_name: str = "odradek-scraper") -> None:
     logger = logging.getLogger(logger_name)
     for existing in list(logger.handlers):
         if isinstance(existing, PanelLogHandler):
