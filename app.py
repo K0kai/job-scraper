@@ -47,7 +47,7 @@ RESUMES_DIR = os.environ.get("RESUMES_DIR", os.path.join(ROOT, "resumes"))
 COPILOT_UPLOADS_DIR = os.environ.get(
     "COPILOT_UPLOADS_DIR", os.path.join(ROOT, "copilot_uploads")
 )
-FAVICON_PATH = os.path.join(ROOT, "assets", "public", "favicon.ico")
+FAVICON_PATH = os.path.join(ROOT, "assets", "public", "odradek-icon.png")
 HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "8765"))
 POLL_SECONDS = 15 * 60
@@ -3713,12 +3713,12 @@ def render_page(notice: str = "", notice_kind: str = "success") -> str:
 <details class="job-selection-prompt"><summary>Editar instruções da seleção</summary>
 <label>Prompt de seleção<textarea name="job_selection_prompt" rows="9">{esc(effective_job_selection_prompt(cfg))}</textarea></label>
 <p class="hint">O sistema acrescenta o nível de otimismo, currículo e dados da vaga automaticamente. Não remova as instruções de formato JSON.</p></details>'''
-    page_html = f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Odradek Scraper</title>
-<link rel="icon" href="/favicon.ico" type="image/x-icon">
+    page_html = f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Odradek</title>
+<link rel="icon" href="/odradek-icon.png" type="image/png">
 <style>{PAGE_CSS}</style></head><body>
 <div class="shell">
 <aside class="sidebar">
-<div class="brand"><strong>Odradek Scraper</strong><small>coleta &middot; triagem &middot; candidaturas</small></div>
+<div class="brand"><strong>Odradek</strong><small>coleta &middot; triagem &middot; candidaturas</small></div>
 <nav class="tabs" aria-label="Seções do painel">
 <span class="nav-label">Operação</span>
 <button type="button" class="tab active" data-tab="painel">Visão geral</button>
@@ -4859,7 +4859,7 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             return
         self.send_response(200)
-        self.send_header("Content-Type", "image/x-icon")
+        self.send_header("Content-Type", "image/png")
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "public, max-age=86400")
         self.end_headers()
@@ -4914,7 +4914,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         path = parsed.path
-        if path == "/favicon.ico":
+        if path in ("/favicon.ico", "/odradek-icon.png"):
             self.send_favicon()
             return
         if path == "/health":
@@ -5461,7 +5461,7 @@ class Handler(BaseHTTPRequestHandler):
 
     #: endpoints de polling — o browser bate a cada poucos segundos; sem isso
     #: o terminal/LOG enche de linha repetida e sota o que importa.
-    QUIET_PATHS = ("/live", "/health", "/favicon.ico")
+    QUIET_PATHS = ("/live", "/health", "/favicon.ico", "/odradek-icon.png")
 
     def log_message(self, fmt: str, *args: object) -> None:
         line = fmt % args
